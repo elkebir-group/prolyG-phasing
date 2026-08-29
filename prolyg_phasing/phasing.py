@@ -28,10 +28,11 @@ interrupter-pattern haplotype $h \\in \\mathcal{H}_i$ is a separate,
 orthogonal evidence source (the multi-run length-vector notation).
 
 Every label this module produces is a direct readout of a read's own
-sequence. The bulk-side counterpart, which re-votes bulk reads against a
-matched normal's already-determined haplotype profile, lives in
-``prolyG.inference.bulk_phasing`` instead, since "bulk" is a tumor-pipeline
-concept.
+sequence. The anchored counterpart, which re-votes one panel's reads
+against a *different*, already-phased panel's haplotype profile, lives in
+:mod:`prolyg_phasing.anchor_phasing` instead — a caller-supplied pairing
+(e.g. a tumor bulk sample voted against its matched normal), not a concept
+this module knows about.
 """
 from __future__ import annotations
 
@@ -720,9 +721,9 @@ def _per_row_bases_at_positions(
     flanking string. Uncovered positions in a row read as ``'.'`` (the
     extraction pad). Shared by the normal-side
     :func:`_per_row_bases_at_snvs` (offsets from each SNV's
-    ``string_index``) and the bulk-side anchored path (offsets remapped
-    from the matched normal's SNV ``ref_pos`` via
-    :func:`~prolyG.inference.bulk_phasing._remap_snv_to_bulk_position`).
+    ``string_index``) and the anchored path (offsets remapped from the
+    reference panel's SNV ``ref_pos`` via
+    :func:`~prolyg_phasing.anchor_phasing._remap_snv_to_target_position`).
     """
     assert (locus.flanking_id >= 0).all(), (
         "flanking_id contains negative values; phasing requires a schema-v2 panel"
@@ -947,8 +948,8 @@ def _vote_assignment(
 ) -> FlankingHaplotypeAssignment:
     """Per-row major/minor/unk vote of ``bases`` against two haplotype profiles.
 
-    Shared by the normal-side :func:`_assign_locus` and the bulk-side
-    :func:`~prolyG.inference.bulk_phasing.assign_flanking_haplotypes_anchored`,
+    Shared by the normal-side :func:`_assign_locus` and the anchored
+    :func:`~prolyg_phasing.anchor_phasing.assign_flanking_haplotypes_anchored`,
     so both use byte-identical voting. ``bases`` is ``(n_rows,
     n_profile_snvs)`` U1; ``major_profile``
     / ``minor_profile`` are length-``n_profile_snvs`` U1 base arrays aligned
