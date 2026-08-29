@@ -157,3 +157,10 @@ snakemake -s workflow/Snakefile --cores N \
 This package produces read-level and locus-level labels. A companion
 library, [prolyG](https://github.com/elkebir-group/prolyG), consumes these
 panels for PCR-chemistry inference and copy-number calling.
+
+`prolyg_phasing.anchor_phasing` additionally lets a caller vote one panel's
+reads against a *different*, already-phased panel's haplotype profiles
+(`assign_flanking_haplotypes_anchored`) — e.g. prolyG's bulk pipeline votes
+a tumor sample's reads against its matched normal. Library-only: no CLI
+subcommand or Snakemake rule wraps it, since prolyG is currently its only
+caller.
