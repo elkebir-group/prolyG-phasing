@@ -6,13 +6,16 @@ where a flanking single-nucleotide variant (SNV) resolves it, the haplotype
 it produces per-locus, per-family, and per-SNV tables. Every label is a
 direct readout of a read's own sequence.
 
-Two stages:
+Three stages:
 
 1. **Extract** — walk a BAM against a BED panel, collapse read pairs into a
    deduplicated, per-locus panel (`panel.db`).
 2. **Phase** — find flanking positions that are informative (heterozygous)
    in the panel, phase them into two haplotype profiles per locus, and label
    every read family that carries phase evidence.
+3. **Ref-phase** — vote a *different* panel's reads against an already-phased
+   reference panel's haplotype profiles, instead of phasing its own — e.g. a
+   tumor bulk sample voted against its matched normal.
 
 ## Install
 
@@ -28,15 +31,18 @@ it.
 
 ## Quickstart — direct execution
 
-A small synthetic BAM + BED ship with the repo (`workflow/example/`, built
-by `workflow/example/make_example_data.py`) so this runs immediately: two
-loci, realistic PCR-duplicate depth throughout (every row's `count` is
-2-5, never a single read). Locus1 has no interrupter allele and no phase
+Two small synthetic BAMs + a shared BED ship with the repo
+(`workflow/example/`, built by `workflow/example/make_example_data.py`) so
+this runs immediately: two loci, realistic PCR-duplicate depth throughout
+(every row's `count` is 2-5, never a single read). `example.bam` (for
+`extract`/`phase`) has Locus1 with no interrupter allele and no phase
 signal — everything phases `unk`. Locus2 has two admitted interrupter
 patterns and 30 families split across two linked flanking SNVs, so
 `phase`'s output shows real `hap_major`/`hap_minor` calls, a genuine
 (< 1.0) interrupter/phase concordance number, and one family whose two
-strands carry different vote evidence.
+strands carry different vote evidence. `example_target.bam` (for
+`ref-phase`, below) is a second, independently composed sample at the same
+two loci.
 
 ```bash
 prolyg-phasing extract \
@@ -48,9 +54,41 @@ prolyg-phasing phase \
 ```
 
 `phase` always writes `phasing.pkl` plus three tables into `--out-dir`:
-`haplotype_calls.tsv`, `locus_summary.tsv`, `snv_calls.tsv` (below). Run
-`prolyg-phasing extract --help` / `prolyg-phasing phase --help` for the full
-flag list.
+`haplotype_calls.tsv`, `locus_summary.tsv`, `snv_calls.tsv` (below).
+
+`ref-phase` votes a *different* panel's reads against an already-phased
+reference panel, instead of phasing its own — the reference's SNVs and
+haplotype profiles come entirely from a prior `phase` run. A second
+synthetic BAM, `example_target.bam`, ships for this: a genuinely different
+sample at the same two loci (same genomic alleles, a different — skewed
+12/6 rather than balanced 15/15 — family split at Locus2, no interrupter
+alternation or strand-mismatch flourish):
+
+```bash
+prolyg-phasing extract \
+    --bam workflow/example/example_target.bam --bed workflow/example/panel.bed \
+    --out-db target_panel.db
+
+prolyg-phasing ref-phase \
+    --target-panel-db target_panel.db --reference-snv-calls phasing/snv_calls.tsv \
+    --target-sample-id TARGET --reference-sample-id REFERENCE \
+    --out-dir ref_phasing/
+```
+
+`ref-phase`'s output shows the target's 18 Locus2 families all getting a
+confident `hap_major`/`hap_minor` label (no `unk`) from the reference's
+profile, split 84/38 reads — close to the family-count ratio (12/6 = 2:1),
+the gap coming from per-family depth variation — with `hap_major` landing
+on the same allele (`CT`) `phasing/locus_summary.tsv` already reported for
+the reference, despite the target never discovering that allele itself.
+
+`--reference-phasing-pkl phasing/phasing.pkl` also works in place of
+`--reference-snv-calls`; the two are equivalent, but the table is smaller —
+`phasing.pkl` also carries the O(reads) per-family phase-label assignments
+this command never needs. `ref-phase` always writes `ref_phasing.pkl` plus
+`ref_phasing_summary.tsv` into `--out-dir` (below).
+
+Run `prolyg-phasing <command> --help` for any command's full flag list.
 
 ## Quickstart — Snakemake
 
@@ -152,8 +190,29 @@ snakemake -s workflow/Snakefile --cores N \
     is checked against. Blank for a dropped SNV (a dropped SNV is exactly
     one whose `pair_double_coverage` fell below that flag).
 
+- **`ref_phasing_summary.tsv`** (`ref-phase` only) — one row per target
+  locus. Unlike `locus_summary.tsv`, the target never phases its own
+  haplotypes — the profile is borrowed from the reference — so there is no
+  `hap_major_profile`/interrupter-concordance pair here, only the vote
+  outcome and the SNV coverage that produced it. Columns:
+  - `locus_id`.
+  - `n_usable_snvs` — reference SNVs the target locus's own flanking window
+    covers, after re-locating each by genomic position; `0` means this
+    locus phased all-`unk`.
+  - `n_rows` — this locus's row count; `n_families`/`n_families_labeled` —
+    distinct molecules, and the subset with a non-`unk` label.
+  - `reads_total`/`reads_major`/`reads_minor`/`reads_unk` — raw read
+    counts, split by vote outcome.
+
 ## Scope
 
 This package produces read-level and locus-level labels. A companion
 library, [prolyG](https://github.com/elkebir-group/prolyG), consumes these
 panels for PCR-chemistry inference and copy-number calling.
+
+`ref-phase` additionally lets a caller vote one panel's reads against a
+*different*, already-phased panel's haplotype profiles — e.g. prolyG's
+bulk pipeline votes a tumor sample's reads against its matched normal. It
+is not wired into the Snakemake workflow: its two-panel (target +
+reference) input shape does not fit the workflow's one-row-per-sample
+table.

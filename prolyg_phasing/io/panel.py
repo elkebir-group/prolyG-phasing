@@ -513,7 +513,7 @@ class ExtractedPanel:
         parsed_per_locus: list[_ParsedLocusData | None] = []
         for locus_id in iterator:
             parsed_per_locus.append(
-                _parse_locus(self.loci[locus_id], max_n_runs=max_n_runs)
+                parse_locus(self.loci[locus_id], max_n_runs=max_n_runs)
             )
 
         # Single-run axis: max run of the single-run () pattern across all loci
@@ -809,7 +809,7 @@ class _ParsedLocusData:
     pattern_max_run: dict[tuple[str, ...], int]     # per-pattern max run component (k_h source)
 
 
-def _parse_locus(
+def parse_locus(
     locus: ExtractedLocus,
     *,
     max_n_runs: int | None,
@@ -881,8 +881,8 @@ def _axis_binned_rows(
     """The on-pattern, on-axis reads of one locus, as ``(mi, pattern, allele_len, count)``.
 
     The single binning convention behind both the pattern-keyed histogram
-    (:func:`_build_empirical`) and the family-keyed one
-    (:func:`_build_empirical_by_family`), so a caller that needs reads grouped by
+    (:func:`build_empirical`) and the family-keyed one
+    (:func:`build_empirical_by_family`), so a caller that needs reads grouped by
     read family does not re-derive which reads are on the axis. A read is kept iff
     its family's majority pattern clears ``min_pattern_freq``, its run count matches
     that pattern, and its longest run lands below ``n_alleles``.
@@ -890,7 +890,7 @@ def _axis_binned_rows(
     Returns ``(rows, parsed, pattern_freqs, dom_pattern)``, or ``None`` when the
     locus is dropped by the parse or has no observed pattern. ``rows`` may be empty.
     """
-    pf = _parse_locus(locus, max_n_runs=max_n_runs)
+    pf = parse_locus(locus, max_n_runs=max_n_runs)
     if pf is None:
         return None
 
@@ -919,14 +919,14 @@ def _axis_binned_rows(
     return rows, pf, pat_freqs, dom_pattern
 
 
-def _build_empirical_by_family(
+def build_empirical_by_family(
     locus: ExtractedLocus,
     *,
     n_alleles: int,
     min_pattern_freq: float,
     max_n_runs: int | None,
 ) -> np.ndarray | None:
-    """Family-keyed counterpart of :func:`_build_empirical`: one row per read family.
+    """Family-keyed counterpart of :func:`build_empirical`: one row per read family.
 
     Returns an ``(n_families, n_alleles)`` count matrix whose **column sums are
     exactly** the ``emp_total`` histogram (pinned by test), or ``None`` when no read
@@ -956,7 +956,7 @@ def _build_empirical_by_family(
     return mat
 
 
-def _build_empirical(
+def build_empirical(
     locus: ExtractedLocus,
     *,
     n_alleles: int,

@@ -28,16 +28,18 @@ interrupter-pattern haplotype $h \\in \\mathcal{H}_i$ is a separate,
 orthogonal evidence source (the multi-run length-vector notation).
 
 Every label this module produces is a direct readout of a read's own
-sequence. The bulk-side counterpart, which re-votes bulk reads against a
-matched normal's already-determined haplotype profile, lives in
-``prolyG.inference.bulk_phasing`` instead, since "bulk" is a tumor-pipeline
-concept.
+sequence. The anchored counterpart, which re-votes one panel's reads
+against a *different*, already-phased panel's haplotype profile, lives in
+:mod:`prolyg_phasing.ref_phasing` instead — a caller-supplied pairing
+(e.g. a tumor bulk sample voted against its matched normal), not a concept
+this module knows about.
 """
 from __future__ import annotations
 
 import dataclasses
 import pickle
 from pathlib import Path
+from typing import Self
 
 import numpy as np
 from scipy import sparse
@@ -52,7 +54,7 @@ _ACGT = ("A", "C", "G", "T")
 #: accumulator :func:`family_consensus_counts` reduces over: at 4 × 8 bytes a cell,
 #: 2**22 cells is a ~134 MB peak regardless of how deep the locus is, and the block
 #: never changes the result -- only how much of the window is scored at a time.
-_CONSENSUS_POSITION_BLOCK = 2 ** 22
+CONSENSUS_POSITION_BLOCK = 2 ** 22
 
 
 def flanking_char_matrix(flanking_seq: np.ndarray, total_width: int) -> np.ndarray:
@@ -300,7 +302,7 @@ def family_consensus_counts(
     # which is hundreds of MB against a per-locus working set the pipeline sizes at
     # ~50 MB. The block width only bounds memory; every reduction below is over the
     # full family axis, so the result is identical to scoring the window at once.
-    block = max(1, _CONSENSUS_POSITION_BLOCK // max(n_fam, 1))
+    block = max(1, CONSENSUS_POSITION_BLOCK // max(n_fam, 1))
     for p0 in range(0, total_width, block):
         p1 = min(p0 + block, total_width)
         acc = np.empty((n_fam, p1 - p0, 4), dtype=np.float64)
@@ -422,6 +424,31 @@ def find_informative_snvs(
     return out
 
 
+def ref_pos_at_offset(ref_orientation: str, ref_start: int, offset: int) -> int:
+    """Genomic position of ``offset`` into a flanking segment starting at ``ref_start``.
+
+    ``ref_orientation`` is ``"+"`` or ``"-"`` (see :attr:`ExtractedLocus.ref_orientation`).
+    Inverse of :func:`offset_at_ref_pos`.
+    """
+    sign = 1 if ref_orientation == "+" else -1
+    return ref_start + sign * offset
+
+
+def offset_at_ref_pos(
+    ref_orientation: str, ref_start: int, ref_pos: int, width: int,
+) -> int | None:
+    """Offset into a ``width``-long flanking segment at ``ref_start`` for genomic ``ref_pos``.
+
+    Inverse of :func:`ref_pos_at_offset`. Returns ``None`` when ``ref_pos`` does
+    not land in ``[0, width)`` of this segment (used by
+    :func:`~prolyg_phasing.ref_phasing._remap_snv_to_target_position` to check
+    the ``up`` then ``dn`` segment of a *different* locus's flanking geometry).
+    """
+    sign = 1 if ref_orientation == "+" else -1
+    offset = sign * (ref_pos - ref_start)
+    return offset if 0 <= offset < width else None
+
+
 def _collect_candidates(
     *,
     locus_id: str,
@@ -433,7 +460,6 @@ def _collect_candidates(
     min_coverage: int,
     vaf_min: float,
 ) -> list[SNVCandidate]:
-    sign = 1 if ref_orientation == "+" else -1
     out: list[SNVCandidate] = []
     for segment, freqs, ref_start in (
         ("up", up_freqs, up_ref_start),
@@ -453,7 +479,7 @@ def _collect_candidates(
                 continue
             out.append(SNVCandidate(
                 locus_id=locus_id,
-                ref_pos=int(ref_start + sign * i),
+                ref_pos=ref_pos_at_offset(ref_orientation, ref_start, i),
                 segment=segment,
                 string_index=i,
                 allele_major=_BASES[int(order[0])],
@@ -711,7 +737,7 @@ def _phase_locus(
     )
 
 
-def _per_row_bases_at_positions(
+def per_row_bases_at_positions(
     locus: ExtractedLocus, positions: list[int],
 ) -> np.ndarray:
     """Return (n_rows, len(positions)) U1 array of bases at flanking-string offsets.
@@ -719,10 +745,10 @@ def _per_row_bases_at_positions(
     ``positions`` are 0-based offsets into the locus's ``up + "|" + dn``
     flanking string. Uncovered positions in a row read as ``'.'`` (the
     extraction pad). Shared by the normal-side
-    :func:`_per_row_bases_at_snvs` (offsets from each SNV's
-    ``string_index``) and the bulk-side anchored path (offsets remapped
-    from the matched normal's SNV ``ref_pos`` via
-    :func:`~prolyG.inference.bulk_phasing._remap_snv_to_bulk_position`).
+    :func:`per_row_bases_at_snvs` (offsets from each SNV's
+    ``string_index``) and the anchored path (offsets remapped from the
+    reference panel's SNV ``ref_pos`` via
+    :func:`~prolyg_phasing.ref_phasing._remap_snv_to_target_position`).
     """
     assert (locus.flanking_id >= 0).all(), (
         "flanking_id contains negative values; phasing requires a schema-v2 panel"
@@ -737,14 +763,14 @@ def _per_row_bases_at_positions(
     return fid_bases[locus.flanking_id]
 
 
-def _per_row_bases_at_snvs(
+def per_row_bases_at_snvs(
     locus: ExtractedLocus, snvs: list[SNVCandidate],
 ) -> np.ndarray:
     """Return (n_rows, n_snvs) U1 array of called bases at each SNV position.
 
     Maps each SNV to its flanking-string offset from ``string_index``
     (downstream SNVs shifted past the ``up`` segment and ``"|"``
-    separator), then delegates to :func:`_per_row_bases_at_positions`.
+    separator), then delegates to :func:`per_row_bases_at_positions`.
     """
     positions: list[int] = []
     for snv in snvs:
@@ -752,7 +778,7 @@ def _per_row_bases_at_snvs(
             positions.append(snv.string_index)
         else:
             positions.append(locus.flanking_up_width + 1 + snv.string_index)
-    return _per_row_bases_at_positions(locus, positions)
+    return per_row_bases_at_positions(locus, positions)
 
 
 def _family_bases_at_snvs(
@@ -760,7 +786,7 @@ def _family_bases_at_snvs(
 ) -> np.ndarray:
     """``(n_families, n_snvs)`` consensus base per molecule at each SNV.
 
-    The family counterpart of :func:`_per_row_bases_at_snvs`: one row per
+    The family counterpart of :func:`per_row_bases_at_snvs`: one row per
     molecule rather than per deduplicated read record, so a pair of positions
     can be read off the same molecule.
     """
@@ -894,7 +920,7 @@ def assign_flanking_haplotypes(
         n_rows = int(locus.mi.shape[0])
         hap = phased.get(locus_id)
         if hap is None or len(hap.snvs) == 0:
-            out[locus_id] = _all_unk_assignment(locus_id, n_rows)
+            out[locus_id] = all_unk_assignment(locus_id, n_rows)
             continue
         out[locus_id] = _assign_locus(
             locus_id=locus_id,
@@ -906,7 +932,7 @@ def assign_flanking_haplotypes(
     return out
 
 
-def _all_unk_assignment(locus_id: str, n_rows: int) -> FlankingHaplotypeAssignment:
+def all_unk_assignment(locus_id: str, n_rows: int) -> FlankingHaplotypeAssignment:
     zeros = np.zeros(n_rows, dtype=np.int8)
     return FlankingHaplotypeAssignment(
         locus_id=locus_id,
@@ -926,8 +952,8 @@ def _assign_locus(
     min_informative_positions: int,
     vote_margin: int,
 ) -> FlankingHaplotypeAssignment:
-    bases = _per_row_bases_at_snvs(locus, list(hap.snvs))  # (n_rows, n_snvs) U1
-    return _vote_assignment(
+    bases = per_row_bases_at_snvs(locus, list(hap.snvs))  # (n_rows, n_snvs) U1
+    return vote_assignment(
         locus_id,
         bases,
         np.asarray(hap.hap_major_profile, dtype="U1"),
@@ -937,7 +963,7 @@ def _assign_locus(
     )
 
 
-def _vote_assignment(
+def vote_assignment(
     locus_id: str,
     bases: np.ndarray,
     major_profile: np.ndarray,
@@ -947,8 +973,8 @@ def _vote_assignment(
 ) -> FlankingHaplotypeAssignment:
     """Per-row major/minor/unk vote of ``bases`` against two haplotype profiles.
 
-    Shared by the normal-side :func:`_assign_locus` and the bulk-side
-    :func:`~prolyG.inference.bulk_phasing.assign_flanking_haplotypes_anchored`,
+    Shared by the normal-side :func:`_assign_locus` and the anchored
+    :func:`~prolyg_phasing.ref_phasing.assign_flanking_haplotypes_ref`,
     so both use byte-identical voting. ``bases`` is ``(n_rows,
     n_profile_snvs)`` U1; ``major_profile``
     / ``minor_profile`` are length-``n_profile_snvs`` U1 base arrays aligned
@@ -985,8 +1011,29 @@ def _vote_assignment(
 # ---------------------------------------------------------------------------
 
 
+class PicklePanel:
+    """Mixin: single-``.pkl`` save/load for a panel-level container dataclass.
+
+    Shared by :class:`PhasingPanel` and
+    :class:`~prolyg_phasing.ref_phasing.RefPhasingPanel` — both persist as one
+    pickle of the whole in-memory dataclass, nothing schema-specific.
+    """
+
+    def save_pickle(self, path: str | Path) -> None:
+        """Write a single ``.pkl`` of the in-memory dataclass."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("wb") as f:
+            pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    @classmethod
+    def load_pickle(cls, path: str | Path) -> Self:
+        with Path(path).open("rb") as f:
+            return pickle.load(f)
+
+
 @dataclasses.dataclass
-class PhasingPanel:
+class PhasingPanel(PicklePanel):
     """Full phasing artifact for one sample: SNVs + haplotypes + assignments.
 
     Carries the outputs of PRs 2-4 in a single typed container that
@@ -1022,15 +1069,3 @@ class PhasingPanel:
             vote_margin=vote_margin,
         )
         return cls(snvs=snvs, haplotypes=haplotypes, assignments=assignments)
-
-    def save_pickle(self, path: str | Path) -> None:
-        """Write a single ``.pkl`` of the in-memory phasing artifact."""
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("wb") as f:
-            pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    @classmethod
-    def load_pickle(cls, path: str | Path) -> PhasingPanel:
-        with Path(path).open("rb") as f:
-            return pickle.load(f)
