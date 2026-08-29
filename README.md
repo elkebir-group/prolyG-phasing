@@ -31,15 +31,18 @@ it.
 
 ## Quickstart — direct execution
 
-A small synthetic BAM + BED ship with the repo (`workflow/example/`, built
-by `workflow/example/make_example_data.py`) so this runs immediately: two
-loci, realistic PCR-duplicate depth throughout (every row's `count` is
-2-5, never a single read). Locus1 has no interrupter allele and no phase
+Two small synthetic BAMs + a shared BED ship with the repo
+(`workflow/example/`, built by `workflow/example/make_example_data.py`) so
+this runs immediately: two loci, realistic PCR-duplicate depth throughout
+(every row's `count` is 2-5, never a single read). `example.bam` (for
+`extract`/`phase`) has Locus1 with no interrupter allele and no phase
 signal — everything phases `unk`. Locus2 has two admitted interrupter
 patterns and 30 families split across two linked flanking SNVs, so
 `phase`'s output shows real `hap_major`/`hap_minor` calls, a genuine
 (< 1.0) interrupter/phase concordance number, and one family whose two
-strands carry different vote evidence.
+strands carry different vote evidence. `example_target.bam` (for
+`ref-phase`, below) is a second, independently composed sample at the same
+two loci.
 
 ```bash
 prolyg-phasing extract \
@@ -55,11 +58,15 @@ prolyg-phasing phase \
 
 `ref-phase` votes a *different* panel's reads against an already-phased
 reference panel, instead of phasing its own — the reference's SNVs and
-haplotype profiles come entirely from a prior `phase` run:
+haplotype profiles come entirely from a prior `phase` run. A second
+synthetic BAM, `example_target.bam`, ships for this: a genuinely different
+sample at the same two loci (same genomic alleles, a different — skewed
+12/6 rather than balanced 15/15 — family split at Locus2, no interrupter
+alternation or strand-mismatch flourish):
 
 ```bash
 prolyg-phasing extract \
-    --bam workflow/example/example.bam --bed workflow/example/panel.bed \
+    --bam workflow/example/example_target.bam --bed workflow/example/panel.bed \
     --out-db target_panel.db
 
 prolyg-phasing ref-phase \
@@ -67,6 +74,13 @@ prolyg-phasing ref-phase \
     --target-sample-id TARGET --reference-sample-id REFERENCE \
     --out-dir ref_phasing/
 ```
+
+`ref-phase`'s output shows the target's 18 Locus2 families all getting a
+confident `hap_major`/`hap_minor` label (no `unk`) from the reference's
+profile, split 84/38 reads — close to the family-count ratio (12/6 = 2:1),
+the gap coming from per-family depth variation — with `hap_major` landing
+on the same allele (`CT`) `phasing/locus_summary.tsv` already reported for
+the reference, despite the target never discovering that allele itself.
 
 `--reference-phasing-pkl phasing/phasing.pkl` also works in place of
 `--reference-snv-calls`; the two are equivalent, but the table is smaller —

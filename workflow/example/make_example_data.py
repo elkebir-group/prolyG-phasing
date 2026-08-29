@@ -52,8 +52,22 @@ keeps its own row in ``haplotype_calls.tsv``.
     is ``snv_calls.tsv``'s upstream-SNV ``coverage`` reading 29, not 30:
     not a bug, family_consensus_counts' own documented tie rule.
 
-Still small — under 700 reads total — and fast enough to extract and phase
-in well under a second.
+A second BAM, ``example_target.bam``, is a genuinely different sample at the
+same two loci — for the ``ref-phase`` quickstart, which needs a target
+sample to vote against a *different*, already-phased reference. Locus1 is
+unchanged (still no informative SNV, still all-``unk`` regardless of which
+profile it is voted against). Locus2 carries the identical two genomic
+alleles at each flanking SNV as ``example.bam`` (``ref-phase`` borrows the
+reference's already-determined hap_major/hap_minor profile — it never
+re-discovers alleles from the target), but a skewed 12 hap-A-group / 6
+hap-B-group split instead of the reference's balanced 15/15: a different
+family composition, as an independently sequenced sample would have, with
+no interrupter alternation or strand-mismatch flourish (those exercise
+``phase``'s own channels, not the flanking-SNV vote ``ref-phase`` cares
+about).
+
+Still small — under 700 reads total per BAM — and fast enough to extract
+and phase in well under a second.
 """
 from __future__ import annotations
 
@@ -163,6 +177,17 @@ def _read_seq(reference: str, overrides: dict[int, str] | None = None) -> str:
     return "".join(read)
 
 
+# Locus1's plain sequence, and Locus2's two flanking-SNV haplotype sequences —
+# shared module-level so example.bam and example_target.bam draw reads
+# carrying the SAME genomic alleles (ref-phase votes a target sample's reads
+# against a reference sample's already-determined profile; the two samples
+# must agree on what the alleles themselves are, only how many families carry
+# each one is free to differ).
+PLAIN_SEQ = _read_seq(REFERENCE_PLAIN)
+HAP_A_SEQ = _read_seq(REFERENCE_INTERRUPTED, {_UP_SNV_REFPOS: "C", _DN_SNV_REFPOS: "T"})
+HAP_B_SEQ = _read_seq(REFERENCE_INTERRUPTED, {_UP_SNV_REFPOS: "G", _DN_SNV_REFPOS: "C"})
+
+
 def _depth(i: int) -> int:
     """PCR-duplicate read-pair count for family index ``i``: cycles 2, 3, 4, 5."""
     return 2 + (i % 4)
@@ -215,80 +240,113 @@ def _add_family_strand_mismatch(
                 )
 
 
-def main() -> None:
-    header = {
-        "HD": {"VN": "1.6", "SO": "coordinate"},
-        "SQ": [
-            {"SN": "synth1", "LN": len(REFERENCE_PLAIN)},
-            {"SN": "synth2", "LN": len(REFERENCE_INTERRUPTED)},
-        ],
-    }
-    unsorted_path = EXAMPLE_DIR / "example.unsorted.bam"
-    bam_path = EXAMPLE_DIR / "example.bam"
-    with pysam.AlignmentFile(str(unsorted_path), "wb", header=header) as bam:
-        # Locus1: 10 plain families, no interrupter allele, no flanking-SNV signal.
-        plain_seq = _read_seq(REFERENCE_PLAIN)
-        for i in range(10):
-            _add_family(
-                bam, ref_id=0, reference=REFERENCE_PLAIN, mi_prefix=f"20{i:03d}",
-                read_seq=plain_seq, depth=_depth(i),
-            )
+_HEADER = {
+    "HD": {"VN": "1.6", "SO": "coordinate"},
+    "SQ": [
+        {"SN": "synth1", "LN": len(REFERENCE_PLAIN)},
+        {"SN": "synth2", "LN": len(REFERENCE_INTERRUPTED)},
+    ],
+}
 
-        # Locus2: 30 families, 15 hap-A-group + 15 hap-B-group, co-segregating
-        # at both flanking SNV positions. Which group ends up labeled
-        # hap_major vs hap_minor is the algorithm's own call (an exact 15/15
-        # tie here), not predicted by this split.
-        hap_a_seq = _read_seq(
-            REFERENCE_INTERRUPTED, {_UP_SNV_REFPOS: "C", _DN_SNV_REFPOS: "T"},
-        )
-        hap_b_seq = _read_seq(
-            REFERENCE_INTERRUPTED, {_UP_SNV_REFPOS: "G", _DN_SNV_REFPOS: "C"},
-        )
-        # 3 families per haplotype group carry an alternate "T" interrupter
-        # instead of the canonical "A" — split across both groups so the
-        # interrupter-pattern channel doesn't trivially track the SNV-phased
-        # haplotype channel.
-        alt_interrupter_indices = {2, 7, 12, 17, 22, 27}
-        # This one family's B-strand row gets a genuine third-allele base at
-        # the upstream SNV (see _add_family_strand_mismatch below); skip it
-        # in the main loop.
-        strand_mismatch_index = 0
 
-        for i in range(30):
-            if i == strand_mismatch_index:
-                continue
-            base_seq = hap_a_seq if i < 15 else hap_b_seq
-            read_seq = (
-                _read_seq(REFERENCE_INTERRUPTED, {
-                    _INTERRUPTER_REFPOS: "T",
-                    _UP_SNV_REFPOS: base_seq[_UP_SNV_REFPOS],
-                    _DN_SNV_REFPOS: base_seq[_DN_SNV_REFPOS],
-                })
-                if i in alt_interrupter_indices else base_seq
-            )
-            _add_family(
-                bam, ref_id=1, reference=REFERENCE_INTERRUPTED,
-                mi_prefix=f"30{i:03d}", read_seq=read_seq, depth=_depth(i),
-            )
-
-        # Family 0 (hap-A group): strand A reads the clean hap-A sequence;
-        # strand B substitutes a third base ("A", neither hap-A's "C" nor
-        # hap-B's "G") at the upstream SNV, leaving the downstream SNV and
-        # the interrupter untouched.
-        mismatch_seq_b = _read_seq(
-            REFERENCE_INTERRUPTED,
-            {_UP_SNV_REFPOS: "A", _DN_SNV_REFPOS: hap_a_seq[_DN_SNV_REFPOS]},
-        )
-        _add_family_strand_mismatch(
-            bam, ref_id=1, reference=REFERENCE_INTERRUPTED,
-            mi_prefix=f"30{strand_mismatch_index:03d}",
-            read_seq_a=hap_a_seq, read_seq_b=mismatch_seq_b,
-            depth=_depth(strand_mismatch_index),
-        )
-
+def _write_bam(bam_path: Path, add_reads) -> None:
+    """Write, coordinate-sort, and index a BAM; ``add_reads(bam)`` populates it."""
+    unsorted_path = bam_path.with_name(bam_path.stem + ".unsorted.bam")
+    with pysam.AlignmentFile(str(unsorted_path), "wb", header=_HEADER) as bam:
+        add_reads(bam)
     pysam.sort("-o", str(bam_path), str(unsorted_path))
     pysam.index(str(bam_path))
     unsorted_path.unlink()
+
+
+def _add_reference_reads(bam: pysam.AlignmentFile) -> None:
+    # Locus1: 10 plain families, no interrupter allele, no flanking-SNV signal.
+    for i in range(10):
+        _add_family(
+            bam, ref_id=0, reference=REFERENCE_PLAIN, mi_prefix=f"20{i:03d}",
+            read_seq=PLAIN_SEQ, depth=_depth(i),
+        )
+
+    # Locus2: 30 families, 15 hap-A-group + 15 hap-B-group, co-segregating
+    # at both flanking SNV positions. Which group ends up labeled
+    # hap_major vs hap_minor is the algorithm's own call (an exact 15/15
+    # tie here), not predicted by this split.
+    # 3 families per haplotype group carry an alternate "T" interrupter
+    # instead of the canonical "A" — split across both groups so the
+    # interrupter-pattern channel doesn't trivially track the SNV-phased
+    # haplotype channel.
+    alt_interrupter_indices = {2, 7, 12, 17, 22, 27}
+    # This one family's B-strand row gets a genuine third-allele base at
+    # the upstream SNV (see _add_family_strand_mismatch below); skip it
+    # in the main loop.
+    strand_mismatch_index = 0
+
+    for i in range(30):
+        if i == strand_mismatch_index:
+            continue
+        base_seq = HAP_A_SEQ if i < 15 else HAP_B_SEQ
+        read_seq = (
+            _read_seq(REFERENCE_INTERRUPTED, {
+                _INTERRUPTER_REFPOS: "T",
+                _UP_SNV_REFPOS: base_seq[_UP_SNV_REFPOS],
+                _DN_SNV_REFPOS: base_seq[_DN_SNV_REFPOS],
+            })
+            if i in alt_interrupter_indices else base_seq
+        )
+        _add_family(
+            bam, ref_id=1, reference=REFERENCE_INTERRUPTED,
+            mi_prefix=f"30{i:03d}", read_seq=read_seq, depth=_depth(i),
+        )
+
+    # Family 0 (hap-A group): strand A reads the clean hap-A sequence;
+    # strand B substitutes a third base ("A", neither hap-A's "C" nor
+    # hap-B's "G") at the upstream SNV, leaving the downstream SNV and
+    # the interrupter untouched.
+    mismatch_seq_b = _read_seq(
+        REFERENCE_INTERRUPTED,
+        {_UP_SNV_REFPOS: "A", _DN_SNV_REFPOS: HAP_A_SEQ[_DN_SNV_REFPOS]},
+    )
+    _add_family_strand_mismatch(
+        bam, ref_id=1, reference=REFERENCE_INTERRUPTED,
+        mi_prefix=f"30{strand_mismatch_index:03d}",
+        read_seq_a=HAP_A_SEQ, read_seq_b=mismatch_seq_b,
+        depth=_depth(strand_mismatch_index),
+    )
+
+
+def _add_target_reads(bam: pysam.AlignmentFile) -> None:
+    # Locus1: same plain families as the reference sample -- still no
+    # informative SNV, still all-unk regardless of which profile it votes
+    # against.
+    for i in range(10):
+        _add_family(
+            bam, ref_id=0, reference=REFERENCE_PLAIN, mi_prefix=f"50{i:03d}",
+            read_seq=PLAIN_SEQ, depth=_depth(i),
+        )
+
+    # Locus2: 18 families, skewed 12 hap-A-group + 6 hap-B-group -- a
+    # different family composition than the reference sample's balanced
+    # 15/15, as an independently sequenced sample would have, but the SAME
+    # two genomic alleles at each flanking SNV (HAP_A_SEQ/HAP_B_SEQ):
+    # ref-phase borrows the reference's already-determined hap_major/
+    # hap_minor profile, it never re-discovers alleles from the target. No
+    # interrupter alternation or strand-mismatch flourish here -- those
+    # exercise phase's own channels, not the flanking-SNV vote ref-phase
+    # cares about.
+    for i in range(18):
+        base_seq = HAP_A_SEQ if i < 12 else HAP_B_SEQ
+        _add_family(
+            bam, ref_id=1, reference=REFERENCE_INTERRUPTED,
+            mi_prefix=f"60{i:03d}", read_seq=base_seq, depth=_depth(i),
+        )
+
+
+def main() -> None:
+    bam_path = EXAMPLE_DIR / "example.bam"
+    _write_bam(bam_path, _add_reference_reads)
+
+    target_bam_path = EXAMPLE_DIR / "example_target.bam"
+    _write_bam(target_bam_path, _add_target_reads)
 
     bed_path = EXAMPLE_DIR / "panel.bed"
     bed_path.write_text(
@@ -296,7 +354,8 @@ def main() -> None:
         f"synth2\t{BED_START}\t{BED_END}\tLocus2\n"
     )
 
-    print(f"wrote {bam_path}, {bam_path}.bai, {bed_path}")
+    print(f"wrote {bam_path}, {bam_path}.bai, {target_bam_path}, "
+          f"{target_bam_path}.bai, {bed_path}")
 
 
 if __name__ == "__main__":
