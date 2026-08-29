@@ -267,6 +267,21 @@ def build_ref_phasing_summary(target_panel: ExtractedPanel, anchored: RefPhasing
     return pd.DataFrame(rows)
 
 
+def _snv_from_row(locus_id: str, r) -> SNVCandidate:
+    """Rebuild one :class:`~prolyg_phasing.phasing.SNVCandidate` from a ``build_snv_calls`` row.
+
+    Shared by the phased and dropped-for-low-linkage reconstruction loops in
+    :func:`haplotypes_from_snv_calls_table` — both read the same seven
+    ``build_snv_calls`` columns.
+    """
+    return SNVCandidate(
+        locus_id=locus_id, ref_pos=int(r.ref_pos), segment=r.segment,
+        string_index=int(r.string_index), allele_major=r.allele_major,
+        allele_minor=r.allele_minor, vaf_minor=float(r.vaf_minor),
+        coverage=int(r.coverage),
+    )
+
+
 def haplotypes_from_snv_calls_table(df) -> dict[str, FlankingHaplotype]:
     """Reconstruct per-locus :class:`~prolyg_phasing.phasing.FlankingHaplotype`
     from a ``build_snv_calls`` table (e.g. loaded back from ``snv_calls.tsv``).
@@ -293,27 +308,12 @@ def haplotypes_from_snv_calls_table(df) -> dict[str, FlankingHaplotype]:
     """
     out: dict[str, FlankingHaplotype] = {}
     for locus_id, locus_df in df.groupby("locus_id", sort=False):
+        locus_id = str(locus_id)
         phased = locus_df[locus_df["status"] == "phased"]
         dropped = locus_df[locus_df["status"] == "dropped_low_linkage"]
 
-        snvs = tuple(
-            SNVCandidate(
-                locus_id=locus_id, ref_pos=int(r.ref_pos), segment=r.segment,
-                string_index=int(r.string_index), allele_major=r.allele_major,
-                allele_minor=r.allele_minor, vaf_minor=float(r.vaf_minor),
-                coverage=int(r.coverage),
-            )
-            for r in phased.itertuples()
-        )
-        dropped_snvs = tuple(
-            SNVCandidate(
-                locus_id=locus_id, ref_pos=int(r.ref_pos), segment=r.segment,
-                string_index=int(r.string_index), allele_major=r.allele_major,
-                allele_minor=r.allele_minor, vaf_minor=float(r.vaf_minor),
-                coverage=int(r.coverage),
-            )
-            for r in dropped.itertuples()
-        )
+        snvs = tuple(_snv_from_row(locus_id, r) for r in phased.itertuples())
+        dropped_snvs = tuple(_snv_from_row(locus_id, r) for r in dropped.itertuples())
 
         anchor_positions = [i for i, v in enumerate(phased["is_anchor"]) if bool(v)]
         anchor_index = anchor_positions[0] if anchor_positions else -1

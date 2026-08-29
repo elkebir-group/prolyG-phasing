@@ -14,8 +14,6 @@ caller makes; this module carries no such vocabulary.
 from __future__ import annotations
 
 import dataclasses
-import pickle
-from pathlib import Path
 
 import numpy as np
 
@@ -23,10 +21,12 @@ from prolyg_phasing.io.panel import ExtractedLocus, ExtractedPanel
 from prolyg_phasing.phasing import (
     FlankingHaplotype,
     FlankingHaplotypeAssignment,
+    PicklePanel,
     SNVCandidate,
-    _all_unk_assignment,
-    _per_row_bases_at_positions,
-    _vote_assignment,
+    all_unk_assignment,
+    offset_at_ref_pos,
+    per_row_bases_at_positions,
+    vote_assignment,
 )
 
 
@@ -35,27 +35,33 @@ def _remap_snv_to_target_position(
 ) -> int | None:
     """Flanking-string offset of a reference-panel SNV in the target locus.
 
-    Inverts ``ref_pos = ref_start + sign * i`` (``sign`` per orientation)
-    against the target locus's own flanking geometry, checking the ``up``
-    then ``dn`` segment. Genomic ``ref_pos`` is the cross-panel key: target
-    and reference differ in ``g_walk`` / width, so a SNV's reference
-    ``string_index`` is not its target offset. Returns the 0-based offset
-    into the target ``up + "|" + dn`` string, or ``None`` if the target
-    locus does not cover the SNV's genomic position (shorter window, or the
-    base now sits inside the target's tract).
+    Inverts :func:`~prolyg_phasing.phasing.ref_pos_at_offset` (via
+    :func:`~prolyg_phasing.phasing.offset_at_ref_pos`) against the target
+    locus's own flanking geometry, checking the ``up`` then ``dn`` segment.
+    Genomic ``ref_pos`` is the cross-panel key: target and reference differ
+    in ``g_walk`` / width, so a SNV's reference ``string_index`` is not its
+    target offset. Returns the 0-based offset into the target
+    ``up + "|" + dn`` string, or ``None`` if the target locus does not cover
+    the SNV's genomic position (shorter window, or the base now sits inside
+    the target's tract).
     """
-    sign = 1 if target_locus.ref_orientation == "+" else -1
-    i_up = sign * (snv.ref_pos - target_locus.flanking_up_ref_pos_start)
-    if 0 <= i_up < target_locus.flanking_up_width:
-        return int(i_up)
-    i_dn = sign * (snv.ref_pos - target_locus.flanking_dn_ref_pos_start)
-    if 0 <= i_dn < target_locus.flanking_dn_width:
-        return int(target_locus.flanking_up_width + 1 + i_dn)
+    i_up = offset_at_ref_pos(
+        target_locus.ref_orientation, target_locus.flanking_up_ref_pos_start,
+        snv.ref_pos, target_locus.flanking_up_width,
+    )
+    if i_up is not None:
+        return i_up
+    i_dn = offset_at_ref_pos(
+        target_locus.ref_orientation, target_locus.flanking_dn_ref_pos_start,
+        snv.ref_pos, target_locus.flanking_dn_width,
+    )
+    if i_dn is not None:
+        return target_locus.flanking_up_width + 1 + i_dn
     return None
 
 
 @dataclasses.dataclass
-class RefPhasingPanel:
+class RefPhasingPanel(PicklePanel):
     """Per-read haplotype labels for one panel, anchored on another's profile.
 
     Mirrors :class:`~prolyg_phasing.phasing.PhasingPanel`'s shape but for
@@ -86,17 +92,6 @@ class RefPhasingPanel:
     reference_sample_id: str
     assignments: dict[str, FlankingHaplotypeAssignment]
     usable_snvs: dict[str, tuple[SNVCandidate, ...]]
-
-    def save_pickle(self, path: str | Path) -> None:
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("wb") as f:
-            pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    @classmethod
-    def load_pickle(cls, path: str | Path) -> RefPhasingPanel:
-        with Path(path).open("rb") as f:
-            return pickle.load(f)
 
 
 def assign_flanking_haplotypes_ref(
@@ -147,7 +142,7 @@ def assign_flanking_haplotypes_ref(
         n_rows = int(target_locus.mi.shape[0])
         hap = reference_phased.get(locus_id)
         if hap is None or len(hap.snvs) == 0:
-            assignments[locus_id] = _all_unk_assignment(locus_id, n_rows)
+            assignments[locus_id] = all_unk_assignment(locus_id, n_rows)
             usable[locus_id] = ()
             continue
 
@@ -165,12 +160,12 @@ def assign_flanking_haplotypes_ref(
             kept_minor.append(hap.hap_minor_profile[k])
 
         if not positions:
-            assignments[locus_id] = _all_unk_assignment(locus_id, n_rows)
+            assignments[locus_id] = all_unk_assignment(locus_id, n_rows)
             usable[locus_id] = ()
             continue
 
-        bases = _per_row_bases_at_positions(target_locus, positions)
-        assignments[locus_id] = _vote_assignment(
+        bases = per_row_bases_at_positions(target_locus, positions)
+        assignments[locus_id] = vote_assignment(
             locus_id,
             bases,
             np.asarray(kept_major, dtype="U1"),
