@@ -1,0 +1,28 @@
+samples: config/samples.tsv           # sample_id, bam (path relative to the repo root, or absolute).
+                                       # Points at the committed example by default (workflow/example/)
+                                       # so the workflow runs out of the box; edit in place, or override
+                                       # with --config samples=<your samples.tsv>, to use your own data.
+
+panel:
+  bed: example/panel.bed               # 4-column BED: chrom, start, end, name. Relative to this file's
+                                       # dir. Override with --config panel='{"bed": "<your.bed>"}'.
+
+outputs:
+  root: results                        # relative to the repo root, or absolute
+
+extraction:
+  min_mapq: 40
+  drop_chimeric: true
+  max_tlen: 1000
+  anchor_hamming_max: 1
+  pair_disagreement_policy: drop
+  n_alleles_margin: 1
+  min_flanking_base_q: 20
+
+phasing:
+  min_coverage: 25
+  vaf_min: 0.2
+  min_linkage_families: 10
+  min_informative_positions: 1
+  vote_margin: 0
+  min_pattern_freq: 0.1

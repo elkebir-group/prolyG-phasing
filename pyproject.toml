@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "prolyG-phasing"
+version = "0.1.0"
+description = "Read/family interrupter-pattern and flanking-SNV haplotype labeling at polyG loci"
+readme = "README.md"
+requires-python = ">=3.11"  # snakemake>=8 (the `pipeline` extra) only supports 3.11+
+license = { text = "MIT" }
+authors = [
+    { name = "El-Kebir Lab", email = "melkebir@illinois.edu" },
+]
+dependencies = [
+    "numpy>=1.26,<3",
+    "scipy>=1.11",
+    "pandas>=2.0",
+    "tqdm>=4.65",
+]
+
+[project.scripts]
+prolyg-phasing = "prolyg_phasing.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "pytest-cov",
+    "ruff",
+    "pre-commit",
+]
+# `extract` needs pysam; `phase` (given an already-extracted panel.db) does
+# not, so a phase-only consumer never pays for it. Mirrors prolyG's own
+# `bam` extra and its stated reason (prolyG/pyproject.toml).
+bam = ["pysam>=0.22"]
+pipeline = ["snakemake>=8", "pandas>=2.0"]
+
+[project.urls]
+Homepage = "https://github.com/elkebir-group/prolyG-phasing"
+Parent = "https://github.com/elkebir-group/prolyG"
+
+[tool.hatch.build.targets.wheel]
+packages = ["prolyg_phasing"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B"]
+# E: pycodestyle errors;  F: pyflakes;  I: isort;
+# N: pep8-naming;  UP: pyupgrade;  B: flake8-bugbear
+
+[tool.ruff.lint.pep8-naming]
+# Paper-math notation carried over verbatim from prolyG's phasing.py (see
+# prolyG's own docs/glossary.md and pyproject.toml, which allowlists the
+# same names for the same reason).
+extend-ignore-names = [
+    # Multi-run CSR fields (per-strand X^tau_{i,u,l}) and per-family phasing
+    # counts, glossary "Multi-run length tuples" + CSR encoding.
+    "XA_offsets", "XA_ell", "XA_v", "XA_h",
+    "XB_offsets", "XB_ell", "XB_v", "XB_h",
+    "Xphs_maj", "Xphs_min",
+    # SNV phasing pair-counts: M = major allele, m = minor (the gamma=1/gamma=2
+    # major/minor convention, docs/glossary.md). Anchor/k-snv major alleles
+    # `aM`/`kM` and the 2x2 haplotype-concordance counts n_MM/n_Mm/n_mM
+    # (n_mm is already lowercase-clean).
+    "aM", "kM", "n_MM", "n_Mm", "n_mM",
+]
+

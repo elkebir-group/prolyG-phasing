@@ -1,0 +1,119 @@
+"""Standalone extract → phase pipeline for prolyg_phasing.
+
+Two rules, one per package CLI subcommand (`prolyg-phasing extract` /
+`prolyg-phasing phase`), driven by a plain `sample_id`/`bam` samples table —
+that's all extraction and phasing need.
+
+    snakemake -s workflow/Snakefile --configfile workflow/config/config.yaml --cores N
+
+Or run either stage directly on one sample, without Snakemake at all:
+
+    prolyg-phasing extract --bam s.bam --bed panel.bed --out-db panel.db
+    prolyg-phasing phase --panel-db panel.db --out-dir phasing/
+"""
+from pathlib import Path
+
+import pandas as pd
+
+WORKFLOW_DIR = Path(workflow.basedir)
+REPO_ROOT = WORKFLOW_DIR.parent
+
+configfile: str(WORKFLOW_DIR / "config" / "config.yaml")
+
+OUT_ROOT = Path(config["outputs"]["root"])
+if not OUT_ROOT.is_absolute():
+    OUT_ROOT = REPO_ROOT / OUT_ROOT
+
+BED_PATH = Path(config["panel"]["bed"])
+if not BED_PATH.is_absolute():
+    BED_PATH = WORKFLOW_DIR / BED_PATH
+
+_samples_path = Path(config["samples"])
+if not _samples_path.is_absolute():
+    _samples_path = WORKFLOW_DIR / _samples_path
+SAMPLES = pd.read_table(_samples_path, dtype=str).set_index("sample_id", drop=False)
+SAMPLE_IDS = list(SAMPLES["sample_id"])
+
+
+def bam_for(sample_id: str) -> str:
+    bam = SAMPLES.loc[sample_id, "bam"]
+    bam_path = Path(bam)
+    return str(bam_path if bam_path.is_absolute() else REPO_ROOT / bam_path)
+
+
+rule all:
+    input:
+        expand(str(OUT_ROOT / "{sample}" / "phasing" / "haplotype_calls.tsv"),
+               sample=SAMPLE_IDS),
+
+
+rule extract:
+    input:
+        bam=lambda wc: bam_for(wc.sample),
+        bed=str(BED_PATH),
+    output:
+        db=str(OUT_ROOT / "{sample}" / "extract" / "panel.db"),
+    params:
+        min_mapq=config["extraction"]["min_mapq"],
+        drop_chimeric_flag=(
+            "" if config["extraction"]["drop_chimeric"] else "--no-drop-chimeric"
+        ),
+        max_tlen=config["extraction"]["max_tlen"],
+        anchor_hamming_max=config["extraction"]["anchor_hamming_max"],
+        pair_disagreement_policy=config["extraction"]["pair_disagreement_policy"],
+        n_alleles_margin=config["extraction"]["n_alleles_margin"],
+        min_flanking_base_q=config["extraction"]["min_flanking_base_q"],
+    threads: workflow.cores
+    log:
+        str(OUT_ROOT / "{sample}" / "extract" / "extract.log"),
+    shell:
+        r"""
+        set -o pipefail
+        prolyg-phasing extract \
+            --bam {input.bam} \
+            --bed {input.bed} \
+            --out-db {output.db} \
+            --min-mapq {params.min_mapq} \
+            {params.drop_chimeric_flag} \
+            --max-tlen {params.max_tlen} \
+            --anchor-hamming-max {params.anchor_hamming_max} \
+            --pair-disagreement-policy {params.pair_disagreement_policy} \
+            --n-alleles-margin {params.n_alleles_margin} \
+            --min-flanking-base-q {params.min_flanking_base_q} \
+            --verbose 2>&1 | tee {log}
+        """
+
+
+rule phase:
+    input:
+        panel=str(OUT_ROOT / "{sample}" / "extract" / "panel.db"),
+    output:
+        pickle=str(OUT_ROOT / "{sample}" / "phasing" / "phasing.pkl"),
+        haplotype_calls=str(OUT_ROOT / "{sample}" / "phasing" / "haplotype_calls.tsv"),
+        locus_summary=str(OUT_ROOT / "{sample}" / "phasing" / "locus_summary.tsv"),
+        snv_calls=str(OUT_ROOT / "{sample}" / "phasing" / "snv_calls.tsv"),
+    params:
+        out_dir=str(OUT_ROOT / "{sample}" / "phasing"),
+        min_coverage=config["phasing"]["min_coverage"],
+        vaf_min=config["phasing"]["vaf_min"],
+        min_linkage_families=config["phasing"]["min_linkage_families"],
+        min_informative_positions=config["phasing"]["min_informative_positions"],
+        vote_margin=config["phasing"]["vote_margin"],
+        min_pattern_freq=config["phasing"]["min_pattern_freq"],
+    threads: 1
+    log:
+        str(OUT_ROOT / "{sample}" / "phasing" / "phase.log"),
+    shell:
+        r"""
+        set -o pipefail
+        prolyg-phasing phase \
+            --panel-db {input.panel} \
+            --out-dir {params.out_dir} \
+            --min-coverage {params.min_coverage} \
+            --vaf-min {params.vaf_min} \
+            --min-linkage-families {params.min_linkage_families} \
+            --min-informative-positions {params.min_informative_positions} \
+            --vote-margin {params.vote_margin} \
+            --min-pattern-freq {params.min_pattern_freq} \
+            2>&1 | tee {log}
+        """
