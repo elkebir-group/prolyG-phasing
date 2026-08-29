@@ -173,3 +173,50 @@ def test_remap_minus_orientation():
     snv_out = SNVCandidate("L1", 2010, "up", 0, "A", "C", 0.4, 60)
     assert _remap_snv_to_target_position(snv_in, locus) == 2
     assert _remap_snv_to_target_position(snv_out, locus) is None
+
+
+def test_anchored_matches_when_reference_loaded_from_snv_calls_table(tmp_path):
+    """A `--reference-snv-calls` CLI run must match a `--reference-phasing-pkl` run."""
+    import pandas as pd
+
+    from prolyg_phasing.io.phasing_tables import (
+        build_snv_calls,
+        haplotypes_from_snv_calls_table,
+    )
+    from prolyg_phasing.phasing import PhasingPanel
+
+    reference_locus = _make_locus(
+        flanking_strings=["CA|TT", "GG|TT"], counts=[70, 30],
+        up_width=2, dn_width=2,
+    )
+    reference_pp = PhasingPanel.from_panel(_panel("L1", reference_locus))
+    assert len(reference_pp.haplotypes["L1"].snvs) == 2  # both up positions informative
+
+    df = build_snv_calls(reference_pp)
+    path = tmp_path / "snv_calls.tsv"
+    df.to_csv(path, sep="\t", index=False)
+    reloaded = pd.read_csv(path, sep="\t")
+    from_table = haplotypes_from_snv_calls_table(reloaded)
+
+    target_locus = _make_locus(
+        flanking_strings=["TTCATTT|", "TTGGTTT|", "TTTTTTT|"],
+        counts=[1, 1, 1], up_width=7, dn_width=0, up_ref_start=998,
+    )
+    target_panel = _panel("L1", target_locus)
+
+    out_pkl = assign_flanking_haplotypes_anchored(
+        target_panel, reference_pp.haplotypes,
+        target_sample_id="TARGET", reference_sample_id="REF",
+    )
+    out_table = assign_flanking_haplotypes_anchored(
+        target_panel, from_table,
+        target_sample_id="TARGET", reference_sample_id="REF",
+    )
+
+    a_pkl, a_table = out_pkl.assignments["L1"], out_table.assignments["L1"]
+    assert list(a_pkl.label) == [LABEL_MAJOR, LABEL_MINOR, LABEL_UNK]
+    assert np.array_equal(a_pkl.label, a_table.label)
+    assert np.array_equal(a_pkl.n_major, a_table.n_major)
+    assert np.array_equal(a_pkl.n_minor, a_table.n_minor)
+    assert np.array_equal(a_pkl.n_other, a_table.n_other)
+    assert out_pkl.usable_snvs["L1"] == out_table.usable_snvs["L1"]

@@ -1,9 +1,12 @@
-"""Command-line entry point: ``prolyg-phasing extract`` / ``prolyg-phasing phase``.
+"""Command-line entry point: ``prolyg-phasing extract`` / ``phase`` / ``ref-phase``.
 
 Thin argparse wrappers, one per stage. Run directly against one BAM (or one
-already-extracted ``panel.db``), or drive the same two steps over many
+already-extracted ``panel.db``), or drive ``extract``/``phase`` over many
 samples through ``workflow/Snakefile``, which shells out to these same
-subcommands.
+subcommands. ``ref-phase`` is not wired into the Snakemake workflow: its
+two-panel (target + reference) input shape does not fit the workflow's
+one-row-per-sample table, and its only caller so far (prolyG's own
+tumor/normal bulk pipeline) already runs it as a library call.
 """
 
 from __future__ import annotations
@@ -11,12 +14,15 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from prolyg_phasing.anchor_phasing import assign_flanking_haplotypes_anchored
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import ExtractedPanel
 from prolyg_phasing.io.phasing_tables import (
+    build_anchor_phasing_summary,
     build_haplotype_calls,
     build_locus_summary,
     build_snv_calls,
+    haplotypes_from_snv_calls_table,
 )
 from prolyg_phasing.phasing import PhasingPanel
 
@@ -185,6 +191,92 @@ def _run_phase(args: argparse.Namespace) -> None:
     )
 
 
+_REF_PHASE_DESCRIPTION = """\
+Vote a target panel.db's reads against a *different*, already-phased
+reference panel's haplotype profiles -- e.g. a tumor bulk sample voted
+against its matched normal. No SNV discovery or haplotype-profile
+construction happens on the target: its germline SNVs and
+hap_major_profile/hap_minor_profile come entirely from the reference,
+supplied either as its phasing.pkl (--reference-phasing-pkl) or its
+snv_calls.tsv (--reference-snv-calls) -- the two are equivalent for this
+purpose, but the table is far smaller: phasing.pkl also carries
+PhasingPanel.assignments, an O(reads) structure this command never reads,
+while snv_calls.tsv is already the O(SNVs) summary. Each reference SNV is
+re-located inside the target's own flanking-string coordinates by genomic
+position; SNVs the target does not cover are dropped. Always writes
+ref_phasing.pkl plus ref_phasing_summary.tsv (per locus) into --out-dir."""
+
+
+def _add_ref_phase_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--target-panel-db", required=True, type=Path,
+                    help="panel.db of the panel being phased.")
+    reference = p.add_mutually_exclusive_group(required=True)
+    reference.add_argument("--reference-phasing-pkl", type=Path,
+                            help="phasing.pkl written by `prolyg-phasing "
+                                 "phase` for the reference panel.")
+    reference.add_argument("--reference-snv-calls", type=Path,
+                            help="snv_calls.tsv written by `prolyg-phasing "
+                                 "phase` for the reference panel. Carries "
+                                 "everything this command reads from the "
+                                 "reference, without the O(reads) "
+                                 "PhasingPanel.assignments phasing.pkl also "
+                                 "carries.")
+    p.add_argument("--target-sample-id", required=True,
+                    help="Identifier recorded on the output, not used to "
+                         "look up anything.")
+    p.add_argument("--reference-sample-id", required=True,
+                    help="Identifier recorded on the output, not used to "
+                         "look up anything.")
+    p.add_argument("--out-dir", required=True, type=Path,
+                    help="Directory for ref_phasing.pkl + "
+                         "ref_phasing_summary.tsv. Created if missing.")
+    p.add_argument("--min-informative-positions", type=int, default=1,
+                    help="Minimum number of usable reference SNVs a target "
+                         "read must have votes at (n_major + n_minor) to "
+                         "get a non-'unk' hap_major/hap_minor label.")
+    p.add_argument("--vote-margin", type=int, default=0,
+                    help="Minimum |n_major - n_minor| vote margin a target "
+                         "read needs to get a non-'unk' label; a tie or "
+                         "near-tie within this margin labels 'unk'.")
+
+
+def _run_ref_phase(args: argparse.Namespace) -> None:
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    target_panel = ExtractedPanel.load_db(args.target_panel_db)
+    if args.reference_phasing_pkl is not None:
+        reference_haplotypes = PhasingPanel.load_pickle(args.reference_phasing_pkl).haplotypes
+    else:
+        import pandas as pd
+        reference_haplotypes = haplotypes_from_snv_calls_table(
+            pd.read_csv(args.reference_snv_calls, sep="\t"),
+        )
+    anchored = assign_flanking_haplotypes_anchored(
+        target_panel, reference_haplotypes,
+        target_sample_id=args.target_sample_id,
+        reference_sample_id=args.reference_sample_id,
+        min_informative_positions=args.min_informative_positions,
+        vote_margin=args.vote_margin,
+    )
+    anchored.save_pickle(args.out_dir / "ref_phasing.pkl")
+    build_anchor_phasing_summary(target_panel, anchored).to_csv(
+        args.out_dir / "ref_phasing_summary.tsv", sep="\t", index=False,
+    )
+
+    n_loci = len(anchored.assignments)
+    n_phasable = sum(1 for v in anchored.usable_snvs.values() if len(v) > 0)
+    n_labeled_rows = sum(
+        int((a.label >= 0).sum()) for a in anchored.assignments.values()
+    )
+    n_total_rows = sum(a.n_rows for a in anchored.assignments.values())
+    print(
+        f"ref-phased {n_loci} loci ({n_phasable} with >=1 usable "
+        f"reference SNV) against {args.reference_sample_id}; "
+        f"{n_labeled_rows}/{n_total_rows} rows labeled major/minor; "
+        f"wrote {args.out_dir}"
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(
         prog="prolyg-phasing",
@@ -213,6 +305,16 @@ def main(argv: list[str] | None = None) -> None:
     )
     _add_phase_args(phase_p)
     phase_p.set_defaults(func=_run_phase)
+
+    ref_phase_p = sub.add_parser(
+        "ref-phase",
+        help="Vote a target panel.db's reads against a reference panel's "
+             "already-phased haplotypes.",
+        description=_REF_PHASE_DESCRIPTION,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    _add_ref_phase_args(ref_phase_p)
+    ref_phase_p.set_defaults(func=_run_ref_phase)
 
     args = p.parse_args(argv)
     args.func(args)

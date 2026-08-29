@@ -6,13 +6,16 @@ where a flanking single-nucleotide variant (SNV) resolves it, the haplotype
 it produces per-locus, per-family, and per-SNV tables. Every label is a
 direct readout of a read's own sequence.
 
-Two stages:
+Three stages:
 
 1. **Extract** — walk a BAM against a BED panel, collapse read pairs into a
    deduplicated, per-locus panel (`panel.db`).
 2. **Phase** — find flanking positions that are informative (heterozygous)
    in the panel, phase them into two haplotype profiles per locus, and label
    every read family that carries phase evidence.
+3. **Ref-phase** — vote a *different* panel's reads against an already-phased
+   reference panel's haplotype profiles, instead of phasing its own — e.g. a
+   tumor bulk sample voted against its matched normal.
 
 ## Install
 
@@ -48,9 +51,30 @@ prolyg-phasing phase \
 ```
 
 `phase` always writes `phasing.pkl` plus three tables into `--out-dir`:
-`haplotype_calls.tsv`, `locus_summary.tsv`, `snv_calls.tsv` (below). Run
-`prolyg-phasing extract --help` / `prolyg-phasing phase --help` for the full
-flag list.
+`haplotype_calls.tsv`, `locus_summary.tsv`, `snv_calls.tsv` (below).
+
+`ref-phase` votes a *different* panel's reads against an already-phased
+reference panel, instead of phasing its own — the reference's SNVs and
+haplotype profiles come entirely from a prior `phase` run:
+
+```bash
+prolyg-phasing extract \
+    --bam workflow/example/example.bam --bed workflow/example/panel.bed \
+    --out-db target_panel.db
+
+prolyg-phasing ref-phase \
+    --target-panel-db target_panel.db --reference-snv-calls phasing/snv_calls.tsv \
+    --target-sample-id TARGET --reference-sample-id REFERENCE \
+    --out-dir ref_phasing/
+```
+
+`--reference-phasing-pkl phasing/phasing.pkl` also works in place of
+`--reference-snv-calls`; the two are equivalent, but the table is smaller —
+`phasing.pkl` also carries the O(reads) per-family phase-label assignments
+this command never needs. `ref-phase` always writes `ref_phasing.pkl` plus
+`ref_phasing_summary.tsv` into `--out-dir` (below).
+
+Run `prolyg-phasing <command> --help` for any command's full flag list.
 
 ## Quickstart — Snakemake
 
@@ -152,15 +176,29 @@ snakemake -s workflow/Snakefile --cores N \
     is checked against. Blank for a dropped SNV (a dropped SNV is exactly
     one whose `pair_double_coverage` fell below that flag).
 
+- **`ref_phasing_summary.tsv`** (`ref-phase` only) — one row per target
+  locus. Unlike `locus_summary.tsv`, the target never phases its own
+  haplotypes — the profile is borrowed from the reference — so there is no
+  `hap_major_profile`/interrupter-concordance pair here, only the vote
+  outcome and the SNV coverage that produced it. Columns:
+  - `locus_id`.
+  - `n_usable_snvs` — reference SNVs the target locus's own flanking window
+    covers, after re-locating each by genomic position; `0` means this
+    locus phased all-`unk`.
+  - `n_rows` — this locus's row count; `n_families`/`n_families_labeled` —
+    distinct molecules, and the subset with a non-`unk` label.
+  - `reads_total`/`reads_major`/`reads_minor`/`reads_unk` — raw read
+    counts, split by vote outcome.
+
 ## Scope
 
 This package produces read-level and locus-level labels. A companion
 library, [prolyG](https://github.com/elkebir-group/prolyG), consumes these
 panels for PCR-chemistry inference and copy-number calling.
 
-`prolyg_phasing.anchor_phasing` additionally lets a caller vote one panel's
-reads against a *different*, already-phased panel's haplotype profiles
-(`assign_flanking_haplotypes_anchored`) — e.g. prolyG's bulk pipeline votes
-a tumor sample's reads against its matched normal. Library-only: no CLI
-subcommand or Snakemake rule wraps it, since prolyG is currently its only
-caller.
+`ref-phase` additionally lets a caller vote one panel's reads against a
+*different*, already-phased panel's haplotype profiles — e.g. prolyG's
+bulk pipeline votes a tumor sample's reads against its matched normal. It
+is not wired into the Snakemake workflow: its two-panel (target +
+reference) input shape does not fit the workflow's one-row-per-sample
+table.

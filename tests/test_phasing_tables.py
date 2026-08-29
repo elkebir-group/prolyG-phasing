@@ -9,6 +9,7 @@ from prolyg_phasing.io.phasing_tables import (
     build_haplotype_calls,
     build_locus_summary,
     build_snv_calls,
+    haplotypes_from_snv_calls_table,
 )
 from prolyg_phasing.phasing import PhasingPanel
 
@@ -266,3 +267,51 @@ def test_locus_summary_min_pattern_freq_filters_admitted_patterns():
     row_all = build_locus_summary(panel, pp, min_pattern_freq=0.0).iloc[0]
     assert row_default["n_admitted_patterns"] == 2
     assert row_all["n_admitted_patterns"] == 3
+
+
+# ---------------------------------------------------------------------------
+# haplotypes_from_snv_calls_table
+# ---------------------------------------------------------------------------
+
+
+def test_haplotypes_from_snv_calls_table_round_trips_through_csv(tmp_path):
+    # Same fixture as test_snv_calls_phased_and_dropped_rows: one phased SNV
+    # (the anchor) and one dropped-for-low-linkage SNV.
+    locus = _make_locus(
+        flanking_strings=["C.|", ".A|", "CA|", "G.|", ".G|", "GG|"],
+        counts=[40, 40, 5, 15, 15, 3],
+        seqs=["GGGGGG"] * 118,
+        up_width=2, dn_width=0,
+    )
+    panel = _panel("L1", locus)
+    pp = PhasingPanel.from_panel(panel)
+    df = build_snv_calls(pp)
+
+    path = tmp_path / "snv_calls.tsv"
+    df.to_csv(path, sep="\t", index=False)
+    reloaded = pd.read_csv(path, sep="\t")
+    rebuilt = haplotypes_from_snv_calls_table(reloaded)["L1"]
+    original = pp.haplotypes["L1"]
+
+    assert rebuilt.locus_id == original.locus_id
+    assert rebuilt.snvs == original.snvs
+    assert rebuilt.hap_major_profile == original.hap_major_profile
+    assert rebuilt.hap_minor_profile == original.hap_minor_profile
+    assert rebuilt.anchor_index == original.anchor_index
+    assert rebuilt.pair_discordance == original.pair_discordance
+    assert rebuilt.pair_double_coverage == original.pair_double_coverage
+    assert rebuilt.max_discordance == original.max_discordance
+    assert rebuilt.n_anchor_families == original.n_anchor_families
+    assert rebuilt.dropped_low_linkage_snvs == original.dropped_low_linkage_snvs
+
+
+def test_haplotypes_from_snv_calls_table_omits_zero_snv_loci():
+    locus = _make_locus(
+        flanking_strings=["TT|TT"], counts=[50], seqs=["GGGGGG"] * 50,
+        up_width=2, dn_width=2,
+    )
+    panel = _panel("L1", locus)
+    pp = PhasingPanel.from_panel(panel)
+    df = build_snv_calls(pp)
+    assert len(df) == 0
+    assert haplotypes_from_snv_calls_table(df) == {}
