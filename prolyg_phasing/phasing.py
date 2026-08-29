@@ -53,7 +53,7 @@ _ACGT = ("A", "C", "G", "T")
 #: accumulator :func:`family_consensus_counts` reduces over: at 4 × 8 bytes a cell,
 #: 2**22 cells is a ~134 MB peak regardless of how deep the locus is, and the block
 #: never changes the result -- only how much of the window is scored at a time.
-_CONSENSUS_POSITION_BLOCK = 2 ** 22
+CONSENSUS_POSITION_BLOCK = 2 ** 22
 
 
 def flanking_char_matrix(flanking_seq: np.ndarray, total_width: int) -> np.ndarray:
@@ -301,7 +301,7 @@ def family_consensus_counts(
     # which is hundreds of MB against a per-locus working set the pipeline sizes at
     # ~50 MB. The block width only bounds memory; every reduction below is over the
     # full family axis, so the result is identical to scoring the window at once.
-    block = max(1, _CONSENSUS_POSITION_BLOCK // max(n_fam, 1))
+    block = max(1, CONSENSUS_POSITION_BLOCK // max(n_fam, 1))
     for p0 in range(0, total_width, block):
         p1 = min(p0 + block, total_width)
         acc = np.empty((n_fam, p1 - p0, 4), dtype=np.float64)
@@ -720,7 +720,7 @@ def _per_row_bases_at_positions(
     ``positions`` are 0-based offsets into the locus's ``up + "|" + dn``
     flanking string. Uncovered positions in a row read as ``'.'`` (the
     extraction pad). Shared by the normal-side
-    :func:`_per_row_bases_at_snvs` (offsets from each SNV's
+    :func:`per_row_bases_at_snvs` (offsets from each SNV's
     ``string_index``) and the anchored path (offsets remapped from the
     reference panel's SNV ``ref_pos`` via
     :func:`~prolyg_phasing.anchor_phasing._remap_snv_to_target_position`).
@@ -738,7 +738,7 @@ def _per_row_bases_at_positions(
     return fid_bases[locus.flanking_id]
 
 
-def _per_row_bases_at_snvs(
+def per_row_bases_at_snvs(
     locus: ExtractedLocus, snvs: list[SNVCandidate],
 ) -> np.ndarray:
     """Return (n_rows, n_snvs) U1 array of called bases at each SNV position.
@@ -761,7 +761,7 @@ def _family_bases_at_snvs(
 ) -> np.ndarray:
     """``(n_families, n_snvs)`` consensus base per molecule at each SNV.
 
-    The family counterpart of :func:`_per_row_bases_at_snvs`: one row per
+    The family counterpart of :func:`per_row_bases_at_snvs`: one row per
     molecule rather than per deduplicated read record, so a pair of positions
     can be read off the same molecule.
     """
@@ -927,7 +927,7 @@ def _assign_locus(
     min_informative_positions: int,
     vote_margin: int,
 ) -> FlankingHaplotypeAssignment:
-    bases = _per_row_bases_at_snvs(locus, list(hap.snvs))  # (n_rows, n_snvs) U1
+    bases = per_row_bases_at_snvs(locus, list(hap.snvs))  # (n_rows, n_snvs) U1
     return _vote_assignment(
         locus_id,
         bases,
