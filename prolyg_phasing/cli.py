@@ -14,17 +14,17 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from prolyg_phasing.anchor_phasing import assign_flanking_haplotypes_anchored
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import ExtractedPanel
 from prolyg_phasing.io.phasing_tables import (
-    build_anchor_phasing_summary,
     build_haplotype_calls,
     build_locus_summary,
+    build_ref_phasing_summary,
     build_snv_calls,
     haplotypes_from_snv_calls_table,
 )
 from prolyg_phasing.phasing import PhasingPanel
+from prolyg_phasing.ref_phasing import assign_flanking_haplotypes_ref
 
 _EXTRACT_DESCRIPTION = """\
 Walk a sorted, indexed BAM against a BED panel and write the extracted
@@ -251,7 +251,7 @@ def _run_ref_phase(args: argparse.Namespace) -> None:
         reference_haplotypes = haplotypes_from_snv_calls_table(
             pd.read_csv(args.reference_snv_calls, sep="\t"),
         )
-    anchored = assign_flanking_haplotypes_anchored(
+    anchored = assign_flanking_haplotypes_ref(
         target_panel, reference_haplotypes,
         target_sample_id=args.target_sample_id,
         reference_sample_id=args.reference_sample_id,
@@ -259,7 +259,7 @@ def _run_ref_phase(args: argparse.Namespace) -> None:
         vote_margin=args.vote_margin,
     )
     anchored.save_pickle(args.out_dir / "ref_phasing.pkl")
-    build_anchor_phasing_summary(target_panel, anchored).to_csv(
+    build_ref_phasing_summary(target_panel, anchored).to_csv(
         args.out_dir / "ref_phasing_summary.tsv", sep="\t", index=False,
     )
 

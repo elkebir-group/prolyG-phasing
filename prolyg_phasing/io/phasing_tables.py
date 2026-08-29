@@ -9,8 +9,8 @@ interrupter pattern) and asks whether they agree.
 
 Three tables (``build_haplotype_calls``/``build_locus_summary``/
 ``build_snv_calls``) describe a same-panel :class:`~prolyg_phasing.phasing.PhasingPanel`.
-A fourth, ``build_anchor_phasing_summary``, describes an
-:class:`~prolyg_phasing.anchor_phasing.AnchoredPhasingPanel` instead — a
+A fourth, ``build_ref_phasing_summary``, describes an
+:class:`~prolyg_phasing.ref_phasing.RefPhasingPanel` instead — a
 different result type, since an anchored panel borrows its haplotype
 profiles from a reference panel rather than phasing its own.
 
@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from prolyg_phasing.anchor_phasing import AnchoredPhasingPanel
 from prolyg_phasing.io.format import format_pattern
 from prolyg_phasing.io.panel import ExtractedPanel, majority_pattern_per_rf
 from prolyg_phasing.phasing import (
@@ -41,6 +40,7 @@ from prolyg_phasing.phasing import (
     PhasingPanel,
     SNVCandidate,
 )
+from prolyg_phasing.ref_phasing import RefPhasingPanel
 
 _LABEL_NAME = {LABEL_MAJOR: "hap_major", LABEL_MINOR: "hap_minor", LABEL_UNK: "unk"}
 
@@ -228,12 +228,12 @@ def build_locus_summary(panel: ExtractedPanel, pp: PhasingPanel, *, min_pattern_
     return pd.DataFrame(rows)
 
 
-def build_anchor_phasing_summary(target_panel: ExtractedPanel, anchored: AnchoredPhasingPanel):
+def build_ref_phasing_summary(target_panel: ExtractedPanel, anchored: RefPhasingPanel):
     """One row per locus: anchored-phasing QC over the target panel.
 
     Unlike :func:`build_locus_summary`, the target panel never phases its own
     haplotypes — the profile is borrowed from the reference panel
-    (:func:`~prolyg_phasing.anchor_phasing.assign_flanking_haplotypes_anchored`)
+    (:func:`~prolyg_phasing.ref_phasing.assign_flanking_haplotypes_ref`)
     — so there is no ``hap_major_profile``/interrupter-concordance pair here,
     only the vote outcome and the SNV coverage that produced it.
 
@@ -285,10 +285,10 @@ def haplotypes_from_snv_calls_table(df) -> dict[str, FlankingHaplotype]:
     A locus with zero informative SNVs contributes no rows to
     ``build_snv_calls`` at all, so it has no key here either — the same
     "locus absent means zero-SNV" convention
-    :func:`~prolyg_phasing.anchor_phasing.assign_flanking_haplotypes_anchored`
+    :func:`~prolyg_phasing.ref_phasing.assign_flanking_haplotypes_ref`
     already applies to a ``phasing.pkl``-sourced ``reference_phased`` dict
     that never has a missing key. A caller iterating this dict directly
-    (rather than through ``assign_flanking_haplotypes_anchored``) must
+    (rather than through ``assign_flanking_haplotypes_ref``) must
     account for that difference.
     """
     out: dict[str, FlankingHaplotype] = {}

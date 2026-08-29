@@ -1,13 +1,8 @@
-"""Tests for prolyg_phasing.anchor_phasing."""
+"""Tests for prolyg_phasing.ref_phasing."""
 from __future__ import annotations
 
 import numpy as np
 
-from prolyg_phasing.anchor_phasing import (
-    AnchoredPhasingPanel,
-    _remap_snv_to_target_position,
-    assign_flanking_haplotypes_anchored,
-)
 from prolyg_phasing.io.panel import ExtractedLocus, ExtractedPanel, ExtractionProvenance
 from prolyg_phasing.phasing import (
     LABEL_MAJOR,
@@ -15,6 +10,11 @@ from prolyg_phasing.phasing import (
     LABEL_UNK,
     FlankingHaplotype,
     SNVCandidate,
+)
+from prolyg_phasing.ref_phasing import (
+    RefPhasingPanel,
+    _remap_snv_to_target_position,
+    assign_flanking_haplotypes_ref,
 )
 
 
@@ -105,18 +105,18 @@ def _reference_hap(ref_pos: int = 1002, major: str = "A", minor: str = "C"):
     )
 
 
-def test_anchored_remap_uses_ref_pos_not_string_index():
+def test_ref_phase_remap_uses_ref_pos_not_string_index():
     # Target window shifted left and wider: ref_pos 1002 -> target offset 4
     # (reference string_index is 2 and must be ignored).
     target_locus = _make_locus(
         flanking_strings=["TTTTATT|", "TTTTCTT|", "TTTT.TT|", "TTTTGTT|"],
         counts=[1, 1, 1, 1], up_width=7, dn_width=0, up_ref_start=998,
     )
-    out = assign_flanking_haplotypes_anchored(
+    out = assign_flanking_haplotypes_ref(
         _panel("L1", target_locus), {"L1": _reference_hap()},
         target_sample_id="TARGET", reference_sample_id="REF",
     )
-    assert isinstance(out, AnchoredPhasingPanel)
+    assert isinstance(out, RefPhasingPanel)
     a = out.assignments["L1"]
     assert list(a.label) == [LABEL_MAJOR, LABEL_MINOR, LABEL_UNK, LABEL_UNK]
     assert list(a.n_major) == [1, 0, 0, 0]
@@ -126,7 +126,7 @@ def test_anchored_remap_uses_ref_pos_not_string_index():
     assert out.usable_snvs["L1"][0].ref_pos == 1002
 
 
-def test_anchored_drops_snv_outside_target_window():
+def test_ref_phase_drops_snv_outside_target_window():
     snv_cov = SNVCandidate("L1", 1002, "up", 2, "A", "C", 0.4, 60)
     snv_out = SNVCandidate("L1", 990, "up", 0, "A", "C", 0.4, 60)
     hap = FlankingHaplotype(
@@ -140,7 +140,7 @@ def test_anchored_drops_snv_outside_target_window():
         flanking_strings=["TTTTATT|"], counts=[1],
         up_width=7, dn_width=0, up_ref_start=998,
     )
-    out = assign_flanking_haplotypes_anchored(
+    out = assign_flanking_haplotypes_ref(
         _panel("L1", target_locus), {"L1": hap},
         target_sample_id="TARGET", reference_sample_id="REF",
     )
@@ -150,12 +150,12 @@ def test_anchored_drops_snv_outside_target_window():
     assert list(out.assignments["L1"].label) == [LABEL_MAJOR]
 
 
-def test_anchored_missing_locus_all_unk():
+def test_ref_phase_missing_locus_all_unk():
     target_locus = _make_locus(
         flanking_strings=["TTTTATT|", "TTTTCTT|"], counts=[1, 1],
         up_width=7, dn_width=0, up_ref_start=998,
     )
-    out = assign_flanking_haplotypes_anchored(
+    out = assign_flanking_haplotypes_ref(
         _panel("L1", target_locus), {},  # no reference phasing for L1
         target_sample_id="TARGET", reference_sample_id="REF",
     )
@@ -175,7 +175,7 @@ def test_remap_minus_orientation():
     assert _remap_snv_to_target_position(snv_out, locus) is None
 
 
-def test_anchored_matches_when_reference_loaded_from_snv_calls_table(tmp_path):
+def test_ref_phase_matches_when_reference_loaded_from_snv_calls_table(tmp_path):
     """A `--reference-snv-calls` CLI run must match a `--reference-phasing-pkl` run."""
     import pandas as pd
 
@@ -204,11 +204,11 @@ def test_anchored_matches_when_reference_loaded_from_snv_calls_table(tmp_path):
     )
     target_panel = _panel("L1", target_locus)
 
-    out_pkl = assign_flanking_haplotypes_anchored(
+    out_pkl = assign_flanking_haplotypes_ref(
         target_panel, reference_pp.haplotypes,
         target_sample_id="TARGET", reference_sample_id="REF",
     )
-    out_table = assign_flanking_haplotypes_anchored(
+    out_table = assign_flanking_haplotypes_ref(
         target_panel, from_table,
         target_sample_id="TARGET", reference_sample_id="REF",
     )

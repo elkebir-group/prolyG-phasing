@@ -55,7 +55,7 @@ def _remap_snv_to_target_position(
 
 
 @dataclasses.dataclass
-class AnchoredPhasingPanel:
+class RefPhasingPanel:
     """Per-read haplotype labels for one panel, anchored on another's profile.
 
     Mirrors :class:`~prolyg_phasing.phasing.PhasingPanel`'s shape but for
@@ -94,12 +94,12 @@ class AnchoredPhasingPanel:
             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     @classmethod
-    def load_pickle(cls, path: str | Path) -> AnchoredPhasingPanel:
+    def load_pickle(cls, path: str | Path) -> RefPhasingPanel:
         with Path(path).open("rb") as f:
             return pickle.load(f)
 
 
-def assign_flanking_haplotypes_anchored(
+def assign_flanking_haplotypes_ref(
     target_panel: ExtractedPanel,
     reference_phased: dict[str, FlankingHaplotype],
     *,
@@ -107,7 +107,7 @@ def assign_flanking_haplotypes_anchored(
     reference_sample_id: str,
     min_informative_positions: int = 1,
     vote_margin: int = 0,
-) -> AnchoredPhasingPanel:
+) -> RefPhasingPanel:
     """Phase each target read against the reference panel's haplotypes.
 
     The germline SNV set and the ``hap_major_profile`` / ``hap_minor_profile``
@@ -138,7 +138,7 @@ def assign_flanking_haplotypes_anchored(
 
     Returns
     -------
-    AnchoredPhasingPanel
+    RefPhasingPanel
     """
     assignments: dict[str, FlankingHaplotypeAssignment] = {}
     usable: dict[str, tuple[SNVCandidate, ...]] = {}
@@ -180,7 +180,7 @@ def assign_flanking_haplotypes_anchored(
         )
         usable[locus_id] = tuple(kept_snvs)
 
-    return AnchoredPhasingPanel(
+    return RefPhasingPanel(
         target_sample_id=target_sample_id,
         reference_sample_id=reference_sample_id,
         assignments=assignments,
