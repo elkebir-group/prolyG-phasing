@@ -19,6 +19,9 @@ from __future__ import annotations
 import dataclasses
 from typing import TYPE_CHECKING
 
+import numpy as np
+from numpy.lib.stride_tricks import as_strided
+
 if TYPE_CHECKING:
     import pysam
 
@@ -35,21 +38,23 @@ def hamming_search(read_seq: str, anchor: str) -> tuple[int, int]:
     """Slide `anchor` across `read_seq`; return `(min_hamming, offset)`.
 
     On no match (`len(read_seq) < len(anchor)`), returns
-    ``(len(anchor), -1)``.
+    ``(len(anchor), -1)``. On a tie, returns the leftmost offset.
     """
     k = len(anchor)
-    if len(read_seq) < k:
+    n = len(read_seq)
+    if n < k:
         return (k, -1)
-    best = k + 1
-    best_off = -1
-    for i in range(len(read_seq) - k + 1):
-        d = sum(c1 != c2 for c1, c2 in zip(read_seq[i:i + k], anchor, strict=True))
-        if d < best:
-            best = d
-            best_off = i
-            if best == 0:
-                break
-    return (best, best_off)
+    read_bytes = np.frombuffer(read_seq.encode("ascii"), dtype=np.uint8)
+    anchor_bytes = np.frombuffer(anchor.encode("ascii"), dtype=np.uint8)
+    windows = as_strided(
+        read_bytes,
+        shape=(n - k + 1, k),
+        strides=(read_bytes.strides[0], read_bytes.strides[0]),
+        writeable=False,
+    )
+    distances = (windows != anchor_bytes).sum(axis=1)
+    best_off = distances.argmin()
+    return (int(distances[best_off]), int(best_off))
 
 
 # ---------------------------------------------------------------------------
