@@ -1,11 +1,13 @@
 """Tests for prolyg_phasing.io._anchors.hamming_search.
 
-The function scores a whole batch of reads against one anchor with a
-single set of numpy calls, because extraction profiles as CPU-bound on
-it. These tests pin its contract against a naive per-read reference
-implementation so a future rewrite cannot silently change behavior, and
-they mix read lengths within a batch — the ragged case is where a
-batched implementation can go wrong without a single-read test noticing.
+The function scores a whole batch of reads against one anchor, settling
+the reads that carry the anchor verbatim with a substring search and
+scoring the rest with one set of numpy calls per block, because
+extraction profiles as CPU-bound on it. These tests pin its contract
+against a naive per-read reference implementation so a future rewrite
+cannot silently change behavior. They mix read lengths within a batch and
+mix exact against inexact reads — those are where a batched
+implementation can go wrong without a single-read test noticing.
 """
 
 from __future__ import annotations
@@ -77,9 +79,21 @@ def test_empty_batch():
 def test_batch_of_mixed_lengths_matches_per_read_reference():
     # A read longer than the others must not lend its trailing offsets to
     # a shorter neighbour, and a read shorter than the anchor must not
-    # borrow a placement from the batch.
+    # borrow a placement from the batch. The batch also mixes reads that
+    # carry the anchor verbatim with reads that do not, so the two paths
+    # have to write their results back to the right rows.
     anchor = "ACGTA"
     reads = ["ACGTA", "TT", "TTTTTACGTATTTTTTTTT", "", "GGGGGGGGGG", "ACGTA" * 4]
+    distances, offsets = hamming_search(reads, anchor)
+    for i, read in enumerate(reads):
+        assert (int(distances[i]), int(offsets[i])) == naive_hamming_search(read, anchor)
+
+
+def test_batch_with_no_exact_match_anywhere():
+    # The substring shortcut fires for nobody, so every read goes through
+    # the windowed scan and the write-back path for it.
+    anchor = "ACGTACGTAC"
+    reads = ["TTTTTTTTTTTTTTT", "GGGGGGGGGGGG", "ACGTACGTAT", "AC"]
     distances, offsets = hamming_search(reads, anchor)
     for i, read in enumerate(reads):
         assert (int(distances[i]), int(offsets[i])) == naive_hamming_search(read, anchor)
