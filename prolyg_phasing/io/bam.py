@@ -129,53 +129,43 @@ def _alignment_flanking(
     """
     if r.query_sequence is None or r.query_qualities is None:
         return {}, {}
-    seq = r.query_sequence
+    # Upper-case the whole read once; indexing single characters out of an
+    # already-upper string is far cheaper than calling `.upper()` per base
+    # (the loop below runs once per aligned position, up to read length).
+    seq = r.query_sequence.upper()
     quals = r.query_qualities
-
-    if ref_orientation == "+":
-        up_anchor_ref_start = bed_start - g_walk_up - anchor_k
-        dn_anchor_ref_end = bed_end + g_walk_dn + anchor_k
-
-        def to_up(refpos: int) -> int | None:
-            return (up_anchor_ref_start - 1 - refpos
-                    if refpos < up_anchor_ref_start else None)
-
-        def to_dn(refpos: int) -> int | None:
-            return (refpos - dn_anchor_ref_end
-                    if refpos >= dn_anchor_ref_end else None)
-
-        def canonicalize(b: str) -> str:
-            return b
-    else:
-        up_anchor_ref_end = bed_end + g_walk_up + anchor_k
-        dn_anchor_ref_start = bed_start - g_walk_dn - anchor_k
-
-        def to_up(refpos: int) -> int | None:
-            return (refpos - up_anchor_ref_end
-                    if refpos >= up_anchor_ref_end else None)
-
-        def to_dn(refpos: int) -> int | None:
-            return (dn_anchor_ref_start - 1 - refpos
-                    if refpos < dn_anchor_ref_start else None)
-
-        def canonicalize(b: str) -> str:
-            return b.translate(_COMP_TABLE)
+    aligned_pairs = r.get_aligned_pairs(with_seq=False)
 
     up: dict[int, str] = {}
     dn: dict[int, str] = {}
-    for qpos, refpos in r.get_aligned_pairs(with_seq=False):
-        if qpos is None or refpos is None:
-            continue
-        if quals[qpos] < min_base_q:
-            continue
-        base = seq[qpos].upper()
-        d = to_up(refpos)
-        if d is not None:
-            up[d] = canonicalize(base)
-            continue
-        d = to_dn(refpos)
-        if d is not None:
-            dn[d] = canonicalize(base)
+    # `to_up`/`to_dn`/`canonicalize` used to be per-call closures; inlined
+    # here (one straight-line loop per orientation, chosen once outside the
+    # per-position loop) since the per-position Python function-call
+    # overhead dwarfed the trivial arithmetic they did.
+    if ref_orientation == "+":
+        up_anchor_ref_start = bed_start - g_walk_up - anchor_k
+        dn_anchor_ref_end = bed_end + g_walk_dn + anchor_k
+        for qpos, refpos in aligned_pairs:
+            if qpos is None or refpos is None:
+                continue
+            if quals[qpos] < min_base_q:
+                continue
+            if refpos < up_anchor_ref_start:
+                up[up_anchor_ref_start - 1 - refpos] = seq[qpos]
+            elif refpos >= dn_anchor_ref_end:
+                dn[refpos - dn_anchor_ref_end] = seq[qpos]
+    else:
+        up_anchor_ref_end = bed_end + g_walk_up + anchor_k
+        dn_anchor_ref_start = bed_start - g_walk_dn - anchor_k
+        for qpos, refpos in aligned_pairs:
+            if qpos is None or refpos is None:
+                continue
+            if quals[qpos] < min_base_q:
+                continue
+            if refpos >= up_anchor_ref_end:
+                up[refpos - up_anchor_ref_end] = seq[qpos].translate(_COMP_TABLE)
+            elif refpos < dn_anchor_ref_start:
+                dn[dn_anchor_ref_start - 1 - refpos] = seq[qpos].translate(_COMP_TABLE)
     return up, dn
 
 
@@ -403,8 +393,17 @@ def _extract_locus(
     flanking_seq_to_id: dict[str, int] = {}
     read_counts: Counter = Counter()
     for mi_, strand_, ia_, up, dn in accepted:
-        up_chars = [up.get(flanking_up_width - 1 - i, ".") for i in range(flanking_up_width)]
-        dn_chars = [dn.get(i, ".") for i in range(flanking_dn_width)]
+        # `flanking_up_width`/`flanking_dn_width` are the panel-wide max
+        # over all accepted reads at this locus; a `width`-many `.get()`
+        # call per read (mostly misses, for reads narrower than the widest
+        # outlier) used to dominate this loop. Fill the placeholder list
+        # once, then overwrite only the positions this read actually has.
+        up_chars = ["."] * flanking_up_width
+        for pos, base in up.items():
+            up_chars[flanking_up_width - 1 - pos] = base
+        dn_chars = ["."] * flanking_dn_width
+        for pos, base in dn.items():
+            dn_chars[pos] = base
         fl = "".join(up_chars) + "|" + "".join(dn_chars)
         fid = flanking_seq_to_id.get(fl)
         if fid is None:
