@@ -701,15 +701,14 @@ def extract_panel(
 
     bam = pysam.AlignmentFile(str(bam_path), "rb")
 
-    # Per-locus read counts + anchor info + QC, accumulated.
-    per_locus_counts: dict[str, Counter] = {}
-    per_locus_anchor: dict[str, AnchorResult] = {}
-    per_locus_qc: dict[str, dict] = {}
-    per_locus_bed: dict[str, tuple[str, int, int]] = {}
-    per_locus_flanking_seqs: dict[str, list[str]] = {}
-    per_locus_flanking_up_width: dict[str, int] = {}
-    per_locus_flanking_dn_width: dict[str, int] = {}
-
+    # One pass: extract a locus and immediately turn it into its
+    # `ExtractedLocus`, so the locus's `Counter` — one 4-tuple key per
+    # deduped row, and a full panel has millions of them — is released
+    # before the next locus starts. Holding every locus's Counter across
+    # a second pass kept those tuples alive to the end of the run, which
+    # both raised peak memory and made every cyclic-collection pass walk
+    # them again.
+    loci: dict[str, ExtractedLocus] = {}
     max_observed_run_length = 0
 
     bed_iter = (
@@ -718,17 +717,17 @@ def extract_panel(
 
     try:
         for name, chrom, bed_start, bed_end in bed_iter:
-            per_locus_bed[name] = (chrom, bed_start, bed_end)
-
             anchor = _build_anchors_for_locus(
                 bam, chrom, bed_start, bed_end,
                 pad=REF_WINDOW_PAD, k=FLANKING_SEQ_LEN, min_mapq=min_mapq,
             )
-            per_locus_anchor[name] = anchor
 
             if anchor.status != "anchorable":
-                per_locus_counts[name] = Counter()
-                per_locus_qc[name] = {
+                counts: Counter = Counter()
+                flanking_seqs: list[str] = []
+                up_width = 0
+                dn_width = 0
+                qc = {
                     "n_alignments_overlap_locus": 0,
                     "n_alignments_drop_mapq": 0,
                     "n_alignments_drop_sa": 0,
@@ -737,139 +736,32 @@ def extract_panel(
                     "n_read_pairs": 0,
                     "n_read_pairs_drop_disagree": 0,
                 }
-                per_locus_flanking_seqs[name] = []
-                per_locus_flanking_up_width[name] = 0
-                per_locus_flanking_dn_width[name] = 0
-                continue
+            else:
+                counts, flanking_seqs, up_width, dn_width, qc = _extract_locus(
+                    bam, chrom, bed_start, bed_end,
+                    ref_orientation=anchor.ref_orientation,
+                    anchor_up=anchor.upstream_anchor,
+                    anchor_dn=anchor.downstream_anchor,
+                    anchor_k=FLANKING_SEQ_LEN,
+                    g_walk_up=anchor.g_walk_up,
+                    g_walk_dn=anchor.g_walk_dn,
+                    min_mapq=min_mapq,
+                    drop_chimeric=drop_chimeric,
+                    max_tlen=max_tlen,
+                    anchor_hamming_max=anchor_hamming_max,
+                    min_base_q=min_base_q,
+                )
 
-            read_counts, flanking_seqs, up_width, dn_width, qc = _extract_locus(
-                bam, chrom, bed_start, bed_end,
-                ref_orientation=anchor.ref_orientation,
-                anchor_up=anchor.upstream_anchor,
-                anchor_dn=anchor.downstream_anchor,
-                anchor_k=FLANKING_SEQ_LEN,
-                g_walk_up=anchor.g_walk_up,
-                g_walk_dn=anchor.g_walk_dn,
-                min_mapq=min_mapq,
-                drop_chimeric=drop_chimeric,
-                max_tlen=max_tlen,
-                anchor_hamming_max=anchor_hamming_max,
-                min_base_q=min_base_q,
+            locus = _build_locus(
+                name, chrom, bed_start, bed_end,
+                anchor=anchor, counts=counts, qc=qc,
+                flanking_seqs=flanking_seqs, up_width=up_width, dn_width=dn_width,
             )
-            per_locus_counts[name] = read_counts
-            per_locus_qc[name] = qc
-            per_locus_flanking_seqs[name] = flanking_seqs
-            per_locus_flanking_up_width[name] = up_width
-            per_locus_flanking_dn_width[name] = dn_width
+            loci[name] = locus
+            if locus.max_observed_run_length > max_observed_run_length:
+                max_observed_run_length = locus.max_observed_run_length
     finally:
         bam.close()
-
-    # Build ExtractedLocus per BED row. The panel-wide
-    # `max_observed_run_length` is the running maximum of the per-locus
-    # ones, taken from the same parse this loop already needs.
-    loci: dict[str, ExtractedLocus] = {}
-    for name, chrom, bed_start, bed_end in bed_rows:
-        anchor = per_locus_anchor[name]
-        counts = per_locus_counts[name]
-        qc = per_locus_qc[name]
-
-        if anchor.ref_inter_anchor_seq:
-            ref_run_lengths = parse_run_lengths(anchor.ref_inter_anchor_seq)
-        else:
-            ref_run_lengths = ()
-
-        if counts:
-            mi_arr = np.asarray([k[0] for k in counts], dtype=object)
-            strand_arr = np.asarray([k[1] for k in counts], dtype="U1")
-            seq_arr = np.asarray([k[2] for k in counts], dtype=object)
-            flanking_id_arr = np.asarray([k[3] for k in counts], dtype=np.int32)
-            count_arr = np.asarray(list(counts.values()), dtype=np.int64)
-        else:
-            mi_arr = np.empty(0, dtype=object)
-            strand_arr = np.empty(0, dtype="U1")
-            seq_arr = np.empty(0, dtype=object)
-            flanking_id_arr = np.empty(0, dtype=np.int32)
-            count_arr = np.empty(0, dtype=np.int64)
-
-        flanking_seqs = per_locus_flanking_seqs[name]
-        flanking_seq_arr = np.asarray(flanking_seqs, dtype=object)
-        up_width = per_locus_flanking_up_width[name]
-        dn_width = per_locus_flanking_dn_width[name]
-
-        if anchor.status == "anchorable":
-            if anchor.ref_orientation == "+":
-                flanking_up_ref_pos_start = (
-                    bed_start - anchor.g_walk_up - FLANKING_SEQ_LEN - up_width
-                )
-                flanking_dn_ref_pos_start = (
-                    bed_end + anchor.g_walk_dn + FLANKING_SEQ_LEN
-                )
-            else:
-                flanking_up_ref_pos_start = (
-                    bed_end + anchor.g_walk_up + FLANKING_SEQ_LEN + up_width - 1
-                )
-                flanking_dn_ref_pos_start = (
-                    bed_start - anchor.g_walk_dn - FLANKING_SEQ_LEN - 1
-                )
-        else:
-            flanking_up_ref_pos_start = 0
-            flanking_dn_ref_pos_start = 0
-
-        # ``n_runs`` is set from the data: max parsed tuple length across all
-        # accepted reads at this locus. The reference-derived
-        # ``reference_run_lengths`` is kept as diagnostic context but is no
-        # longer authoritative for $S_i$. The inference adapter
-        # (``ExtractedPanel.to_loci``) recomputes the locus-level max run
-        # count from the observed patterns; extraction stays faithful (no
-        # pattern filter here).
-        per_locus_max_n_runs = 0
-        per_locus_max = 0
-        for s in seq_arr:
-            runs = parse_run_lengths(str(s))
-            if runs:
-                if len(runs) > per_locus_max_n_runs:
-                    per_locus_max_n_runs = len(runs)
-                m = max(runs)
-                if m > per_locus_max:
-                    per_locus_max = m
-        n_runs = per_locus_max_n_runs if per_locus_max_n_runs > 0 else 0
-        if per_locus_max > max_observed_run_length:
-            max_observed_run_length = per_locus_max
-
-        loci[name] = ExtractedLocus(
-            mi=mi_arr,
-            strand=strand_arr,
-            seq=seq_arr,
-            count=count_arr,
-            flanking_id=flanking_id_arr,
-            flanking_seq=flanking_seq_arr,
-            n_runs=n_runs,
-            ref_inter_anchor_seq=anchor.ref_inter_anchor_seq,
-            reference_run_lengths=ref_run_lengths,
-            chrom=chrom,
-            bed_start=bed_start,
-            bed_end=bed_end,
-            bed_name=name,
-            ref_orientation=anchor.ref_orientation,
-            upstream_anchor=anchor.upstream_anchor,
-            downstream_anchor=anchor.downstream_anchor,
-            anchorability_status=anchor.status,
-            max_observed_run_length=per_locus_max,
-            n_alignments_overlap_locus=qc["n_alignments_overlap_locus"],
-            n_alignments_drop_mapq=qc["n_alignments_drop_mapq"],
-            n_alignments_drop_sa=qc["n_alignments_drop_sa"],
-            n_alignments_drop_tlen=qc["n_alignments_drop_tlen"],
-            n_alignments_drop_anchor=qc["n_alignments_drop_anchor"],
-            n_read_pairs=qc["n_read_pairs"],
-            n_read_pairs_drop_disagree=qc["n_read_pairs_drop_disagree"],
-            n_reads=int(count_arr.sum()),
-            g_walk_up=anchor.g_walk_up,
-            g_walk_dn=anchor.g_walk_dn,
-            flanking_up_width=up_width,
-            flanking_dn_width=dn_width,
-            flanking_up_ref_pos_start=flanking_up_ref_pos_start,
-            flanking_dn_ref_pos_start=flanking_dn_ref_pos_start,
-        )
 
     n_alleles = max_observed_run_length + n_alleles_margin
 
@@ -889,3 +781,113 @@ def extract_panel(
     )
 
     return ExtractedPanel(loci=loci, n_alleles=n_alleles, provenance=provenance)
+
+
+def _build_locus(
+    name: str,
+    chrom: str,
+    bed_start: int,
+    bed_end: int,
+    *,
+    anchor: AnchorResult,
+    counts: Counter,
+    qc: dict,
+    flanking_seqs: list[str],
+    up_width: int,
+    dn_width: int,
+) -> ExtractedLocus:
+    """Turn one locus's extraction output into its `ExtractedLocus`.
+
+    ``n_runs`` and ``max_observed_run_length`` are set from the **data**:
+    the longest parsed tuple, and the longest G-run, across the accepted
+    reads at this locus. The reference-derived ``reference_run_lengths``
+    is kept as diagnostic context but is not authoritative for $S_i$ —
+    the inference adapter (``ExtractedPanel.to_loci``) recomputes the
+    locus-level run count from the observed patterns, and extraction
+    stays faithful with no pattern filter here.
+    """
+    if anchor.ref_inter_anchor_seq:
+        ref_run_lengths = parse_run_lengths(anchor.ref_inter_anchor_seq)
+    else:
+        ref_run_lengths = ()
+
+    if counts:
+        mi_arr = np.asarray([k[0] for k in counts], dtype=object)
+        strand_arr = np.asarray([k[1] for k in counts], dtype="U1")
+        seq_arr = np.asarray([k[2] for k in counts], dtype=object)
+        flanking_id_arr = np.asarray([k[3] for k in counts], dtype=np.int32)
+        count_arr = np.asarray(list(counts.values()), dtype=np.int64)
+    else:
+        mi_arr = np.empty(0, dtype=object)
+        strand_arr = np.empty(0, dtype="U1")
+        seq_arr = np.empty(0, dtype=object)
+        flanking_id_arr = np.empty(0, dtype=np.int32)
+        count_arr = np.empty(0, dtype=np.int64)
+
+    flanking_seq_arr = np.asarray(flanking_seqs, dtype=object)
+
+    if anchor.status == "anchorable":
+        if anchor.ref_orientation == "+":
+            flanking_up_ref_pos_start = (
+                bed_start - anchor.g_walk_up - FLANKING_SEQ_LEN - up_width
+            )
+            flanking_dn_ref_pos_start = (
+                bed_end + anchor.g_walk_dn + FLANKING_SEQ_LEN
+            )
+        else:
+            flanking_up_ref_pos_start = (
+                bed_end + anchor.g_walk_up + FLANKING_SEQ_LEN + up_width - 1
+            )
+            flanking_dn_ref_pos_start = (
+                bed_start - anchor.g_walk_dn - FLANKING_SEQ_LEN - 1
+            )
+    else:
+        flanking_up_ref_pos_start = 0
+        flanking_dn_ref_pos_start = 0
+
+    per_locus_max_n_runs = 0
+    per_locus_max = 0
+    for s in seq_arr:
+        runs = parse_run_lengths(str(s))
+        if runs:
+            if len(runs) > per_locus_max_n_runs:
+                per_locus_max_n_runs = len(runs)
+            m = max(runs)
+            if m > per_locus_max:
+                per_locus_max = m
+    n_runs = per_locus_max_n_runs if per_locus_max_n_runs > 0 else 0
+
+    return ExtractedLocus(
+        mi=mi_arr,
+        strand=strand_arr,
+        seq=seq_arr,
+        count=count_arr,
+        flanking_id=flanking_id_arr,
+        flanking_seq=flanking_seq_arr,
+        n_runs=n_runs,
+        ref_inter_anchor_seq=anchor.ref_inter_anchor_seq,
+        reference_run_lengths=ref_run_lengths,
+        chrom=chrom,
+        bed_start=bed_start,
+        bed_end=bed_end,
+        bed_name=name,
+        ref_orientation=anchor.ref_orientation,
+        upstream_anchor=anchor.upstream_anchor,
+        downstream_anchor=anchor.downstream_anchor,
+        anchorability_status=anchor.status,
+        max_observed_run_length=per_locus_max,
+        n_alignments_overlap_locus=qc["n_alignments_overlap_locus"],
+        n_alignments_drop_mapq=qc["n_alignments_drop_mapq"],
+        n_alignments_drop_sa=qc["n_alignments_drop_sa"],
+        n_alignments_drop_tlen=qc["n_alignments_drop_tlen"],
+        n_alignments_drop_anchor=qc["n_alignments_drop_anchor"],
+        n_read_pairs=qc["n_read_pairs"],
+        n_read_pairs_drop_disagree=qc["n_read_pairs_drop_disagree"],
+        n_reads=int(count_arr.sum()),
+        g_walk_up=anchor.g_walk_up,
+        g_walk_dn=anchor.g_walk_dn,
+        flanking_up_width=up_width,
+        flanking_dn_width=dn_width,
+        flanking_up_ref_pos_start=flanking_up_ref_pos_start,
+        flanking_dn_ref_pos_start=flanking_dn_ref_pos_start,
+    )
