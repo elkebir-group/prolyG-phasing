@@ -169,6 +169,30 @@ def _alignment_flanking(
     return up, dn
 
 
+def _consensus(a: dict[int, str], b: dict[int, str]) -> dict[int, str]:
+    """Per-position consensus of two flanking dicts.
+
+    Agreement keeps the base; disagreement drops the position; a
+    position present in only one dict is kept as-is. Copies `a` and
+    patches in `b` rather than iterating `set(a) | set(b)`, since
+    values are always non-empty base characters — `out.get(pos)`
+    returning `None` unambiguously means "not in `a`" — with no need
+    to also probe `b` for keys already covered by the `a` copy.
+    """
+    if not a:
+        return dict(b)
+    if not b:
+        return dict(a)
+    out = dict(a)
+    for pos, bb in b.items():
+        ba = out.get(pos)
+        if ba is None:
+            out[pos] = bb
+        elif ba != bb:
+            del out[pos]
+    return out
+
+
 def _merge_pair_flanking(
     mates: list[tuple[dict[int, str], dict[int, str]]],
 ) -> tuple[dict[int, str], dict[int, str]]:
@@ -183,20 +207,6 @@ def _merge_pair_flanking(
     if len(mates) == 1:
         return mates[0]
     (up_a, dn_a), (up_b, dn_b) = mates
-
-    def _consensus(a: dict[int, str], b: dict[int, str]) -> dict[int, str]:
-        out: dict[int, str] = {}
-        for pos in set(a) | set(b):
-            ba = a.get(pos)
-            bb = b.get(pos)
-            if ba is None:
-                out[pos] = bb  # type: ignore[assignment]
-            elif bb is None:
-                out[pos] = ba
-            elif ba == bb:
-                out[pos] = ba
-        return out
-
     return _consensus(up_a, up_b), _consensus(dn_a, dn_b)
 
 
