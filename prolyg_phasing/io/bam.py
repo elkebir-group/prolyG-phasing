@@ -284,6 +284,10 @@ def _alignment_flanking(
             qpos += op_len
             pos = end
         elif op == 1 or op == 4 or op == 6:    # I / S / P — consumes query
+            # P consumes neither cursor per the SAM spec, but pysam's own
+            # get_aligned_pairs advances the query cursor across it. This
+            # walk reproduces pysam, so the two agree base for base on
+            # any alignment either of them can be handed.
             qpos += op_len
         elif op == 2 or op == 3:               # D / N — consumes reference
             pos += op_len
@@ -454,8 +458,15 @@ def _extract_locus(
             candidates.append((r, None))
 
     # Anchor placement for every bed-spanning read of this locus at once.
+    # Read back as Python lists: the pass below indexes them one read at
+    # a time, and unboxing a numpy scalar per read costs more than the
+    # whole conversion.
     up_distances, up_offsets = hamming_search(bed_seqs, anchor_up)
     dn_distances, dn_offsets = hamming_search(bed_seqs, anchor_dn)
+    up_distances = up_distances.tolist()
+    up_offsets = up_offsets.tolist()
+    dn_distances = dn_distances.tolist()
+    dn_offsets = dn_offsets.tolist()
 
     # Second pass, still in fetch order: apply the anchor and MI decisions
     # and group by query_name for pair-collapse. Each entry is
@@ -481,14 +492,12 @@ def _extract_locus(
 
         i = bed_index
         bed_index += 1
-        off_up = int(up_offsets[i])
-        off_dn = int(dn_offsets[i])
         if up_distances[i] > anchor_hamming_max or dn_distances[i] > anchor_hamming_max:
             qc["n_alignments_drop_anchor"] += 1
             continue
 
-        ia_start = off_up + anchor_k
-        ia_end = off_dn
+        ia_start = up_offsets[i] + anchor_k
+        ia_end = dn_offsets[i]
         if ia_end < ia_start:
             qc["n_alignments_drop_anchor"] += 1
             continue
