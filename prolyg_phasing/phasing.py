@@ -49,12 +49,34 @@ from prolyg_phasing.io.panel import ExtractedLocus, ExtractedPanel
 _BASES = ("A", "C", "G", "T", "N", ".")
 _N_COLS = len(_BASES)
 _ACGT = ("A", "C", "G", "T")
+_N_ACGT = len(_ACGT)
+_PAD_CODE = _BASES.index(".")
+#: Code for a character outside :data:`_BASES`. Such a character is counted in no
+#: column at all -- exactly what per-base equality against ``_BASES`` does with it.
+_OTHER_CODE = _N_COLS
+_N_CODES = _N_COLS + 1
 
-#: Family × position cells per consensus block. Bounds the dense ``(n_fam, block, 4)``
-#: accumulator :func:`family_consensus_counts` reduces over: at 4 × 8 bytes a cell,
-#: 2**22 cells is a ~134 MB peak regardless of how deep the locus is, and the block
-#: never changes the result -- only how much of the window is scored at a time.
-CONSENSUS_POSITION_BLOCK = 2 ** 22
+#: ASCII byte -> base code. Every byte outside ``_BASES`` maps to ``_OTHER_CODE``.
+_BASE_CODE = np.full(256, _OTHER_CODE, dtype=np.uint8)
+for _i, _ch in enumerate(_BASES):
+    _BASE_CODE[ord(_ch)] = _i
+
+
+def _reject_ragged_flanking(lengths: np.ndarray, total_width: int) -> None:
+    """Raise when any flanking string is not exactly ``total_width`` characters.
+
+    Shared by both expansions of ``flanking_seq``
+    (:func:`flanking_char_matrix` and :func:`_flanking_codes`), which both
+    reshape a flat buffer and would otherwise silently truncate, null-pad or
+    shift every later string.
+    """
+    bad = np.unique(lengths[lengths != total_width])
+    if bad.size:
+        raise ValueError(
+            f"flanking_seq char-array shape mismatch: {int((lengths != total_width).sum())} "
+            f"string(s) of length(s) {sorted(int(x) for x in bad)} != expected "
+            f"{total_width}"
+        )
 
 
 def flanking_char_matrix(flanking_seq: np.ndarray, total_width: int) -> np.ndarray:
@@ -68,19 +90,216 @@ def flanking_char_matrix(flanking_seq: np.ndarray, total_width: int) -> np.ndarr
     is rejected up front (the view would otherwise silently truncate or
     null-pad it). The output is byte-identical to ``np.array([list(s) for s in
     flanking_seq], dtype="U1")``.
+
+    Callers that only ever compare the characters against ``_BASES`` want
+    :func:`_flanking_codes` instead: it carries the same information in one byte
+    a character rather than four, which is what the per-position counting paths
+    are bandwidth-bound on.
     """
     seq = np.asarray(flanking_seq)
     if seq.shape[0] == 0:
         return np.empty((0, total_width), dtype="U1")
-    lengths = np.char.str_len(seq.astype(str))
-    bad = np.unique(lengths[lengths != total_width])
-    if bad.size:
-        raise ValueError(
-            f"flanking_seq char-array shape mismatch: {int((lengths != total_width).sum())} "
-            f"string(s) of length(s) {sorted(int(x) for x in bad)} != expected "
-            f"{total_width}"
-        )
+    _reject_ragged_flanking(np.char.str_len(seq.astype(str)), total_width)
     return seq.astype(f"U{total_width}").view("U1").reshape(seq.shape[0], total_width)
+
+
+def _flanking_codes(flanking_seq: np.ndarray, total_width: int) -> np.ndarray:
+    """``(n_flanking, total_width)`` uint8 base codes, one per character.
+
+    A code indexes :data:`_BASES`; any other character — including a non-ASCII
+    one, which encodes as ``'?'`` and so keeps the one-character-one-code
+    alignment — takes :data:`_OTHER_CODE` and is counted in no column, matching
+    what equality against each of ``_BASES`` in turn does with it.
+
+    The strings are joined and read as one ASCII buffer rather than widened to
+    numpy's 4-byte-per-character unicode form. Every downstream pass over the
+    matrix is memory-bound, so the byte form does the same work on a quarter of
+    the traffic.
+    """
+    seq = np.asarray(flanking_seq)
+    n_flanking = int(seq.shape[0])
+    if n_flanking == 0:
+        return np.empty((0, total_width), dtype=np.uint8)
+    strings = seq.tolist()
+    lengths = np.fromiter(map(len, strings), dtype=np.int64, count=n_flanking)
+    _reject_ragged_flanking(lengths, total_width)
+    buf = "".join(strings).encode("ascii", errors="replace")
+    flat = np.frombuffer(buf, dtype=np.uint8).reshape(n_flanking, total_width)
+    return _BASE_CODE[flat]
+
+
+@dataclasses.dataclass(frozen=True)
+class _FlankingCells:
+    """The non-pad cells of a locus's flanking code matrix, in row-major order.
+
+    ``'.'`` pad fills ~85 % of the ``(n_flanking, total_width)`` matrix on this
+    panel's ~1 kb windows — a read covers a couple of hundred positions of it —
+    so every per-position count is a reduction over a small minority of cells.
+    Listing those cells once turns each count into a scatter over the cells
+    instead of a full-matrix pass per base, and lets the read-count and
+    family-consensus reductions share one traversal of the strings.
+
+    Attributes
+    ----------
+    n_flanking, total_width : int
+        Shape of the matrix the cells were taken from.
+    indptr : (n_flanking + 1,) int64
+        Start of each unique string's cells in ``col``/``base`` (CSR-style).
+    col : (n_cells,) int64
+        Position of the cell within the flanking string.
+    base : (n_cells,) uint8
+        Base code of the cell; never :data:`_PAD_CODE`.
+    """
+
+    n_flanking: int
+    total_width: int
+    indptr: np.ndarray
+    col: np.ndarray
+    base: np.ndarray
+
+
+def _flanking_cells(codes: np.ndarray) -> _FlankingCells:
+    """List the non-pad cells of a code matrix from :func:`_flanking_codes`."""
+    n_flanking, total_width = codes.shape
+    covered = codes != _PAD_CODE
+    indptr = np.zeros(n_flanking + 1, dtype=np.int64)
+    per_string = covered.sum(axis=1)
+    np.cumsum(per_string, out=indptr[1:])
+    base = codes[covered]
+    col = np.nonzero(covered.ravel())[0]
+    col -= np.repeat(
+        np.arange(n_flanking, dtype=np.int64) * total_width, per_string
+    )
+    return _FlankingCells(
+        n_flanking=n_flanking, total_width=total_width,
+        indptr=indptr, col=col, base=base,
+    )
+
+
+def _position_base_counts(
+    cells: _FlankingCells, string_weight: np.ndarray,
+) -> np.ndarray:
+    """``(total_width, 6)`` int64 per-position base counts at one set of weights.
+
+    ``string_weight[s]`` is the weight of unique flanking string ``s``; the
+    pad column is the complement of the rest, since every character of the
+    matrix is a pad, a base, or a character in neither.
+    """
+    total_width = cells.total_width
+    total = int(string_weight.sum())
+    freqs = np.zeros((total_width, _N_COLS), dtype=np.int64)
+    if cells.base.size == 0:
+        freqs[:, _PAD_CODE] = total
+        return freqs
+    weights = np.repeat(
+        string_weight.astype(np.float64), np.diff(cells.indptr)
+    )
+    flat = cells.col * _N_CODES + cells.base
+    # Integer weights below 2**53, so the float64 accumulator is exact.
+    per_code = np.bincount(
+        flat, weights=weights, minlength=_N_CODES * total_width,
+    ).reshape(total_width, _N_CODES).astype(np.int64)
+    freqs[:, :_PAD_CODE] = per_code[:, :_PAD_CODE]
+    freqs[:, _PAD_CODE] = total - per_code.sum(axis=1)
+    return freqs
+
+
+def _family_consensus_from_cells(
+    cells: _FlankingCells,
+    flanking_id: np.ndarray,
+    count: np.ndarray,
+    mi: np.ndarray,
+) -> np.ndarray:
+    """``(total_width, 4)`` int64 family-consensus counts; the collapse rule.
+
+    See :func:`family_consensus_counts` for the rule itself. Both operands of
+    the weight product are sparse — one nonzero per distinct (family, string)
+    pair on one side, one per covered cell on the other — so the per-family
+    weights ``w_f(p, b)`` come out as a sparse matrix listing only the
+    (family, position) pairs the family actually covers, and the consensus is
+    read off its ``≤ 4``-entry runs. A dense ``(n_fam, total_width, 4)``
+    accumulator would be ~85 % zeros and hundreds of MB on a deep locus.
+    """
+    total_width = cells.total_width
+    fam_counts = np.zeros((total_width, _N_ACGT), dtype=np.int64)
+    flanking_id = np.asarray(flanking_id)
+    if flanking_id.shape[0] == 0 or cells.base.size == 0:
+        return fam_counts
+
+    fam_idx = np.unique(np.asarray(mi), return_inverse=True)[1].reshape(-1)
+    n_fam = int(fam_idx.max()) + 1
+    # Row -> (family, unique flanking string) read weight; duplicates sum.
+    family_string = sparse.csr_matrix(
+        (np.asarray(count, dtype=np.int64), (fam_idx, flanking_id)),
+        shape=(n_fam, cells.n_flanking),
+    )
+    # Unique flanking string -> its ACGT cells, column p * 4 + b.
+    acgt = cells.base < _N_ACGT
+    kept = np.zeros(acgt.size + 1, dtype=np.int64)
+    np.cumsum(acgt, out=kept[1:])
+    indices = (cells.col[acgt] * _N_ACGT + cells.base[acgt]).astype(np.int32)
+    string_cell = sparse.csr_matrix(
+        (np.ones(indices.size, dtype=np.int64), indices,
+         kept[cells.indptr].astype(np.int32)),
+        shape=(cells.n_flanking, total_width * _N_ACGT),
+    )
+    weight = family_string @ string_cell     # w_f(p, b), (n_fam, total_width * 4)
+    weight.sort_indices()
+    data, indices, indptr = weight.data, weight.indices, weight.indptr
+    if data.size == 0:
+        return fam_counts
+
+    position = indices // _N_ACGT
+    base = (indices - position * _N_ACGT).astype(np.uint8)
+    # One run per (family, position): the position changes, or the family does.
+    run_start = np.empty(data.size, dtype=bool)
+    run_start[0] = True
+    np.not_equal(position[1:], position[:-1], out=run_start[1:])
+    family_start = indptr[1:-1]
+    run_start[family_start[family_start < data.size]] = True
+
+    start = np.nonzero(run_start)[0]
+    length = np.diff(np.append(start, data.size))
+    run_max = np.maximum.reduceat(data, start)
+    at_max = data == np.repeat(run_max, length)
+    # A run holds at most one entry per base, so the count fits in int8.
+    n_at_max = np.add.reduceat(at_max.view(np.int8), start)
+    first_max = np.nonzero(at_max)[0]
+    call = base[first_max[np.searchsorted(first_max, start)]]
+
+    # Called iff the maximum weight is strictly positive and unique; a tie or an
+    # all-pad/N family abstains (the latter has no run at that position at all).
+    called = (run_max > 0) & (n_at_max == 1)
+    return np.bincount(
+        position[start][called].astype(np.int64) * _N_ACGT + call[called],
+        minlength=total_width * _N_ACGT,
+    ).reshape(total_width, _N_ACGT).astype(np.int64)
+
+
+def _string_weights(
+    flanking_id: np.ndarray, count: np.ndarray, n_flanking: int,
+) -> np.ndarray:
+    """Total ``count`` per unique flanking string, ``(n_flanking,)`` int64."""
+    return np.bincount(
+        flanking_id, weights=count, minlength=n_flanking,
+    ).astype(np.int64)
+
+
+def _split_segments(
+    per_position: np.ndarray, flanking_up_width: int, flanking_dn_width: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Cut a whole-window ``(total_width, n)`` array at the ``'|'`` separator."""
+    return (
+        per_position[:flanking_up_width].copy(),
+        per_position[flanking_up_width + 1:].copy(),
+    )
+
+
+def _assert_schema_v2(flanking_id: np.ndarray) -> None:
+    assert (flanking_id >= 0).all(), (
+        "flanking_id contains negative values — schema-v1 panel passed to "
+        "aggregator (expected to short-circuit on zero widths upstream)"
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,6 +333,10 @@ def aggregate_position_frequencies(
     Walks each unique flanking string once, weighted by the total
     ``count`` across all rows sharing that ``flanking_id``.
 
+    A caller that also wants the strand split or the family-consensus counts
+    over the same positions should use :func:`flanking_base_counts`, which
+    shares this traversal with them rather than repeating it.
+
     Parameters
     ----------
     flanking_seq : (n_flanking,) object
@@ -137,26 +360,13 @@ def aggregate_position_frequencies(
     if n_flanking == 0 or (flanking_up_width == 0 and flanking_dn_width == 0):
         return up_freqs, dn_freqs
 
-    assert (flanking_id >= 0).all(), (
-        "flanking_id contains negative values — schema-v1 panel passed to "
-        "aggregator (expected to short-circuit on zero widths upstream)"
-    )
-
-    fid_weight = np.zeros(n_flanking, dtype=np.int64)
-    np.add.at(fid_weight, flanking_id, count)
-
+    _assert_schema_v2(flanking_id)
     total_width = flanking_up_width + 1 + flanking_dn_width
-    arr = flanking_char_matrix(flanking_seq, total_width)
-
-    for col, ch in enumerate(_BASES):
-        mask = arr == ch
-        per_pos = (mask * fid_weight[:, None]).sum(axis=0)
-        if flanking_up_width > 0:
-            up_freqs[:, col] = per_pos[:flanking_up_width]
-        if flanking_dn_width > 0:
-            dn_freqs[:, col] = per_pos[flanking_up_width + 1:]
-
-    return up_freqs, dn_freqs
+    cells = _flanking_cells(_flanking_codes(flanking_seq, total_width))
+    freqs = _position_base_counts(
+        cells, _string_weights(flanking_id, count, n_flanking),
+    )
+    return _split_segments(freqs, flanking_up_width, flanking_dn_width)
 
 
 def family_consensus_at_positions(
@@ -251,6 +461,10 @@ def family_consensus_counts(
     (unlike the read-based strand-resolved ``nA_a…`` columns) there is no A/B
     split here.
 
+    A caller that also wants the per-strand read counts over the same positions
+    should use :func:`flanking_base_counts`, which shares this traversal with
+    them rather than repeating it.
+
     Parameters
     ----------
     flanking_seq : (n_flanking,) object
@@ -271,58 +485,99 @@ def family_consensus_counts(
     dn_fam : (flanking_dn_width, 4) int64
         Family consensus counts; column order A, C, G, T.
     """
-    up_fam = np.zeros((flanking_up_width, 4), dtype=np.int64)
-    dn_fam = np.zeros((flanking_dn_width, 4), dtype=np.int64)
+    up_fam = np.zeros((flanking_up_width, _N_ACGT), dtype=np.int64)
+    dn_fam = np.zeros((flanking_dn_width, _N_ACGT), dtype=np.int64)
     n_rows = int(np.asarray(flanking_id).shape[0])
     if n_rows == 0 or (flanking_up_width == 0 and flanking_dn_width == 0):
         return up_fam, dn_fam
 
     total_width = flanking_up_width + 1 + flanking_dn_width
-    arr = flanking_char_matrix(flanking_seq, total_width)   # (n_flanking, total_width)
+    cells = _flanking_cells(_flanking_codes(flanking_seq, total_width))
+    fam_counts = _family_consensus_from_cells(cells, flanking_id, count, mi)
+    return _split_segments(fam_counts, flanking_up_width, flanking_dn_width)
 
-    # Map mi -> contiguous family index; aggregate each row's read count onto its
-    # (family, unique-flanking-string) cell. This cf matrix is very sparse (one
-    # nonzero per distinct (family, string) pair, ≤ n_rows), so the per-position
-    # per-base consensus weight is a cheap sparse-times-dense product rather than
-    # a dense (n_fam, total_width, 4) scatter over the ~1 kb window.
-    fam_idx = np.unique(np.asarray(mi), return_inverse=True)[1].reshape(-1)
-    n_fam = int(fam_idx.max()) + 1
-    count = np.asarray(count, dtype=np.float64)
-    cf = sparse.csr_matrix(
-        (count, (fam_idx, np.asarray(flanking_id))),
-        shape=(n_fam, arr.shape[0]),
+
+@dataclasses.dataclass(frozen=True)
+class FlankingBaseCounts:
+    """Per-position base counts for one flanking segment of one locus.
+
+    The three observation units the somatic and BAF channels read, from one
+    traversal of the locus's flanking strings.
+
+    Attributes
+    ----------
+    reads_a, reads_b : (width, 6) int64
+        Read counts, split by :attr:`ExtractedLocus.strand`; column order A, C,
+        G, T, N, ``'.'``, as :func:`aggregate_position_frequencies`. Which
+        physical strand is which is immaterial — only the split matters, for
+        strand bias.
+    families : (width, 4) int64
+        Strand-pooled UMI-family consensus counts; column order A, C, G, T, as
+        :func:`family_consensus_counts`.
+    """
+
+    reads_a: np.ndarray
+    reads_b: np.ndarray
+    families: np.ndarray
+
+
+def flanking_base_counts(
+    locus: ExtractedLocus,
+) -> tuple[FlankingBaseCounts, FlankingBaseCounts]:
+    """Upstream and downstream per-position base counts for one locus.
+
+    The strand-split read counts of :func:`aggregate_position_frequencies` and
+    the family-consensus counts of :func:`family_consensus_counts`, over the
+    same positions, from one expansion of the flanking strings. Each of those
+    entry points re-reads every string on its own, so a caller that wants all
+    three — the per-position somatic table does — pays for three traversals of
+    the same ~1 kb × depth character window; this pays for one.
+
+    Returns
+    -------
+    up, dn : FlankingBaseCounts
+        Widths ``locus.flanking_up_width`` and ``locus.flanking_dn_width``;
+        either may be zero-length.
+    """
+    up_w = locus.flanking_up_width
+    dn_w = locus.flanking_dn_width
+    n_flanking = int(locus.flanking_seq.shape[0])
+    if n_flanking == 0 or (up_w == 0 and dn_w == 0):
+        blank = [
+            FlankingBaseCounts(
+                reads_a=np.zeros((w, _N_COLS), dtype=np.int64),
+                reads_b=np.zeros((w, _N_COLS), dtype=np.int64),
+                families=np.zeros((w, _N_ACGT), dtype=np.int64),
+            )
+            for w in (up_w, dn_w)
+        ]
+        return blank[0], blank[1]
+
+    _assert_schema_v2(locus.flanking_id)
+    total_width = up_w + 1 + dn_w
+    cells = _flanking_cells(_flanking_codes(locus.flanking_seq, total_width))
+
+    reads = [
+        _position_base_counts(
+            cells,
+            _string_weights(
+                locus.flanking_id,
+                np.where(locus.strand == label, locus.count, 0),
+                n_flanking,
+            ),
+        )
+        for label in ("A", "B")
+    ]
+    families = _family_consensus_from_cells(
+        cells, locus.flanking_id, locus.count, locus.mi,
     )
-
-    fam_counts = np.zeros((total_width, 4), dtype=np.int64)
-    # acc[f, p, b] = Σ_{rows r ∈ f} count[r] · [char_r(p) == b]  (exact on integer
-    # counts via float64). The family axis cannot be reduced before the argmax — the
-    # consensus is per family — so the window is walked in position blocks instead:
-    # a deep locus (thousands of families over a ~1 kb window) would otherwise
-    # materialize acc and the four dense (n_flanking, total_width) comparands whole,
-    # which is hundreds of MB against a per-locus working set the pipeline sizes at
-    # ~50 MB. The block width only bounds memory; every reduction below is over the
-    # full family axis, so the result is identical to scoring the window at once.
-    block = max(1, CONSENSUS_POSITION_BLOCK // max(n_fam, 1))
-    for p0 in range(0, total_width, block):
-        p1 = min(p0 + block, total_width)
-        acc = np.empty((n_fam, p1 - p0, 4), dtype=np.float64)
-        for b, base in enumerate(_ACGT):
-            acc[..., b] = cf @ (arr[:, p0:p1] == base).astype(np.float64)
-
-        # Per-family consensus: argmax base, valid iff the max weight is > 0 and
-        # unique (a tie or an all-`.`/`N` family abstains).
-        max_w = acc.max(axis=2)                         # (n_fam, p1 - p0)
-        consensus = acc.argmax(axis=2)                  # first max on a tie
-        n_at_max = (acc == max_w[..., None]).sum(axis=2)
-        valid = (max_w > 0) & (n_at_max == 1)
-        for b in range(4):
-            fam_counts[p0:p1, b] = (valid & (consensus == b)).sum(axis=0)
-
-    if flanking_up_width > 0:
-        up_fam = fam_counts[:flanking_up_width]
-    if flanking_dn_width > 0:
-        dn_fam = fam_counts[flanking_up_width + 1:]
-    return up_fam, dn_fam
+    up_a, dn_a = _split_segments(reads[0], up_w, dn_w)
+    up_b, dn_b = _split_segments(reads[1], up_w, dn_w)
+    up_fam, dn_fam = _split_segments(families, up_w, dn_w)
+    return (
+        FlankingBaseCounts(reads_a=up_a, reads_b=up_b, families=up_fam),
+        FlankingBaseCounts(reads_a=dn_a, reads_b=dn_b, families=dn_fam),
+    )
 
 
 def find_informative_snvs(
