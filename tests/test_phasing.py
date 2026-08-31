@@ -1,6 +1,8 @@
 """Tests for prolyg_phasing.phasing."""
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -13,7 +15,9 @@ from prolyg_phasing.phasing import (
     aggregate_position_frequencies,
     assign_flanking_haplotypes,
     determine_flanking_haplotypes,
+    family_consensus_counts,
     find_informative_snvs,
+    flanking_base_counts,
 )
 
 
@@ -208,6 +212,135 @@ def test_aggregate_raises_on_bad_string_length():
     count = np.asarray([10, 5], dtype=np.int64)
     with pytest.raises(ValueError, match="char-array shape mismatch"):
         aggregate_position_frequencies(flanking_seq, flanking_id, count, 2, 2)
+
+
+def test_aggregate_counts_an_unknown_character_in_no_column():
+    """A character outside ``A C G T N .`` lands in no column — pad included.
+
+    The pad column is the complement of the other five, so an unknown character
+    has to be excluded from it explicitly rather than fall into it by default.
+    """
+    flanking_seq = np.asarray(["A-|CG", "AT|CG"], dtype=object)
+    flanking_id = np.asarray([0, 1], dtype=np.int32)
+    count = np.asarray([10, 5], dtype=np.int64)
+    up_freqs, _ = aggregate_position_frequencies(
+        flanking_seq, flanking_id, count, 2, 2,
+    )
+    assert up_freqs[1, 3] == 5      # 'T'
+    assert up_freqs[1, 5] == 0      # '.' does not absorb the '-'
+    assert up_freqs[1].sum() == 5   # the '-' weight is counted nowhere
+
+
+# ---------------------------------------------------------------------------
+# family_consensus_counts
+# ---------------------------------------------------------------------------
+
+
+def test_family_consensus_ignores_a_non_acgt_vote():
+    """``N`` casts no vote, so a family with one ACGT row still calls."""
+    locus = _make_locus_from_rows(
+        [("AT|CG", "M1", 3), ("AN|CG", "M1", 5)], up_width=2, dn_width=2,
+    )
+    up_fam, _ = family_consensus_counts(
+        locus.flanking_seq, locus.flanking_id, locus.count, locus.mi, 2, 2,
+    )
+    assert up_fam[1].tolist() == [0, 0, 0, 1]   # T, on the weight-3 row alone
+
+
+def test_family_consensus_abstains_when_every_row_is_non_acgt():
+    locus = _make_locus_from_rows(
+        [("AN|CG", "M1", 3), ("A-|CG", "M2", 5)], up_width=2, dn_width=2,
+    )
+    up_fam, _ = family_consensus_counts(
+        locus.flanking_seq, locus.flanking_id, locus.count, locus.mi, 2, 2,
+    )
+    assert up_fam[1].tolist() == [0, 0, 0, 0]
+    assert up_fam[0].tolist() == [2, 0, 0, 0]   # both families call 'A' at up[0]
+
+
+def test_family_consensus_abstains_on_a_within_family_tie():
+    locus = _make_locus_from_rows(
+        [("AT|CG", "M1", 4), ("AA|CG", "M1", 4)], up_width=2, dn_width=2,
+    )
+    up_fam, _ = family_consensus_counts(
+        locus.flanking_seq, locus.flanking_id, locus.count, locus.mi, 2, 2,
+    )
+    assert up_fam[1].tolist() == [0, 0, 0, 0]
+
+
+# ---------------------------------------------------------------------------
+# flanking_base_counts
+# ---------------------------------------------------------------------------
+
+
+def _mixed_strand_locus() -> ExtractedLocus:
+    rows = [
+        ("AT|CG", "M1", 3), ("AT|CG", "M2", 2), ("AC|CG", "M2", 4),
+        ("A.|CG", "M3", 5), ("GT|CG", "M3", 1), ("GT|CN", "M4", 6),
+    ]
+    locus = _make_locus_from_rows(rows, up_width=2, dn_width=2)
+    return dataclasses.replace(
+        locus, strand=np.asarray(["A", "B", "A", "B", "A", "B"], dtype="U1"),
+    )
+
+
+def test_flanking_base_counts_matches_the_separate_entry_points():
+    """The fused traversal returns exactly what the three separate calls do."""
+    locus = _mixed_strand_locus()
+    up_w, dn_w = locus.flanking_up_width, locus.flanking_dn_width
+    up, dn = flanking_base_counts(locus)
+
+    for label, got_up, got_dn in (
+        ("A", up.reads_a, dn.reads_a), ("B", up.reads_b, dn.reads_b),
+    ):
+        want_up, want_dn = aggregate_position_frequencies(
+            locus.flanking_seq, locus.flanking_id,
+            np.where(locus.strand == label, locus.count, 0),
+            up_w, dn_w,
+        )
+        assert np.array_equal(got_up, want_up)
+        assert np.array_equal(got_dn, want_dn)
+
+    want_up, want_dn = family_consensus_counts(
+        locus.flanking_seq, locus.flanking_id, locus.count, locus.mi, up_w, dn_w,
+    )
+    assert np.array_equal(up.families, want_up)
+    assert np.array_equal(dn.families, want_dn)
+
+
+def test_flanking_base_counts_splits_reads_by_strand():
+    locus = _mixed_strand_locus()
+    up, _ = flanking_base_counts(locus)
+    # up[1] on strand A: ("AT", 3), ("AC", 4), ("GT", 1) → T=4, C=4.
+    assert up.reads_a[1].tolist() == [0, 4, 0, 4, 0, 0]
+    # up[1] on strand B: ("AT", 2), ("A.", 5), ("GT", 6) → T=8, pad=5.
+    assert up.reads_b[1].tolist() == [0, 0, 0, 8, 0, 5]
+    # Families pool both strands: M1 → T; M2 has T=2 against C=4 → C; M3 has
+    # T=1 against a pad row that casts no vote → T; M4 → T.
+    assert up.families[1].tolist() == [0, 1, 0, 3]
+
+
+def test_flanking_base_counts_on_a_zero_width_downstream_segment():
+    locus = _make_locus_from_rows([("AT|", "M1", 3)], up_width=2, dn_width=0)
+    up, dn = flanking_base_counts(locus)
+    assert up.reads_a.shape == (2, 6)
+    assert dn.reads_a.shape == (0, 6)
+    assert dn.families.shape == (0, 4)
+    assert up.families[1].tolist() == [0, 0, 0, 1]
+
+
+def test_flanking_base_counts_on_a_locus_without_flanking_extraction():
+    locus = dataclasses.replace(
+        _make_locus_from_rows([("AT|CG", "M1", 3)], up_width=2, dn_width=2),
+        flanking_seq=np.empty(0, dtype=object),
+        flanking_id=np.empty(0, dtype=np.int32),
+        flanking_up_width=0, flanking_dn_width=0,
+    )
+    up, dn = flanking_base_counts(locus)
+    for seg in (up, dn):
+        assert seg.reads_a.shape == (0, 6)
+        assert seg.reads_b.shape == (0, 6)
+        assert seg.families.shape == (0, 4)
 
 
 # ---------------------------------------------------------------------------
