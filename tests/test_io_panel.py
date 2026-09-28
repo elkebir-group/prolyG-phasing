@@ -2,14 +2,10 @@
 
 Covers synthetic ExtractedPanel construction, the ``panel.db`` round-trip, and
 every pure panel-shape helper (``interrupter_pattern``, pattern-frequency
-screens). ``format_drop_report``/``format_panel_composition`` stay in prolyG
-(``inference/to_loci_report.py``) — they format ``to_loci()``'s fit-machinery
-output (torch ``LocusData`` objects), not anything this package produces; see
-``tests/test_to_loci_report.py`` in prolyG. This file has no dependency on
-``prolyG.inference.pcr_params``/``train`` either way — the ``to_loci()``
-adapter into that fit machinery has its own coverage in prolyG's
-``test_panel_to_loci.py``. pysam-free: BAM-walking tests live in
-``test_io_bam.py``.
+screens). The inference adapter ``to_loci`` and its drop report live in prolyG
+(``prolyG.inference.to_loci``, ``inference/to_loci_report.py``), with their
+tests: they build prolyG's torch ``LocusData`` objects, not anything this
+package produces. pysam-free: BAM-walking tests live in ``test_io_bam.py``.
 """
 
 from __future__ import annotations
@@ -23,10 +19,12 @@ from prolyg_phasing.io.panel import (
     ExtractedPanel,
     interrupter_pattern,
     loci_equal,
+    majority_pattern_by_family,
     majority_pattern_per_rf,
     observed_pattern_frequencies,
     panels_equal,
     parse_run_lengths,
+    pattern_family_shares,
     select_patterns_above_freq,
 )
 
@@ -355,3 +353,57 @@ def test_v1_pickle_without_flanking_fields_round_trips(tmp_path):
     rec = loaded.loci["Locus1"]
     assert len(rec.flanking_id) == 0
     assert rec.g_walk_up == 0
+
+
+# ---------------------------------------------------------------------------
+# Majority vote on parsed rows, and per-locus metadata columns
+# ---------------------------------------------------------------------------
+
+
+def _mixed_locus(**kw):
+    # Family 1 ties 2:2 between () and ("A",): the lexicographic minimum () wins.
+    # Family 2 is ("A",) by read weight; family 3 is () alone.
+    return _make_locus_single_run([
+        ("1", "A", "GGGGGG", 2), ("1", "B", "GGGAGG", 2),
+        ("2", "A", "GGGAGG", 3), ("2", "B", "GGGGGG", 1),
+        ("3", "A", "GGGGGG", 1),
+    ], **kw)
+
+
+def test_majority_pattern_by_family_is_the_per_locus_vote_on_parsed_rows():
+    """The parsed-rows vote gives the per-locus majority map exactly, and the
+    family shares are the value counts of that map."""
+    locus = _mixed_locus()
+    rows = majority_pattern_by_family(
+        [str(m) for m in locus.mi],
+        [interrupter_pattern(str(s)) for s in locus.seq],
+        [int(c) for c in locus.count],
+    )
+    assert rows == majority_pattern_per_rf(locus) == {
+        "1": (), "2": ("A",), "3": (),
+    }
+    assert pattern_family_shares(rows) == observed_pattern_frequencies(locus)
+    assert pattern_family_shares(rows) == {(): 2 / 3, ("A",): 1 / 3}
+    assert pattern_family_shares({}) == {}
+
+
+def test_locus_column_agrees_between_the_database_and_memory(tmp_path):
+    """A loaded panel reads a metadata column by SQL; an in-memory panel gives
+    the same values, and a non-column name is refused."""
+    panel = ExtractedPanel(
+        loci={
+            "L1": _mixed_locus(bed_name="L1"),
+            "L2": _mixed_locus(bed_name="L2", anchorability_status="no_anchor"),
+        },
+        n_alleles=10, provenance=_make_provenance(),
+    )
+    db = tmp_path / "panel.db"
+    panel.save_db(db)
+    loaded = ExtractedPanel.load_db(db)
+    for name in ("anchorability_status", "chrom", "n_runs", "reference_run_lengths"):
+        assert loaded.locus_column(name) == panel.locus_column(name)
+    assert loaded.locus_column("anchorability_status") == {
+        "L1": "anchorable", "L2": "no_anchor",
+    }
+    with pytest.raises(ValueError):
+        loaded.locus_column("row_blob")

@@ -9,10 +9,9 @@ then runs `extract_panel` and verifies:
 - per-locus QC counters
 - panel-wide `n_alleles` decision
 
-``ExtractedPanel.to_loci()`` ships as a method here (it lazy-imports
-prolyG's PCR-chemistry fit machinery, which this package never installs) but
-is untested in this repo's own suite for the same reason. A real extraction
-feeding it cleanly is covered from prolyG's side instead —
+The inference adapter that turns a panel into fittable loci (``to_loci``)
+lives in prolyG, with the PCR-chemistry fit machinery it builds for. A real
+extraction feeding it cleanly is covered from prolyG's side —
 ``tests/test_extract_to_loci_integration.py``.
 """
 
