@@ -31,7 +31,11 @@ from __future__ import annotations
 import numpy as np
 
 from prolyg_phasing.io.format import format_pattern
-from prolyg_phasing.io.panel import ExtractedPanel, majority_pattern_per_rf
+from prolyg_phasing.io.panel import (
+    ExtractedPanel,
+    majority_pattern_per_rf,
+    pattern_family_shares,
+)
 from prolyg_phasing.phasing import (
     LABEL_MAJOR,
     LABEL_MINOR,
@@ -177,17 +181,11 @@ def build_locus_summary(panel: ExtractedPanel, pp: PhasingPanel, *, min_pattern_
         n_rows = int(mi.shape[0])
 
         # One majority_pattern_per_rf pass serves both the per-family
-        # frequencies (observed_pattern_frequencies' own logic, inlined) and
-        # the per-row pattern array (pattern_breakdown's own logic, inlined)
-        # -- each of those two helpers, plus select_patterns_above_freq,
-        # would otherwise repeat this same per-row scan.
+        # frequencies and the per-row pattern array (pattern_breakdown's own
+        # logic, inlined) -- observed_pattern_frequencies, pattern_breakdown
+        # and select_patterns_above_freq would each repeat this per-row scan.
         mi_to_majority = majority_pattern_per_rf(locus)
-        pattern_counts: dict[tuple[str, ...], int] = {}
-        for majority in mi_to_majority.values():
-            pattern_counts[majority] = pattern_counts.get(majority, 0) + 1
-        freqs = (
-            {h: c / n_rfs for h, c in pattern_counts.items()} if n_rfs else {}
-        )
+        freqs = pattern_family_shares(mi_to_majority)
         admitted = {h for h, f in freqs.items() if f >= min_pattern_freq}
         admitted_sorted = sorted(admitted, key=lambda h: -freqs[h])
         admitted_patterns = ";".join(

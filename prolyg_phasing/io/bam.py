@@ -654,8 +654,8 @@ def extract_panel(
     `n_alleles` is set to `max_observed_run_length + n_alleles_margin`,
     where the max is taken across all parsed reads in all loci. Reads
     are not pre-filtered against `n_alleles` at extraction; the panel
-    is faithful and the inference adapter (`to_loci`) is what gates
-    on the model's state space.
+    is faithful and the inference adapter (prolyG's `to_loci`) is what
+    gates on the model's state space.
 
     Parameters
     ----------
@@ -802,7 +802,7 @@ def _build_locus(
     the longest parsed tuple, and the longest G-run, across the accepted
     reads at this locus. The reference-derived ``reference_run_lengths``
     is kept as diagnostic context but is not authoritative for $S_i$ —
-    the inference adapter (``ExtractedPanel.to_loci``) recomputes the
+    the inference adapter (prolyG's ``to_loci``) recomputes the
     locus-level run count from the observed patterns, and extraction
     stays faithful with no pattern filter here.
     """
