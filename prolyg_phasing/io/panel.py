@@ -616,10 +616,15 @@ class ExtractedPanel:
         # re-deriving from the inference-side CSR (whose MR ``ell`` is a
         # flat-tuple index, not a length). Lazy import: overdispersion imports
         # from this module.
+        #
+        # A generator, not a list: a list decodes every kept locus's reads at
+        # once, which on a real bulk panel is most of this method's memory
+        # (about 10 GiB on a 1479-locus rung) and breaks the one-locus-resident
+        # contract of the streaming ``.loci`` mapping.
         from prolyG.inference.overdispersion import panel_ref_and_delta
 
         ell_ref, delta_up, delta_down = panel_ref_and_delta(
-            [self.loci[lid] for lid in kept_ids],
+            (self.loci[lid] for lid in kept_ids),
             n_alleles=n_alleles_max,
             min_pattern_freq=min_pattern_freq,
         )
