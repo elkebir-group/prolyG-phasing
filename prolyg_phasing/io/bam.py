@@ -48,6 +48,7 @@ from prolyg_phasing.io._anchors import (
     revcomp,
 )
 from prolyg_phasing.io.panel import (
+    EXTRACTION_SCHEMA_VERSION,
     ExtractedLocus,
     ExtractedPanel,
     ExtractionProvenance,
@@ -57,7 +58,6 @@ from prolyg_phasing.io.panel import (
 FLANKING_SEQ_LEN = 10
 REF_WINDOW_PAD = 50
 
-EXTRACTION_SCHEMA_VERSION = "3"
 PAIR_DISAGREEMENT_POLICY = "merge_by_quality"
 DEFAULT_MIN_FLANKING_BASE_Q = 20
 

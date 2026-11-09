@@ -46,6 +46,10 @@ import numpy as np
 
 from prolyg_phasing.io.format import format_pattern
 
+# Version of the saved-panel layout and extraction rules. `load_db` rejects
+# a panel written under any other version.
+EXTRACTION_SCHEMA_VERSION = "3"
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -65,10 +69,8 @@ class ExtractionProvenance:
     anchor_hamming_max: int
     pair_disagreement_policy: str
     n_alleles_margin: int
-    # Schema-v2 additions (flanking extraction). Defaults preserve
-    # backward-compat for old provenance JSONs that lack these keys.
+    extraction_schema_version: str
     min_base_q: int = 0
-    extraction_schema_version: str = "1"
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -286,6 +288,15 @@ class ExtractedPanel:
         p = Path(path)
         conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
         provenance_json = conn.execute("SELECT json FROM provenance").fetchone()[0]
+        stored_version = json.loads(provenance_json).get("extraction_schema_version")
+        if stored_version != EXTRACTION_SCHEMA_VERSION:
+            conn.close()
+            shown = "missing" if stored_version is None else repr(stored_version)
+            raise ValueError(
+                f"Panel {p} has extraction schema version {shown}; this "
+                f"code reads version {EXTRACTION_SCHEMA_VERSION!r}. "
+                "Re-extract the panel from its BAM."
+            )
         provenance = ExtractionProvenance.from_dict(json.loads(provenance_json))
         n_alleles = conn.execute("SELECT n_alleles FROM panel_info").fetchone()[0]
         return cls(loci=_LazyLociMap(conn), n_alleles=n_alleles, provenance=provenance)

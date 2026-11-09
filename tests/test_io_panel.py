@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 from prolyg_phasing.io.panel import (
+    EXTRACTION_SCHEMA_VERSION,
     ExtractedPanel,
     interrupter_pattern,
     loci_equal,
@@ -407,3 +408,50 @@ def test_locus_column_agrees_between_the_database_and_memory(tmp_path):
     }
     with pytest.raises(ValueError):
         loaded.locus_column("row_blob")
+
+
+def _rewrite_schema_version(db, version):
+    """Rewrite a saved panel's provenance; ``None`` removes the version field."""
+    import json
+    import sqlite3
+
+    conn = sqlite3.connect(str(db))
+    try:
+        (raw,) = conn.execute("SELECT json FROM provenance").fetchone()
+        prov = json.loads(raw)
+        if version is None:
+            del prov["extraction_schema_version"]
+        else:
+            prov["extraction_schema_version"] = version
+        conn.execute("UPDATE provenance SET json = ?", (json.dumps(prov),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_load_db_current_schema_version_loads(tmp_path):
+    db = tmp_path / "panel.db"
+    _two_locus_panel_with_flanking().save_db(db)
+    loaded = ExtractedPanel.load_db(db)
+    assert loaded.provenance.extraction_schema_version == EXTRACTION_SCHEMA_VERSION
+
+
+def test_load_db_rejects_other_schema_version(tmp_path):
+    db = tmp_path / "panel.db"
+    _two_locus_panel_with_flanking().save_db(db)
+    _rewrite_schema_version(db, "2")
+    with pytest.raises(ValueError) as err:
+        ExtractedPanel.load_db(db)
+    message = str(err.value)
+    assert str(db) in message
+    assert "'2'" in message
+    assert repr(EXTRACTION_SCHEMA_VERSION) in message
+    assert "Re-extract" in message
+
+
+def test_load_db_rejects_missing_schema_version(tmp_path):
+    db = tmp_path / "panel.db"
+    _two_locus_panel_with_flanking().save_db(db)
+    _rewrite_schema_version(db, None)
+    with pytest.raises(ValueError, match="version missing"):
+        ExtractedPanel.load_db(db)

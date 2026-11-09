@@ -11,7 +11,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from prolyg_phasing.io.panel import ExtractedLocus, ExtractionProvenance, parse_run_lengths
+from prolyg_phasing.io.panel import (
+    EXTRACTION_SCHEMA_VERSION,
+    ExtractedLocus,
+    ExtractionProvenance,
+    parse_run_lengths,
+)
 
 
 def _make_provenance() -> ExtractionProvenance:
@@ -25,6 +30,7 @@ def _make_provenance() -> ExtractionProvenance:
         max_tlen=1000,
         anchor_hamming_max=1,
         pair_disagreement_policy="merge_by_quality",
+        extraction_schema_version=EXTRACTION_SCHEMA_VERSION,
         n_alleles_margin=1,
     )
 

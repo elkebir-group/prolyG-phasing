@@ -4,7 +4,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from prolyg_phasing.io.panel import ExtractedLocus, ExtractedPanel, ExtractionProvenance
+from prolyg_phasing.io.panel import (
+    EXTRACTION_SCHEMA_VERSION,
+    ExtractedLocus,
+    ExtractedPanel,
+    ExtractionProvenance,
+)
 from prolyg_phasing.io.phasing_tables import (
     build_haplotype_calls,
     build_locus_summary,
@@ -25,8 +30,8 @@ def _make_provenance() -> ExtractionProvenance:
         max_tlen=1000,
         anchor_hamming_max=1,
         pair_disagreement_policy="merge_by_quality",
+        extraction_schema_version=EXTRACTION_SCHEMA_VERSION,
         n_alleles_margin=1,
-        extraction_schema_version="2",
     )
 
 
