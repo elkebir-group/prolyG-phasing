@@ -24,7 +24,7 @@ def _make_provenance() -> ExtractionProvenance:
         drop_chimeric=True,
         max_tlen=1000,
         anchor_hamming_max=1,
-        pair_disagreement_policy="drop",
+        pair_disagreement_policy="merge_by_quality",
         n_alleles_margin=1,
         extraction_schema_version="2",
     )
@@ -71,7 +71,7 @@ def _make_locus(
         n_alignments_overlap_locus=total * 2,
         n_alignments_drop_mapq=0, n_alignments_drop_sa=0,
         n_alignments_drop_tlen=0, n_alignments_drop_anchor=0,
-        n_read_pairs=total, n_read_pairs_drop_disagree=0, n_reads=total,
+        n_read_pairs=total, n_read_pairs_drop_disagree=0, n_read_pairs_merged=0, n_reads=total,
         flanking_id=flanking_id, flanking_seq=flanking_seq,
         flanking_up_width=up_width, flanking_dn_width=dn_width,
         flanking_up_ref_pos_start=1000, flanking_dn_ref_pos_start=2000,

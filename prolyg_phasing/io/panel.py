@@ -131,6 +131,7 @@ class ExtractedLocus:
     n_alignments_drop_anchor: int
     n_read_pairs: int
     n_read_pairs_drop_disagree: int
+    n_read_pairs_merged: int
     n_reads: int                 # = count.sum()
     max_observed_run_length: int
     anchorability_status: str
@@ -514,6 +515,7 @@ _PANEL_META_COLUMNS = [
     "n_alignments_drop_anchor",
     "n_read_pairs",
     "n_read_pairs_drop_disagree",
+    "n_read_pairs_merged",
     "n_reads",
     "n_alleles",
     # Schema-v2 flanking geometry.
@@ -539,7 +541,7 @@ _DB_INT_COLUMNS = {
     "n_alignments_overlap_locus", "n_alignments_drop_mapq",
     "n_alignments_drop_sa", "n_alignments_drop_tlen",
     "n_alignments_drop_anchor", "n_read_pairs",
-    "n_read_pairs_drop_disagree", "n_reads",
+    "n_read_pairs_drop_disagree", "n_read_pairs_merged", "n_reads",
     "g_walk_up", "g_walk_dn", "flanking_up_width", "flanking_dn_width",
     "flanking_up_ref_pos_start", "flanking_dn_ref_pos_start",
 }
@@ -717,6 +719,7 @@ def _locus_meta_row(locus: ExtractedLocus) -> dict:
         "n_alignments_drop_anchor": locus.n_alignments_drop_anchor,
         "n_read_pairs": locus.n_read_pairs,
         "n_read_pairs_drop_disagree": locus.n_read_pairs_drop_disagree,
+        "n_read_pairs_merged": locus.n_read_pairs_merged,
         "n_reads": locus.n_reads,
         "g_walk_up": locus.g_walk_up,
         "g_walk_dn": locus.g_walk_dn,

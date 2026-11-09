@@ -17,11 +17,13 @@ extraction feeding it cleanly is covered from prolyG's side —
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pysam
 import pytest
 
+from prolyg_phasing.io._anchors import revcomp
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import ExtractedPanel
 
@@ -91,6 +93,7 @@ def _add_read(
     tlen: int = 200,
     has_sa: bool = False,
     quality_str: str | None = None,
+    no_qualities: bool = False,
 ) -> None:
     """Add one synthetic alignment to a pysam.AlignmentFile open for writing.
 
@@ -103,7 +106,8 @@ def _add_read(
     if quality_str is None:
         quality_str = "I" * len(read_seq)
     assert len(quality_str) == len(read_seq), "quality_str must match read length"
-    seg.query_qualities = pysam.qualitystring_to_array(quality_str)
+    if not no_qualities:
+        seg.query_qualities = pysam.qualitystring_to_array(quality_str)
     seg.flag = 0
     if not is_read1:
         seg.is_read2 = True
@@ -328,12 +332,175 @@ def test_tlen_filter(tmp_path):
     assert loc.n_reads == 1  # only the seed survives
 
 
-def test_pair_disagreement_policy_only_drop_supported(tmp_path):
-    """`pair_disagreement_policy != 'drop'` raises NotImplementedError."""
+# ---------------------------------------------------------------------------
+# Pair merge by base quality
+# ---------------------------------------------------------------------------
+
+_HIGH_Q = "I"  # Q40
+_LOW_Q = "-"   # Q12
+_NO_CALL_Q = "#"  # Q2
+
+
+def _tract_with(index_to_base: dict[int, str]) -> str:
+    """The reference polyG tract with single bases replaced by index."""
+    tract = list(_REF_POLYG)
+    for i, base in index_to_base.items():
+        tract[i] = base
+    return "".join(tract)
+
+
+def _quality_at(read_index_to_q: dict[int, str]) -> str:
+    """A 150-base quality string of Q40 with single positions overridden."""
+    q = [_HIGH_Q] * 150
+    for i, char in read_index_to_q.items():
+        q[i] = char
+    return "".join(q)
+
+
+def _pair_reads(
+    tract_a: str, tract_b: str, qual_a: str | None, qual_b: str | None,
+    *, orientation: str = "+", no_qualities_b: bool = False,
+) -> list[dict]:
+    """Two mates of one fragment; tracts are given in polyG orientation."""
+    to_read = (lambda t: t) if orientation == "+" else revcomp
+    seq_a, rs = _canonical_read_seq(to_read(tract_a))
+    seq_b, _ = _canonical_read_seq(to_read(tract_b))
+    return [
+        dict(qname="q1", read_seq=seq_a, ref_start=rs, mi="10004/A",
+             is_read1=True, tlen=120, quality_str=qual_a),
+        dict(qname="q1", read_seq=seq_b, ref_start=rs, mi="10004/A",
+             is_read1=False, tlen=120, quality_str=qual_b,
+             no_qualities=no_qualities_b),
+    ]
+
+
+def _extract_one_locus(tmp_path, reads):
+    bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
-    bam_path = _make_test_bam(tmp_path, [])  # empty BAM
-    with pytest.raises(NotImplementedError):
-        extract_panel(bam_path, bed_path, pair_disagreement_policy="r1")
+    return extract_panel(bam_path, bed_path).loci["Locus1"]
+
+
+def test_pair_merge_higher_quality_base_wins(tmp_path):
+    """One differing base: the Q40 call beats the Q12 call; the pair counts once."""
+    # Tract index 0 is read index BED_START + 0 on a "+" locus.
+    reads = _pair_reads(
+        _tract_with({0: "G"}), _tract_with({0: "T"}),
+        _quality_at({}), _quality_at({BED_START: _LOW_Q}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs == 1
+    assert loc.n_read_pairs_merged == 1
+    assert loc.n_read_pairs_drop_disagree == 0
+    assert int(loc.count.sum()) == 1
+    assert list(loc.seq) == [_tract_with({0: "G"})]
+
+
+def test_pair_merge_winner_differs_by_position(tmp_path):
+    """Two differing bases, each mate wins one."""
+    tract_a = _tract_with({2: "C", 5: "T"})
+    tract_b = _tract_with({2: "A", 5: "G"})
+    # Mate A wins index 2 (B is low); mate B wins index 5 (A is low).
+    reads = _pair_reads(
+        tract_a, tract_b,
+        _quality_at({BED_START + 5: _LOW_Q}),
+        _quality_at({BED_START + 2: _LOW_Q}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs_merged == 1
+    assert int(loc.count.sum()) == 1
+    assert list(loc.seq) == [_tract_with({2: "C", 5: "G"})]
+
+
+def test_pair_merge_equal_quality_drops(tmp_path):
+    """Equal qualities at the differing base: the pair is dropped."""
+    reads = _pair_reads(
+        _tract_with({0: "G"}), _tract_with({0: "T"}),
+        _quality_at({}), _quality_at({}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs == 1
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 1
+    assert int(loc.count.sum()) == 0
+
+
+def test_pair_merge_one_tied_position_drops(tmp_path):
+    """A tie at any one differing position drops the pair, even if another resolves."""
+    reads = _pair_reads(
+        _tract_with({2: "C", 5: "T"}), _tract_with({2: "A", 5: "G"}),
+        _quality_at({}), _quality_at({BED_START + 2: _LOW_Q}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 1
+
+
+def test_pair_merge_length_difference_drops(tmp_path):
+    """Tracts of different length are dropped, whatever the qualities."""
+    seq_a, rs = _canonical_read_seq(_REF_POLYG)
+    # One extra G in the tract; the read stays 150 bases long.
+    seq_b = (REFERENCE[:BED_START] + "G" + _REF_POLYG + REFERENCE[BED_END:])[:150]
+    reads = [
+        dict(qname="q1", read_seq=seq_a, ref_start=rs, mi="10004/A",
+             is_read1=True, tlen=120, quality_str=_quality_at({})),
+        dict(qname="q1", read_seq=seq_b, ref_start=rs, mi="10004/A",
+             is_read1=False, tlen=120, quality_str=_quality_at({BED_START: _LOW_Q})),
+    ]
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs == 1
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 1
+    assert int(loc.count.sum()) == 0
+
+
+def test_pair_merge_on_minus_locus_reverses_qualities(tmp_path, monkeypatch):
+    """On a "-" locus the qualities follow the reverse complement of the read."""
+    plus_ref = REFERENCE
+    minus_ref = (
+        plus_ref[:50] + revcomp(plus_ref[50:84]) + plus_ref[84:]
+    )
+    monkeypatch.setattr(sys.modules[__name__], "REFERENCE", minus_ref)
+    # Tract index 0 (polyG orientation) is read index BED_END - 1.
+    reads = _pair_reads(
+        _tract_with({0: "G"}), _tract_with({0: "T"}),
+        _quality_at({}), _quality_at({BED_END - 1: _LOW_Q}),
+        orientation="-",
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.ref_orientation == "-"
+    assert loc.n_read_pairs_merged == 1
+    assert int(loc.count.sum()) == 1
+    assert list(loc.seq) == [_tract_with({0: "G"})]
+
+
+def test_pair_merge_low_quality_n_loses_to_called_base(tmp_path):
+    """An N at Q2 against a called base keeps the called base."""
+    reads = _pair_reads(
+        _tract_with({3: "N"}), _tract_with({3: "A"}),
+        _quality_at({BED_START + 3: _NO_CALL_Q}), _quality_at({}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs_merged == 1
+    assert list(loc.seq) == [_tract_with({3: "A"})]
+
+
+def test_pair_merge_without_qualities_drops(tmp_path):
+    """A mate with no stored qualities cannot be merged; the pair is dropped."""
+    reads = _pair_reads(
+        _tract_with({0: "G"}), _tract_with({0: "T"}),
+        _quality_at({}), None, no_qualities_b=True,
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 1
+    assert int(loc.count.sum()) == 0
+
+
+def test_provenance_records_merge_rule(tmp_path):
+    """A panel states the pair-disagreement rule it was built with."""
+    bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
+    panel = extract_panel(_make_test_bam(tmp_path, []), bed_path)
+    assert panel.provenance.pair_disagreement_policy == "merge_by_quality"
 
 
 def test_provenance_records_kwargs(tmp_path):
@@ -616,5 +783,5 @@ def test_extraction_schema_version_in_provenance(tmp_path):
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
     bam_path = _make_test_bam(tmp_path, [])
     panel = extract_panel(bam_path, bed_path, min_base_q=25)
-    assert panel.provenance.extraction_schema_version == "2"
+    assert panel.provenance.extraction_schema_version == "3"
     assert panel.provenance.min_base_q == 25

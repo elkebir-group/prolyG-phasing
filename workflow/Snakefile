@@ -60,7 +60,6 @@ rule extract:
         ),
         max_tlen=config["extraction"]["max_tlen"],
         anchor_hamming_max=config["extraction"]["anchor_hamming_max"],
-        pair_disagreement_policy=config["extraction"]["pair_disagreement_policy"],
         n_alleles_margin=config["extraction"]["n_alleles_margin"],
         min_flanking_base_q=config["extraction"]["min_flanking_base_q"],
     threads: workflow.cores
@@ -77,7 +76,6 @@ rule extract:
             {params.drop_chimeric_flag} \
             --max-tlen {params.max_tlen} \
             --anchor-hamming-max {params.anchor_hamming_max} \
-            --pair-disagreement-policy {params.pair_disagreement_policy} \
             --n-alleles-margin {params.n_alleles_margin} \
             --min-flanking-base-q {params.min_flanking_base_q} \
             --verbose 2>&1 | tee {log}

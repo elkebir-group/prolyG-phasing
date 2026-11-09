@@ -15,7 +15,6 @@ extraction:
   drop_chimeric: true
   max_tlen: 1000
   anchor_hamming_max: 1
-  pair_disagreement_policy: drop
   n_alleles_margin: 1
   min_flanking_base_q: 20
 

@@ -24,7 +24,7 @@ def _make_provenance() -> ExtractionProvenance:
         drop_chimeric=True,
         max_tlen=1000,
         anchor_hamming_max=1,
-        pair_disagreement_policy="drop",
+        pair_disagreement_policy="merge_by_quality",
         n_alleles_margin=1,
     )
 
@@ -78,6 +78,6 @@ def _make_locus_single_run(
         n_alignments_drop_tlen=0,
         n_alignments_drop_anchor=0,
         n_read_pairs=int(count.sum()),
-        n_read_pairs_drop_disagree=0,
+        n_read_pairs_drop_disagree=0, n_read_pairs_merged=0,
         n_reads=int(count.sum()),
     )

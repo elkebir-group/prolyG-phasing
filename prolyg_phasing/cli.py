@@ -62,12 +62,6 @@ def _add_extract_args(p: argparse.ArgumentParser) -> None:
                     help="Maximum Hamming distance allowed when placing "
                          "the upstream/downstream anchor sequence in a "
                          "read; a placement past this is rejected.")
-    p.add_argument("--pair-disagreement-policy", default="drop",
-                    choices=["drop"],
-                    help="What to do when a read pair's R1 and R2 report "
-                         "different inter-anchor sequence. Only 'drop' "
-                         "(discard the pair, count it in "
-                         "n_read_pairs_drop_disagree) is implemented.")
     p.add_argument("--n-alleles-margin", type=int, default=1,
                     help="Headroom added over the panel-wide max observed "
                          "run length when sizing the allele-count axis "
@@ -89,7 +83,6 @@ def _run_extract(args: argparse.Namespace) -> None:
         drop_chimeric=args.drop_chimeric,
         max_tlen=args.max_tlen,
         anchor_hamming_max=args.anchor_hamming_max,
-        pair_disagreement_policy=args.pair_disagreement_policy,
         n_alleles_margin=args.n_alleles_margin,
         min_base_q=args.min_flanking_base_q,
         verbose=args.verbose,

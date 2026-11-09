@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import datetime
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -56,7 +57,8 @@ from prolyg_phasing.io.panel import (
 FLANKING_SEQ_LEN = 10
 REF_WINDOW_PAD = 50
 
-EXTRACTION_SCHEMA_VERSION = "2"
+EXTRACTION_SCHEMA_VERSION = "3"
+PAIR_DISAGREEMENT_POLICY = "merge_by_quality"
 DEFAULT_MIN_FLANKING_BASE_Q = 20
 
 _COMP_TABLE = str.maketrans("ACGTNacgtn", "TGCANtgcan")
@@ -338,6 +340,61 @@ def _consensus(a: FlankingSide, b: FlankingSide) -> FlankingSide:
     return _strip_side(start_a, text_a[:head_len] + overlap + tail)
 
 
+def _merge_tract_by_quality(
+    seq_a: str,
+    seq_b: str,
+    quality_a: Sequence[int] | None,
+    quality_b: Sequence[int] | None,
+) -> str | None:
+    """Merge two mates' equal-length inter-anchor tracts by base quality.
+
+    At each position where the mates differ, the base with the higher
+    Phred quality wins. Return ``None`` when the tracts differ in length,
+    when either mate has no stored qualities, or when the mates differ at
+    a position where their qualities are equal. The caller then drops the
+    pair.
+
+    Parameters
+    ----------
+    seq_a, seq_b : str
+        Inter-anchor tracts in polyG orientation.
+    quality_a, quality_b : sequence of int or None
+        Per-base Phred qualities of the two tracts, in the same
+        orientation and over the same slice as ``seq_a`` and ``seq_b``.
+
+    Returns
+    -------
+    str or None
+        The merged tract, or ``None`` when no merge is possible.
+    """
+    if len(seq_a) != len(seq_b) or quality_a is None or quality_b is None:
+        return None
+    merged = list(seq_a)
+    for i, (base_a, base_b) in enumerate(zip(seq_a, seq_b, strict=True)):
+        if base_a == base_b:
+            continue
+        if quality_a[i] == quality_b[i]:
+            return None
+        if quality_b[i] > quality_a[i]:
+            merged[i] = base_b
+    return "".join(merged)
+
+
+def _tract_qualities(
+    alignment: pysam.AlignedSegment,
+    ia_start: int,
+    ia_end: int,
+    ref_orientation: str,
+) -> Sequence[int] | None:
+    """Base qualities of an alignment's inter-anchor tract, in polyG orientation."""
+    qualities = alignment.query_qualities
+    if qualities is None:
+        return None
+    if ref_orientation == "-":
+        qualities = qualities[::-1]
+    return qualities[ia_start:ia_end]
+
+
 def _merge_pair_flanking(
     mates: list[tuple[FlankingSide, FlankingSide]],
 ) -> tuple[FlankingSide, FlankingSide]:
@@ -392,6 +449,7 @@ def _extract_locus(
         "n_alignments_drop_anchor": 0,
         "n_read_pairs": 0,
         "n_read_pairs_drop_disagree": 0,
+        "n_read_pairs_merged": 0,
     }
 
     # Wide fetch: ``bed ± max_tlen`` so the mate of a bed-spanning read is
@@ -519,14 +577,19 @@ def _extract_locus(
             ref_orientation=ref_orientation,
             min_base_q=min_base_q,
         )
-        by_qn[r.query_name].append(((mi_prefix, strand, ia_seq, up_flank, dn_flank), None))
+        tract_source = (r, ia_start, ia_end)
+        by_qn[r.query_name].append(
+            ((mi_prefix, strand, ia_seq, up_flank, dn_flank, tract_source), None)
+        )
 
     # Pair-collapse: group by query_name. Drop qns with no bed-spanning
     # mate (the fragment never reached the polyG and can't be assigned an
     # MI/strand/length), then drop >2-mate groups. A flanking-only mate
     # that covers nothing outside the anchors is not a mate at all, so it
-    # is dropped before the group-size test. Pair-disagreement checks
-    # only apply when both mates are bed-spanning. Flanking sides are
+    # is dropped before the group-size test. Tract disagreement checks
+    # only apply when both mates are bed-spanning: equal-length tracts
+    # merge by base quality, and a tie or a length difference drops the
+    # pair. Flanking sides are
     # pair-merged with per-position consensus (drop on disagreement); a
     # bed-spanning + flanking-only pair has no disagreement possible at
     # any single position the flanking-only mate covers — both feed into
@@ -557,13 +620,25 @@ def _extract_locus(
         if len(prefs) != 1 or len(strands) != 1:
             continue
         qc["n_read_pairs"] += 1
-        if len(bed_mates) == 2 and bed_mates[0][2] != bed_mates[1][2]:
-            qc["n_read_pairs_drop_disagree"] += 1
-            continue
+        ia_seq = bed_mates[0][2]
+        if len(bed_mates) == 2 and ia_seq != bed_mates[1][2]:
+            # Qualities are read only for pairs whose tracts differ.
+            merged_seq = None
+            if len(ia_seq) == len(bed_mates[1][2]):
+                merged_seq = _merge_tract_by_quality(
+                    ia_seq, bed_mates[1][2],
+                    _tract_qualities(*bed_mates[0][5], ref_orientation),
+                    _tract_qualities(*bed_mates[1][5], ref_orientation),
+                )
+            if merged_seq is None:
+                qc["n_read_pairs_drop_disagree"] += 1
+                continue
+            qc["n_read_pairs_merged"] += 1
+            ia_seq = merged_seq
         up_merged, dn_merged = _merge_pair_flanking(
             [(m[3], m[4]) for m in bed_mates] + flank_sides
         )
-        accepted.append((bed_mates[0][0], bed_mates[0][1], bed_mates[0][2], up_merged, dn_merged))
+        accepted.append((bed_mates[0][0], bed_mates[0][1], ia_seq, up_merged, dn_merged))
 
     # Determine per-locus flanking widths: max distance seen across all
     # accepted reads, on each side.
@@ -635,7 +710,6 @@ def extract_panel(
     drop_chimeric: bool = True,
     max_tlen: int = 1000,
     anchor_hamming_max: int = 1,
-    pair_disagreement_policy: str = "drop",
     n_alleles_margin: int = 1,
     min_base_q: int = DEFAULT_MIN_FLANKING_BASE_Q,
     verbose: bool = False,
@@ -671,11 +745,6 @@ def extract_panel(
         Drop alignments with `|TLEN| > max_tlen`.
     anchor_hamming_max : int, default 1
         Cap on per-anchor Hamming distance for accepted placement.
-    pair_disagreement_policy : str, default "drop"
-        Currently only ``"drop"`` is supported. R1+R2 pairs with
-        different inter-anchor `seq` are dropped and counted in
-        `n_read_pairs_drop_disagree`. Future policies may add
-        ``"r1"`` / ``"keep_both"`` on demand.
     n_alleles_margin : int, default 1
         Headroom over `max_observed_run_length` when setting panel-
         wide `n_alleles`. `1` matches the current SD14 convention.
@@ -688,12 +757,6 @@ def extract_panel(
     -------
     ExtractedPanel
     """
-    if pair_disagreement_policy != "drop":
-        raise NotImplementedError(
-            f"pair_disagreement_policy={pair_disagreement_policy!r} not supported; "
-            "only 'drop' is implemented."
-        )
-
     bam_path = Path(bam_path)
     bed_path = Path(bed_path)
 
@@ -735,6 +798,7 @@ def extract_panel(
                     "n_alignments_drop_anchor": 0,
                     "n_read_pairs": 0,
                     "n_read_pairs_drop_disagree": 0,
+                    "n_read_pairs_merged": 0,
                 }
             else:
                 counts, flanking_seqs, up_width, dn_width, qc = _extract_locus(
@@ -774,7 +838,7 @@ def extract_panel(
         drop_chimeric=drop_chimeric,
         max_tlen=max_tlen,
         anchor_hamming_max=anchor_hamming_max,
-        pair_disagreement_policy=pair_disagreement_policy,
+        pair_disagreement_policy=PAIR_DISAGREEMENT_POLICY,
         n_alleles_margin=n_alleles_margin,
         min_base_q=min_base_q,
         extraction_schema_version=EXTRACTION_SCHEMA_VERSION,
@@ -883,6 +947,7 @@ def _build_locus(
         n_alignments_drop_anchor=qc["n_alignments_drop_anchor"],
         n_read_pairs=qc["n_read_pairs"],
         n_read_pairs_drop_disagree=qc["n_read_pairs_drop_disagree"],
+        n_read_pairs_merged=qc["n_read_pairs_merged"],
         n_reads=int(count_arr.sum()),
         g_walk_up=anchor.g_walk_up,
         g_walk_dn=anchor.g_walk_dn,
