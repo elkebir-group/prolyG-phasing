@@ -44,12 +44,15 @@ from tests._hand_built_reads import (
     chromosome,
     flank_edit_distance,
     placements,
+    run_stutter_with_flank_error_cases,
     run_tuple,
     soft_clipped_flank_case,
 )
 
 CASES = build_cases() + [soft_clipped_flank_case()]
 CASE_IDS = [c.case_id for c in CASES]
+# Every hand-built case, those pinned as known failures included.
+ALL_CASES = CASES + run_stutter_with_flank_error_cases()
 
 # The paths each case must use across its alignments. "fast": the alignment
 # covers the flank with M operations and the read matches it at every
@@ -121,7 +124,7 @@ ASSIGNED_TUPLE: dict[str, tuple[int, ...]] = {
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
+@pytest.mark.parametrize("case", ALL_CASES, ids=[c.case_id for c in ALL_CASES])
 @pytest.mark.parametrize("orientation", ["+", "-"])
 def test_every_placement_is_a_valid_alignment(case: ReadCase, orientation: str):
     """The MD tag and CIGAR rebuild the synthetic reference under every alignment."""
@@ -135,7 +138,7 @@ def test_every_placement_is_a_valid_alignment(case: ReadCase, orientation: str):
         assert seq == case.read
 
 
-@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
+@pytest.mark.parametrize("case", ALL_CASES, ids=[c.case_id for c in ALL_CASES])
 def test_flanks_match_the_reference(case: ReadCase):
     """Each flank is 10 reference bases with a non-G run-side base."""
     ref = case.locus.reference
@@ -646,3 +649,36 @@ def test_block_walk_matches_one_read_at_a_time(orientation):
         for s, (lo, hi) in enumerate(intervals):
             assert (indel[s, i], clip[s, i]) == _reference_events(cig, start, lo, hi)
     assert n_single > 100
+
+
+# ---------------------------------------------------------------------------
+# Reads where one mate's tract gains a base (PolyG8057, donor A's normal)
+# ---------------------------------------------------------------------------
+
+STUTTER_CASES = run_stutter_with_flank_error_cases()
+
+
+def _accepted_outcomes(case: ReadCase) -> set:
+    """The mate's tuple; a read with a G at a run-side base may also drop and count."""
+    outcomes = {case.true_tuple}
+    if "g_at" in case.case_id:
+        outcomes.add("g_at_run_side")
+    return outcomes
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "The kernel gives the run one base more than the mate does: the projection "
+    "bonus keeps the aligner's choice between two placements with one flank edit "
+    "each, and the non-G tie-break reads a G at the run-side base as a deleted "
+    "flank base."))
+@pytest.mark.parametrize("case", STUTTER_CASES, ids=[c.case_id for c in STUTTER_CASES])
+@pytest.mark.parametrize("orientation", ["+", "-"])
+def test_run_stutter_with_a_flank_error_gives_the_mate_tuple(case: ReadCase, orientation):
+    result = _place(case, orientation)
+    for i, form in enumerate(p.form for p in placements(case)):
+        if result.kept[i]:
+            got = run_tuple(result.tracts[i])
+        else:
+            reasons = drop_reasons(result, i)
+            got = reasons.pop() if len(reasons) == 1 else tuple(sorted(reasons))
+        assert got in _accepted_outcomes(case), form

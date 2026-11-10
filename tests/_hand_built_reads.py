@@ -74,6 +74,8 @@ LOCI: dict[str, LocusSequence] = {
                       "TGGTTTTGAAAAAAGCCATGGACTGATGCA"),
         LocusSequence("PolyG8882", "+", "TGAGCTATAAGTGACACAATATACCTTTGC", "G" * 10,
                       "TACAGGAATCTCTTATGTTAAAGATAATCT"),
+        LocusSequence("PolyG8057", "-", "GGGGACCAAGCAGGGTTAGGAGCGGGCTTT", "G" * 10,
+                      "TTCTGGGGTGGGTGGAGTTATCTGCAAGCC"),
     )
 }
 
@@ -315,6 +317,37 @@ def build_cases() -> list[ReadCase]:
     c.append(_case("two_base_deletion_in_flank", "PolyG151: AG deleted from TTTAGAT",
                    "PolyG151", up_ctx=_del(up151, len(up151) - 4, 2), tract=G * 12,
                    drop_reason="flank_not_placed", true_tract=None))
+    return c
+
+
+def run_stutter_with_flank_error_cases() -> list[ReadCase]:
+    """Reads from donor A's normal at PolyG8057 where one mate's tract gains a base.
+
+    Each read carries a run length the mate confirms, and one read error in
+    a flank next to a repeated flank base. Today's anchors and the mate give
+    the true tuple.
+    """
+    c: list[ReadCase] = []
+    up = _up("PolyG8057")
+    dn = _dn("PolyG8057")
+    # G9 and a C>T in TTCT: read G9 TTTTGGGG. One alignment deletes a run G
+    # and calls the T a mismatch; another deletes the C and calls the T
+    # after G9 a mismatch against the tenth G.
+    c.append(_case("run_deletion_flank_substitution", "PolyG8057: G9, C>T in TTCT",
+                   "PolyG8057", tract=G * 9, dn_ctx=_sub(dn, 2, "T")))
+    # G9 and a T>G at the downstream run-side base: read G10 TCTG, which is
+    # also G10 with one T of TT deleted.
+    c.append(_case("run_deletion_g_at_downstream_run_side",
+                   "PolyG8057: G9, T>G at the downstream run-side T", "PolyG8057",
+                   tract=G * 9, dn_ctx="G" + dn[1:]))
+    # G8 and the same T>G: read G9 TCTG.
+    c.append(_case("two_g_deletion_g_at_downstream_run_side",
+                   "PolyG8057: G8, T>G at the downstream run-side T", "PolyG8057",
+                   tract=G * 8, dn_ctx="G" + dn[1:]))
+    # G9 and a T>G at the upstream run-side base: read CTT G10.
+    c.append(_case("run_deletion_g_at_upstream_run_side",
+                   "PolyG8057: G9, T>G at the upstream run-side T", "PolyG8057",
+                   up_ctx=up[:-1] + "G", tract=G * 9))
     return c
 
 
