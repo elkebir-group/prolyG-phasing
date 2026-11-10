@@ -44,10 +44,18 @@ strands carry different vote evidence. `example_target.bam` (for
 `ref-phase`, below) is a second, independently composed sample at the same
 two loci.
 
+`extract` reads every sample of a donor with the flanks that `build-flanks`
+builds from the donor's matched normal; here `example.bam` plays the normal.
+The sample name in the flank tables is the BAM's read-group `SM`.
+
 ```bash
+prolyg-phasing build-flanks \
+    --bam workflow/example/example.bam --bed workflow/example/panel.bed \
+    --out-prefix example
+
 prolyg-phasing extract \
     --bam workflow/example/example.bam --bed workflow/example/panel.bed \
-    --out-db panel.db
+    --flanks example_flank_sides.tsv --out-db panel.db
 
 prolyg-phasing phase \
     --panel-db panel.db --out-dir phasing/
@@ -67,7 +75,7 @@ alternation or strand-mismatch flourish):
 ```bash
 prolyg-phasing extract \
     --bam workflow/example/example_target.bam --bed workflow/example/panel.bed \
-    --out-db target_panel.db
+    --flanks example_flank_sides.tsv --out-db target_panel.db
 
 prolyg-phasing ref-phase \
     --target-panel-db target_panel.db --reference-snv-calls phasing/snv_calls.tsv \
@@ -92,7 +100,7 @@ Run `prolyg-phasing <command> --help` for any command's full flag list.
 
 ## Quickstart — Snakemake
 
-The same two steps, over many samples at once. Runs out of the box against
+The same three steps, over many samples at once. Runs out of the box against
 the committed example (`workflow/config/samples.tsv`/`config.yaml` already
 point at it):
 
@@ -100,11 +108,12 @@ point at it):
 snakemake -s workflow/Snakefile --configfile workflow/config/config.yaml --cores N
 ```
 
-This drives the identical `prolyg-phasing extract`/`prolyg-phasing phase`
-CLI per sample — Snakemake is a convenience for running many samples, not a
-separate code path. To point it at your own data, edit
-`workflow/config/samples.tsv` (`sample_id`, `bam` — the `bam` path is
-relative to the repo root) and `workflow/config/config.yaml`'s `panel.bed`
+This drives the identical `prolyg-phasing build-flanks`/`prolyg-phasing
+extract`/`prolyg-phasing phase` CLI per sample — Snakemake is a convenience
+for running many samples, not a separate code path. To point it at your own
+data, edit `workflow/config/samples.tsv` (`sample_id`, `bam` — the `bam`
+path is relative to the repo root — and `normal`, the `sample_id` of the
+donor's matched normal; a normal names itself) and `workflow/config/config.yaml`'s `panel.bed`
 key in place, or override without editing anything:
 
 ```bash

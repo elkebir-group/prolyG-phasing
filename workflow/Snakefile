@@ -1,14 +1,18 @@
-"""Standalone extract → phase pipeline for prolyg_phasing.
+"""Standalone build-flanks → extract → phase pipeline for prolyg_phasing.
 
-Two rules, one per package CLI subcommand (`prolyg-phasing extract` /
-`prolyg-phasing phase`), driven by a plain `sample_id`/`bam` samples table —
-that's all extraction and phasing need.
+Three rules, one per package CLI subcommand (`prolyg-phasing build-flanks` /
+`prolyg-phasing extract` / `prolyg-phasing phase`), driven by a plain
+`sample_id`/`bam`/`normal` samples table. `normal` names the sample_id of the
+donor's matched normal; a normal names itself. Every sample is extracted with
+the flanks that build-flanks builds from its matched normal.
 
     snakemake -s workflow/Snakefile --configfile workflow/config/config.yaml --cores N
 
-Or run either stage directly on one sample, without Snakemake at all:
+Or run each stage directly on one sample, without Snakemake at all:
 
-    prolyg-phasing extract --bam s.bam --bed panel.bed --out-db panel.db
+    prolyg-phasing build-flanks --bam normal.bam --bed panel.bed --out-prefix normal
+    prolyg-phasing extract --bam s.bam --bed panel.bed \
+        --flanks normal_flank_sides.tsv --out-db panel.db
     prolyg-phasing phase --panel-db panel.db --out-dir phasing/
 """
 from pathlib import Path
@@ -35,6 +39,11 @@ SAMPLES = pd.read_table(_samples_path, dtype=str).set_index("sample_id", drop=Fa
 SAMPLE_IDS = list(SAMPLES["sample_id"])
 
 
+def flanks_for(sample_id: str) -> str:
+    normal = SAMPLES.loc[sample_id, "normal"]
+    return str(OUT_ROOT / normal / "flanks" / f"{normal}_flank_sides.tsv")
+
+
 def bam_for(sample_id: str) -> str:
     bam = SAMPLES.loc[sample_id, "bam"]
     bam_path = Path(bam)
@@ -47,10 +56,35 @@ rule all:
                sample=SAMPLE_IDS),
 
 
+rule build_flanks:
+    input:
+        bam=lambda wc: bam_for(wc.sample),
+        bed=str(BED_PATH),
+    output:
+        sides=str(OUT_ROOT / "{sample}" / "flanks" / "{sample}_flank_sides.tsv"),
+        candidates=str(OUT_ROOT / "{sample}" / "flanks" / "{sample}_flank_candidates.tsv"),
+        error_rate=str(OUT_ROOT / "{sample}" / "flanks" / "{sample}_error_rate.json"),
+    params:
+        out_prefix=str(OUT_ROOT / "{sample}" / "flanks" / "{sample}"),
+    threads: workflow.cores
+    log:
+        str(OUT_ROOT / "{sample}" / "flanks" / "build_flanks.log"),
+    shell:
+        r"""
+        set -o pipefail
+        prolyg-phasing build-flanks \
+            --bam {input.bam} \
+            --bed {input.bed} \
+            --out-prefix {params.out_prefix} \
+            2>&1 | tee {log}
+        """
+
+
 rule extract:
     input:
         bam=lambda wc: bam_for(wc.sample),
         bed=str(BED_PATH),
+        flanks=lambda wc: flanks_for(wc.sample),
     output:
         db=str(OUT_ROOT / "{sample}" / "extract" / "panel.db"),
     params:
@@ -59,7 +93,6 @@ rule extract:
             "" if config["extraction"]["drop_chimeric"] else "--no-drop-chimeric"
         ),
         max_tlen=config["extraction"]["max_tlen"],
-        anchor_hamming_max=config["extraction"]["anchor_hamming_max"],
         n_alleles_margin=config["extraction"]["n_alleles_margin"],
         min_flanking_base_q=config["extraction"]["min_flanking_base_q"],
     threads: workflow.cores
@@ -71,11 +104,11 @@ rule extract:
         prolyg-phasing extract \
             --bam {input.bam} \
             --bed {input.bed} \
+            --flanks {input.flanks} \
             --out-db {output.db} \
             --min-mapq {params.min_mapq} \
             {params.drop_chimeric_flag} \
             --max-tlen {params.max_tlen} \
-            --anchor-hamming-max {params.anchor_hamming_max} \
             --n-alleles-margin {params.n_alleles_margin} \
             --min-flanking-base-q {params.min_flanking_base_q} \
             --verbose 2>&1 | tee {log}
