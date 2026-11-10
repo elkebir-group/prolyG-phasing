@@ -77,6 +77,21 @@ EXPECTED_PATHS: dict[str, set[str]] = {
     "tgg_flank_substitution": {"fast", "local"},
     "tandem_copy_error_in_near_copy": {"fast", "local"},
     "soft_clip_in_flank": {"fast", "local"},
+    "read_ends_in_tract": {"fast"},
+    "tract_and_edge_deleted": {"fast", "local"},
+    "two_base_deletion_in_flank": {"fast"},
+}
+
+# Alignment forms whose drop reason differs from the case's. A read that
+# lost its whole tract differs from the reference by more bases than the
+# window search covers. The gapless forms show that change as mismatches
+# over the downstream flank, so the window cannot reach the placement that
+# crosses the upstream one, and the read drops as "flank_not_placed".
+DROP_REASON_BY_FORM: dict[str, dict[str, str]] = {
+    "tract_and_edge_deleted": {
+        "gapless_start_anchored": "flank_not_placed",
+        "gapless_start_anchored_tail_clipped": "flank_not_placed",
+    },
 }
 
 # Reads that are ambiguous by construction. Each read string also comes,
@@ -226,7 +241,8 @@ def test_every_placement_gives_the_true_tuple(case: ReadCase, orientation: str):
     forms = [p.form for p in placements(case)]
     for i, form in enumerate(forms):
         if case.drop_reason is not None:
-            assert result.drop_reason[i] == case.drop_reason, form
+            expected_drop = DROP_REASON_BY_FORM.get(case.case_id, {}).get(form, case.drop_reason)
+            assert result.drop_reason[i] == expected_drop, form
             continue
         assert result.drop_reason[i] is None, form
         expected = ASSIGNED_TUPLE.get(case.case_id, case.true_tuple)
@@ -311,6 +327,14 @@ def test_every_path_is_used_on_both_sides():
             used["downstream"] |= set(result.downstream_path) - {None}
     assert used["upstream"] == {"fast", "cigar", "local"}
     assert used["downstream"] == {"fast", "cigar", "local"}
+
+
+def test_every_drop_reason_is_used():
+    seen = set()
+    for case in CASES:
+        for orientation in "+-":
+            seen |= set(_place(case, orientation).drop_reason) - {None}
+    assert seen == set(flank_placement.DROP_REASONS)
 
 
 @pytest.mark.parametrize("orientation", ["+", "-"])

@@ -299,6 +299,22 @@ def build_cases() -> list[ReadCase]:
                    "PolyG3550: both copies, one mismatch in the near copy",
                    "PolyG3550", start=0,
                    up_ctx=_sub(_up("PolyG3550", 0, 0), 23, "C"), tract=G * 13))
+    # The read ends inside the tract, 4 bases before the downstream flank, so
+    # the projected flank is not inside the read.
+    ends_in_tract = _case("read_ends_in_tract", "PolyG151: read ends after 8 of 12 Gs",
+                          "PolyG151", tract=G * 8, dn_ctx="",
+                          drop_reason="flank_not_covered", true_tract=None)
+    c.append(dataclasses.replace(ends_in_tract,
+                                 ref_end=ends_in_tract.up.run_side + 1 + 8))
+    # The molecule lost the upstream edge T and all 12 Gs. The upstream flank
+    # and the downstream flank then place their run-side bases on one T.
+    c.append(_case("tract_and_edge_deleted", "PolyG151: edge T and G12 deleted",
+                   "PolyG151", up_ctx=up151[:-1], tract="",
+                   drop_reason="flanks_crossed", true_tract=None))
+    # A 2-base deletion (AG of TTTAGAT) inside the upstream flank: two edits.
+    c.append(_case("two_base_deletion_in_flank", "PolyG151: AG deleted from TTTAGAT",
+                   "PolyG151", up_ctx=_del(up151, len(up151) - 4, 2), tract=G * 12,
+                   drop_reason="flank_not_placed", true_tract=None))
     return c
 
 
