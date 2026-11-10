@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import datetime
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
@@ -412,64 +412,30 @@ def _merge_pair_flanking(
     return _consensus(up_a, up_b), _consensus(dn_a, dn_b)
 
 
-def _extract_locus(
+def filtered_alignments(
     bam: pysam.AlignmentFile,
     chrom: str,
+    fetch_start: int,
+    fetch_end: int,
     bed_start: int,
     bed_end: int,
     *,
-    ref_orientation: str,
-    anchor_up: str,
-    anchor_dn: str,
-    anchor_k: int,
-    g_walk_up: int,
-    g_walk_dn: int,
     min_mapq: int,
     drop_chimeric: bool,
     max_tlen: int,
-    anchor_hamming_max: int,
-    min_base_q: int,
-) -> tuple[Counter, list[str], int, int, dict]:
-    """Extract reads at one locus.
+    qc: dict,
+) -> Iterator[tuple[pysam.AlignedSegment, bool]]:
+    """Alignments in the fetch window that pass the extraction's read filters.
 
-    Returns ``(read_counts, flanking_seqs, flanking_up_width,
-    flanking_dn_width, qc)``. ``read_counts`` is a
-    ``Counter[(mi, strand, seq, flanking_id)]`` of accepted reads
-    (post-pair-collapse); ``flanking_seqs`` is the per-locus deduped
-    flanking string list (indexed by ``flanking_id``), each of the form
-    ``up_seq + "|" + dn_seq`` with ``.`` for uncovered/low-Q positions.
-    ``flanking_up_width`` / ``flanking_dn_width`` are the per-locus
-    extents observed.
+    Yields ``(alignment, bed_overlap)`` in fetch order. The filters drop
+    unmapped, secondary and supplementary alignments, mapping quality
+    below `min_mapq`, an SA tag (when `drop_chimeric`), ``|TLEN| >
+    max_tlen`` and an empty stored sequence. An alignment that overlaps
+    the BED interval must also carry an MI tag. For alignments that
+    overlap the BED interval, the filters add to the
+    ``n_alignments_overlap_locus`` and ``n_alignments_drop_{mapq,sa,tlen}``
+    counters in `qc`.
     """
-    qc = {
-        "n_alignments_overlap_locus": 0,
-        "n_alignments_drop_mapq": 0,
-        "n_alignments_drop_sa": 0,
-        "n_alignments_drop_tlen": 0,
-        "n_alignments_drop_anchor": 0,
-        "n_read_pairs": 0,
-        "n_read_pairs_drop_disagree": 0,
-        "n_read_pairs_merged": 0,
-    }
-
-    # Wide fetch: ``bed ± max_tlen`` so the mate of a bed-spanning read is
-    # visible even if its alignment lies fully outside the polyG bed. With
-    # paired-end Illumina at insert sizes up to ``max_tlen``, a fragment's
-    # far mate sits at most ``max_tlen`` bp from any base of its pair, so
-    # this window captures every relevant mate. Bed-spanning vs
-    # flanking-only is decided per-alignment by reference-interval
-    # overlap; the anchor check runs only on bed-spanning mates, since a
-    # flanking-only mate cannot contain both anchors by construction.
-    fetch_start = max(0, bed_start - max_tlen)
-    fetch_end = bed_end + max_tlen
-
-    # First pass: keep every alignment that clears the alignment-level
-    # filters, in fetch order, tagged bed-spanning or flanking-only. The
-    # anchor placement is deferred to one batched Hamming search over all
-    # bed-spanning reads of this locus, so it is not decided here.
-    candidates: list[tuple[pysam.AlignedSegment, str | None]] = []
-    bed_seqs: list[str] = []
-
     for r in bam.fetch(chrom, fetch_start, fetch_end):
         if r.flag & _DROP_FLAGS:
             continue
@@ -507,6 +473,77 @@ def _extract_locus(
             qc["n_alignments_overlap_locus"] += 1
             if not r.has_tag("MI"):
                 continue
+        yield r, bed_overlap
+
+
+def new_locus_qc() -> dict[str, int]:
+    """Zeroed per-locus QC counters of one extraction."""
+    return {
+        "n_alignments_overlap_locus": 0,
+        "n_alignments_drop_mapq": 0,
+        "n_alignments_drop_sa": 0,
+        "n_alignments_drop_tlen": 0,
+        "n_alignments_drop_anchor": 0,
+        "n_read_pairs": 0,
+        "n_read_pairs_drop_disagree": 0,
+        "n_read_pairs_merged": 0,
+    }
+
+
+def _extract_locus(
+    bam: pysam.AlignmentFile,
+    chrom: str,
+    bed_start: int,
+    bed_end: int,
+    *,
+    ref_orientation: str,
+    anchor_up: str,
+    anchor_dn: str,
+    anchor_k: int,
+    g_walk_up: int,
+    g_walk_dn: int,
+    min_mapq: int,
+    drop_chimeric: bool,
+    max_tlen: int,
+    anchor_hamming_max: int,
+    min_base_q: int,
+) -> tuple[Counter, list[str], int, int, dict]:
+    """Extract reads at one locus.
+
+    Returns ``(read_counts, flanking_seqs, flanking_up_width,
+    flanking_dn_width, qc)``. ``read_counts`` is a
+    ``Counter[(mi, strand, seq, flanking_id)]`` of accepted reads
+    (post-pair-collapse); ``flanking_seqs`` is the per-locus deduped
+    flanking string list (indexed by ``flanking_id``), each of the form
+    ``up_seq + "|" + dn_seq`` with ``.`` for uncovered/low-Q positions.
+    ``flanking_up_width`` / ``flanking_dn_width`` are the per-locus
+    extents observed.
+    """
+    qc = new_locus_qc()
+
+    # Wide fetch: ``bed ± max_tlen`` so the mate of a bed-spanning read is
+    # visible even if its alignment lies fully outside the polyG bed. With
+    # paired-end Illumina at insert sizes up to ``max_tlen``, a fragment's
+    # far mate sits at most ``max_tlen`` bp from any base of its pair, so
+    # this window captures every relevant mate. Bed-spanning vs
+    # flanking-only is decided per-alignment by reference-interval
+    # overlap; the anchor check runs only on bed-spanning mates, since a
+    # flanking-only mate cannot contain both anchors by construction.
+    fetch_start = max(0, bed_start - max_tlen)
+    fetch_end = bed_end + max_tlen
+
+    # First pass: keep every alignment that clears the alignment-level
+    # filters, in fetch order, tagged bed-spanning or flanking-only. The
+    # anchor placement is deferred to one batched Hamming search over all
+    # bed-spanning reads of this locus, so it is not decided here.
+    candidates: list[tuple[pysam.AlignedSegment, str | None]] = []
+    bed_seqs: list[str] = []
+
+    for r, bed_overlap in filtered_alignments(
+        bam, chrom, fetch_start, fetch_end, bed_start, bed_end,
+        min_mapq=min_mapq, drop_chimeric=drop_chimeric, max_tlen=max_tlen, qc=qc,
+    ):
+        if bed_overlap:
             seq = r.query_sequence.upper()
             if ref_orientation == "-":
                 seq = revcomp(seq)
@@ -790,16 +827,7 @@ def extract_panel(
                 flanking_seqs: list[str] = []
                 up_width = 0
                 dn_width = 0
-                qc = {
-                    "n_alignments_overlap_locus": 0,
-                    "n_alignments_drop_mapq": 0,
-                    "n_alignments_drop_sa": 0,
-                    "n_alignments_drop_tlen": 0,
-                    "n_alignments_drop_anchor": 0,
-                    "n_read_pairs": 0,
-                    "n_read_pairs_drop_disagree": 0,
-                    "n_read_pairs_merged": 0,
-                }
+                qc = new_locus_qc()
             else:
                 counts, flanking_seqs, up_width, dn_width, qc = _extract_locus(
                     bam, chrom, bed_start, bed_end,

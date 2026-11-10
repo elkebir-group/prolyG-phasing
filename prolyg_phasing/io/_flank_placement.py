@@ -247,6 +247,63 @@ def banded_flank_distance(flank: str, reads: Sequence[str], run_side_indices: np
 # ---------------------------------------------------------------------------
 
 
+def window_index(position: int, *, ref_orientation: str, window_start: int,
+                 window_len: int) -> int:
+    """Index of reference coordinate `position` in the polyG-orientation window.
+
+    The window is the reference on ``[window_start, window_start +
+    window_len)``, reverse-complemented at a "-" locus.
+    """
+    if ref_orientation == "-":
+        return window_start + window_len - 1 - position
+    return position - window_start
+
+
+def window_reference_position(index: int, *, ref_orientation: str, window_start: int,
+                              window_len: int) -> int:
+    """Reference coordinate of index `index` in the polyG-orientation window."""
+    if ref_orientation == "-":
+        return window_start + window_len - 1 - index
+    return window_start + index
+
+
+def polyg_alignments(
+    read_seqs: Sequence[str],
+    cigars: Sequence[Sequence[tuple[int, int]]],
+    reference_starts: Sequence[int] | np.ndarray,
+    *,
+    ref_orientation: str,
+    window_start: int,
+    window_len: int,
+) -> tuple[list[str], list[list[list[int]]], np.ndarray]:
+    """Reads, CIGARs and alignment starts in polyG orientation.
+
+    Reads are upper-cased. Each CIGAR is a list of mutable ``[op, length]``
+    pairs without hard clips. Each start is the polyG-orientation window
+    index (see :func:`window_index`) of the first aligned reference base.
+    At a "-" locus the read is reverse-complemented and the CIGAR reversed.
+    """
+    n_reads = len(read_seqs)
+    minus = ref_orientation == "-"
+    reads: list[str] = []
+    polyg_cigars: list[list[list[int]]] = []
+    starts = np.empty(n_reads, dtype=np.int64)
+    for i in range(n_reads):
+        seq = read_seqs[i].upper()
+        cig = [[op, length] for op, length in cigars[i] if op != 5]
+        start = int(reference_starts[i])
+        if minus:
+            span = sum(length for op, length in cig if op in _M_OPS or op in _REF_OPS)
+            seq = revcomp(seq)
+            cig.reverse()
+            start = start + span - 1
+        starts[i] = window_index(start, ref_orientation=ref_orientation,
+                                 window_start=window_start, window_len=window_len)
+        reads.append(seq)
+        polyg_cigars.append(cig)
+    return reads, polyg_cigars, starts
+
+
 def _shift_indels(cigar: list[list[int]], start: int, read: str, reference: str,
                   middle: float) -> None:
     """Move each indel away from `middle`, in place, while the bases allow it.
@@ -390,45 +447,25 @@ def place_flanks(
     n_reads = len(read_seqs)
     window_len = len(reference_window)
     minus = ref_orientation == "-"
-    if minus:
-        polyg_reference = revcomp(reference_window.upper())
-        last = reference_window_start + window_len - 1
-
-        def to_u(r: int) -> int:
-            return last - r
-    else:
-        polyg_reference = reference_window.upper()
-
-        def to_u(r: int) -> int:
-            return r - reference_window_start
+    polyg_reference = revcomp(reference_window.upper()) if minus else reference_window.upper()
 
     sides = []
     for flank in (upstream, downstream):
-        us = [to_u(r) for r in flank.ref_positions]
+        us = [window_index(r, ref_orientation=ref_orientation,
+                           window_start=reference_window_start, window_len=window_len)
+              for r in flank.ref_positions]
         if any(b - a != 1 for a, b in zip(us, us[1:], strict=False)):
             raise ValueError("flank ref_positions do not run along the polyG orientation")
         sides.append((flank, us[0], us[flank.run_side_offset]))
     middle = (sides[0][2] + sides[1][2]) / 2
 
-    # Reads, CIGARs and starts in polyG orientation.
-    reads: list[str] = []
-    polyg_cigars: list[list[list[int]]] = []
-    starts = np.empty(n_reads, dtype=np.int64)
+    reads, polyg_cigars, starts = polyg_alignments(
+        read_seqs, cigars, reference_starts, ref_orientation=ref_orientation,
+        window_start=reference_window_start, window_len=window_len)
     for i in range(n_reads):
-        seq = read_seqs[i].upper()
-        cig = [[op, length] for op, length in cigars[i] if op != 5]
-        span = sum(length for op, length in cig if op in _M_OPS or op in _REF_OPS)
-        start = int(reference_starts[i])
-        if minus:
-            seq = revcomp(seq)
-            cig.reverse()
-            starts[i] = to_u(start + span - 1)
-        else:
-            starts[i] = to_u(start)
-        reads.append(seq)
-        polyg_cigars.append(cig)
+        cig = polyg_cigars[i]
         if any(op in (_INS, _DEL) for op, _ in cig):
-            _shift_indels(cig, int(starts[i]), seq, polyg_reference, middle)
+            _shift_indels(cig, int(starts[i]), reads[i], polyg_reference, middle)
 
     matrix, lengths = _pack(reads) if n_reads else (np.zeros((0, 1), np.uint8),
                                                      np.zeros(0, np.int64))
