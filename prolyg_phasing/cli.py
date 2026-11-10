@@ -108,7 +108,10 @@ the repeat. Each one is called "read error" or "G in the donor" from the
 share of the normal's reads that show a G there. The flank starts at the
 first candidate called read error. The read filters are the extraction's
 defaults. Loci run in parallel; the worker count comes from the free cores
-and memory of this machine."""
+and memory of this machine.
+
+Each output names the sample. The name is the BAM's read-group SM; give
+--sample only for a BAM with no SM."""
 
 
 def _add_build_flanks_args(p: argparse.ArgumentParser) -> None:
@@ -119,14 +122,18 @@ def _add_build_flanks_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--out-prefix", required=True, type=Path,
                     help="Path prefix of the three output files. The parent "
                          "directory is not created.")
+    p.add_argument("--sample", default=None,
+                    help="Sample name to write into the outputs. Required when "
+                         "the BAM has no read-group SM; when it has one, it "
+                         "must equal it.")
 
 
 def _run_build_flanks(args: argparse.Namespace) -> None:
     n_workers = worker_count()
-    result = build_flanks(args.bam, args.bed, n_workers=n_workers)
+    result = build_flanks(args.bam, args.bed, n_workers=n_workers, sample=args.sample)
     paths = write_flank_tables(result, args.out_prefix)
     er = result.error_rate
-    print(f"e = {er.e:.4e} ({er.x}/{er.n} at {er.n_positions} positions); "
+    print(f"{result.sample}: e = {er.e:.4e} ({er.x}/{er.n} at {er.n_positions} positions); "
           f"{len(result.records)} loci; {n_workers} workers; wrote "
           + ", ".join(str(p) for p in paths))
 

@@ -91,8 +91,8 @@ _ERROR_MAX_G_SHARE = 0.05
 # search scores.
 _MARKER_SEARCH = 3
 
-# Highest Hamming distance at which the outer marker counts as placed; the
-# extraction's default anchor limit.
+# Highest Hamming distance at which the outer marker counts as placed. It
+# allows one read error in the marker.
 _MARKER_HAMMING_MAX = 1
 
 # A candidate is "next to a reference GGG" when this G run touches it.
@@ -513,6 +513,8 @@ class FlankConstruction:
 
     Attributes
     ----------
+    sample : str
+        The matched normal whose reads built the flanks.
     records : dict of str to (FlankRecord, FlankRecord)
         Upstream and downstream flank per locus.
     candidates : pandas.DataFrame
@@ -522,14 +524,15 @@ class FlankConstruction:
     error_rate : ErrorRate
     """
 
+    sample: str
     records: dict[str, tuple[FlankRecord, FlankRecord]]
     candidates: pd.DataFrame
     sides: pd.DataFrame
     error_rate: ErrorRate
 
 
-def construct_flanks(counts: Sequence[LocusCounts]) -> FlankConstruction:
-    """Error rate, calls and flanks from the count pass of every locus."""
+def construct_flanks(counts: Sequence[LocusCounts], *, sample: str) -> FlankConstruction:
+    """Error rate, calls and flanks from the count pass of every locus of `sample`."""
     rows = []
     for loc in counts:
         for s in SIDES:
@@ -572,7 +575,7 @@ def construct_flanks(counts: Sequence[LocusCounts]) -> FlankConstruction:
                 "n_marker_placed": loc.n_marker_placed[s],
             })
         records[loc.name] = (pair[0], pair[1])
-    return FlankConstruction(records, cand, pd.DataFrame(side_rows), error_rate)
+    return FlankConstruction(sample, records, cand, pd.DataFrame(side_rows), error_rate)
 
 
 _WORKER_BAM: dict[str, pysam.AlignmentFile] = {}
@@ -603,18 +606,44 @@ def worker_count() -> int:
     return max(1, min(by_cores, by_memory))
 
 
-def build_flanks(bam_path: str | Path, bed_path: str | Path, *, n_workers: int
-                 ) -> FlankConstruction:
+def sample_name(bam_path: str | Path, sample: str | None = None) -> str:
+    """The sample name of a BAM: its read-group SM, else `sample`.
+
+    Raises ValueError when the read groups name more than one sample, when
+    `sample` differs from the read-group SM, or when the BAM has no SM and
+    `sample` is None.
+    """
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        groups = bam.header.to_dict().get("RG", [])
+    names = {group["SM"] for group in groups if "SM" in group}
+    if len(names) > 1:
+        raise ValueError(f"{bam_path}: the read groups name more than one sample: "
+                         f"{sorted(names)}")
+    if names:
+        found = names.pop()
+        if sample is not None and sample != found:
+            raise ValueError(f"{bam_path}: the read-group sample {found!r} differs from "
+                             f"the given sample {sample!r}")
+        return found
+    if sample is None:
+        raise ValueError(f"{bam_path}: no read group names a sample (SM); give the "
+                         "sample name")
+    return sample
+
+
+def build_flanks(bam_path: str | Path, bed_path: str | Path, *, n_workers: int,
+                 sample: str | None = None) -> FlankConstruction:
     """Count pass over every BED locus of one matched normal, then the flanks.
 
     Loci run in parallel over `n_workers` processes. A locus without
-    anchors gets no flank.
+    anchors gets no flank. The sample name comes from :func:`sample_name`.
     """
+    sample = sample_name(bam_path, sample)
     rows = _load_bed(Path(bed_path))
     n_workers = max(1, min(n_workers, len(rows)))
     with Pool(n_workers, initializer=_open_worker_bam, initargs=(str(bam_path),)) as pool:
         results = pool.map(_count_bed_row, rows, chunksize=2)
-    return construct_flanks([r for r in results if r is not None])
+    return construct_flanks([r for r in results if r is not None], sample=sample)
 
 
 # ---------------------------------------------------------------------------
@@ -627,37 +656,23 @@ def write_flank_tables(result: FlankConstruction, out_prefix: str | Path) -> lis
 
     The files are ``{out_prefix}_flank_candidates.tsv``,
     ``{out_prefix}_flank_sides.tsv`` and ``{out_prefix}_error_rate.json``.
+    Each names the sample in a first ``sample`` column or key. Extraction
+    reads the side TSV with :func:`read_flank_table`.
     """
     prefix = str(out_prefix)
     paths = [Path(f"{prefix}_flank_candidates.tsv"), Path(f"{prefix}_flank_sides.tsv"),
              Path(f"{prefix}_error_rate.json")]
-    result.candidates.to_csv(paths[0], sep="\t", index=False)
-    result.sides.to_csv(paths[1], sep="\t", index=False)
+    for table, path in ((result.candidates, paths[0]), (result.sides, paths[1])):
+        out = table.copy()
+        out.insert(0, "sample", result.sample)
+        out.to_csv(path, sep="\t", index=False)
     er = result.error_rate
     quantiles = [0.1, 0.5, 0.9, 0.99]
     paths[2].write_text(json.dumps({
+        "sample": result.sample,
         "e": er.e, "x": er.x, "n": er.n, "n_positions": er.n_positions,
         "position_g_share_quantiles": dict(zip(
             [f"q{int(q * 100):02d}" for q in quantiles],
             np.quantile(er.position_g_shares, quantiles).tolist(), strict=True)),
     }, indent=1))
     return paths
-
-
-def read_flank_records(path: str | Path) -> dict[str, tuple[FlankRecord, FlankRecord]]:
-    """Upstream and downstream :class:`FlankRecord` per locus, from a side TSV."""
-    sides = pd.read_csv(path, sep="\t", dtype={"masked_offsets": str, "flank_bases": str},
-                        keep_default_na=False)
-    by_locus: dict[str, dict[str, FlankRecord]] = {}
-    for row in sides.itertuples(index=False):
-        positions = tuple(int(p) for p in row.flank_ref_positions.split(","))
-        masked = tuple(int(m) for m in row.masked_offsets.split(",")) if row.masked_offsets \
-            else ()
-        record = FlankRecord(
-            bases=row.flank_bases,
-            ref_positions=positions,
-            run_side_offset=len(positions) - 1 if row.side == "upstream" else 0,
-            masked_offsets=masked,
-        )
-        by_locus.setdefault(row.locus, {})[row.side] = record
-    return {locus: (pair["upstream"], pair["downstream"]) for locus, pair in by_locus.items()}

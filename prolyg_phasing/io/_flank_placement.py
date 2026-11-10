@@ -51,8 +51,10 @@ belongs to the tract. The rule puts the extra or missing base in the flank.
 
 from __future__ import annotations
 
+import csv
 import dataclasses
 from collections.abc import Sequence
+from pathlib import Path
 
 import numpy as np
 
@@ -138,6 +140,59 @@ class FlankRecord:
     def outer_position(self) -> int:
         """Reference coordinate of the flank base farthest from the repeat."""
         return self.ref_positions[0 if self.is_upstream else -1]
+
+
+@dataclasses.dataclass(frozen=True)
+class FlankTable:
+    """The per-side flank table of one matched normal.
+
+    Attributes
+    ----------
+    sample : str
+        The sample whose reads built the flanks.
+    records : dict of str to (FlankRecord, FlankRecord)
+        Upstream and downstream flank per locus.
+    """
+
+    sample: str
+    records: dict[str, tuple[FlankRecord, FlankRecord]]
+
+
+def read_flank_table(path: str | Path) -> FlankTable:
+    """The flank records and the sample of a side TSV that `build-flanks` writes.
+
+    Raises ValueError when the table has no ``sample`` column, names more
+    than one sample, or lacks one side of a locus.
+    """
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        if "sample" not in (reader.fieldnames or ()):
+            raise ValueError(f"{path}: the flank table has no sample column; rebuild it "
+                             "with build-flanks")
+        rows = list(reader)
+    samples = {row["sample"] for row in rows}
+    if len(samples) != 1:
+        raise ValueError(f"{path}: the flank table must name one sample, not "
+                         f"{sorted(samples)}")
+    by_locus: dict[str, dict[str, FlankRecord]] = {}
+    for row in rows:
+        positions = tuple(int(p) for p in row["flank_ref_positions"].split(","))
+        masked = tuple(int(m) for m in row["masked_offsets"].split(",")) \
+            if row["masked_offsets"] else ()
+        record = FlankRecord(
+            bases=row["flank_bases"],
+            ref_positions=positions,
+            run_side_offset=len(positions) - 1 if row["side"] == "upstream" else 0,
+            masked_offsets=masked,
+        )
+        by_locus.setdefault(row["locus"], {})[row["side"]] = record
+    incomplete = sorted(locus for locus, pair in by_locus.items()
+                        if set(pair) != {"upstream", "downstream"})
+    if incomplete:
+        raise ValueError(f"{path}: loci without both sides: {incomplete}")
+    records = {locus: (pair["upstream"], pair["downstream"])
+               for locus, pair in by_locus.items()}
+    return FlankTable(sample=samples.pop(), records=records)
 
 
 @dataclasses.dataclass(frozen=True)

@@ -10,6 +10,7 @@ the hand-built cases set by hand, through the side TSV.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from pathlib import Path
@@ -21,7 +22,7 @@ import pytest
 
 import prolyg_phasing.io._flank_construction as fc
 from prolyg_phasing.io._anchors import revcomp
-from prolyg_phasing.io._flank_placement import place_flanks, polyg_alignments
+from prolyg_phasing.io._flank_placement import place_flanks, polyg_alignments, read_flank_table
 from tests._hand_built_reads import (
     CHROM_PAD,
     FLANK_LEN,
@@ -380,7 +381,7 @@ def test_build_flanks_end_to_end(tmp_path):
     variant = locus.upstream[:-4] + "G" * 13 + locus.downstream[1:]
     bam_path, bed = _write_bam(tmp_path, "PolyG5177", [(variant, 40), (locus.reference, 2)])
 
-    result = fc.build_flanks(bam_path, bed, n_workers=2)
+    result = fc.build_flanks(bam_path, bed, n_workers=2, sample="normal")
 
     assert set(result.records) == {"PolyG5177+", "PolyG5177-"}
     sides = result.sides.set_index(["locus", "side"])
@@ -416,7 +417,11 @@ def test_build_flanks_end_to_end(tmp_path):
 
     paths = fc.write_flank_tables(result, tmp_path / "normal")
     assert all(p.exists() for p in paths)
-    assert fc.read_flank_records(paths[1]) == result.records
+    table = read_flank_table(paths[1])
+    assert table.records == result.records
+    assert table.sample == "normal"
+    assert set(pd.read_csv(paths[0], sep="\t")["sample"]) == {"normal"}
+    assert json.loads(paths[2].read_text())["sample"] == "normal"
 
 
 def test_side_table_round_trips_masked_offsets(tmp_path):
@@ -438,13 +443,58 @@ def test_side_table_round_trips_masked_offsets(tmp_path):
                      "no_read_error_candidate": int(flag), "n_candidates": len(side.d),
                      "n_reads": 0, "n_marker_placed": 0})
     assert records[0].masked_offsets == (7,)
-    result = fc.FlankConstruction({"L": tuple(records)}, pd.DataFrame(), pd.DataFrame(rows),
+    result = fc.FlankConstruction("S1", {"L": tuple(records)}, pd.DataFrame(),
+                                  pd.DataFrame(rows),
                                   fc.ErrorRate(0.01, 1, 100, np.array([0.01])))
     paths = fc.write_flank_tables(result, tmp_path / "x")
-    assert fc.read_flank_records(paths[1]) == {"L": tuple(records)}
+    assert read_flank_table(paths[1]).records == {"L": tuple(records)}
 
 
 @pytest.mark.skipif(not hasattr(os, "sched_getaffinity"), reason="Linux only")
 def test_worker_count_leaves_free_cores():
     n = fc.worker_count()
     assert 1 <= n < max(2, len(os.sched_getaffinity(0)))
+
+
+# ---------------------------------------------------------------------------
+# The sample name
+# ---------------------------------------------------------------------------
+
+
+def _bam_with_read_groups(tmp_path: Path, groups: list[dict]) -> Path:
+    header = {"HD": {"VN": "1.6", "SO": "coordinate"},
+              "SQ": [{"SN": "synth", "LN": 100}]}
+    if groups:
+        header["RG"] = groups
+    path = tmp_path / "rg.bam"
+    with pysam.AlignmentFile(str(path), "wb", header=header):
+        pass
+    return path
+
+
+def test_sample_name_comes_from_the_read_group(tmp_path):
+    bam = _bam_with_read_groups(tmp_path, [{"ID": "A", "SM": "N1"}, {"ID": "B", "SM": "N1"}])
+    assert fc.sample_name(bam) == "N1"
+    assert fc.sample_name(bam, "N1") == "N1"
+    with pytest.raises(ValueError, match="differs"):
+        fc.sample_name(bam, "other")
+
+
+def test_sample_name_without_a_read_group_needs_the_argument(tmp_path):
+    bam = _bam_with_read_groups(tmp_path, [{"ID": "A"}])
+    assert fc.sample_name(bam, "N1") == "N1"
+    with pytest.raises(ValueError, match="no read group names a sample"):
+        fc.sample_name(bam)
+
+
+def test_sample_name_rejects_two_samples(tmp_path):
+    bam = _bam_with_read_groups(tmp_path, [{"ID": "A", "SM": "N1"}, {"ID": "B", "SM": "N2"}])
+    with pytest.raises(ValueError, match="more than one sample"):
+        fc.sample_name(bam)
+
+
+def test_flank_table_without_a_sample_is_rejected(tmp_path):
+    path = tmp_path / "old_sides.tsv"
+    path.write_text("locus\tside\tflank_bases\tflank_ref_positions\tmasked_offsets\n")
+    with pytest.raises(ValueError, match="no sample column"):
+        read_flank_table(path)
