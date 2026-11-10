@@ -13,6 +13,7 @@ alignment with a correct MD tag. The plain dynamic-programming reference
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import random
 
@@ -31,7 +32,13 @@ from tests._hand_built_reads import (
     CHROM_PAD,
     FLANK_LEN,
     LOCI,
+    G,
     ReadCase,
+    _case,
+    _del,
+    _dn,
+    _sub,
+    _up,
     all_records,
     build_cases,
     chromosome,
@@ -202,8 +209,17 @@ def test_run_tuple_matches_the_extractor_parse():
 
 
 # ---------------------------------------------------------------------------
-# The kernel (expected to fail until it exists)
+# The kernel
 # ---------------------------------------------------------------------------
+
+
+def drop_reasons(result: FlankPlacement, i: int) -> set[str]:
+    """Every drop reason of read `i`: one per failed side, and a crossing."""
+    reasons = {result.upstream_drop[i], result.downstream_drop[i]} - {None}
+    if result.flanks_crossed[i]:
+        reasons.add("flanks_crossed")
+    return reasons
+
 
 def _flank_record(case: ReadCase, spec, orientation: str) -> FlankRecord:
     n = len(case.locus.reference)
@@ -225,7 +241,6 @@ def _place(case: ReadCase, orientation: str) -> FlankPlacement:
         [r.query_sequence for r in records],
         [r.cigartuples for r in records],
         np.array([r.reference_start for r in records], dtype=np.int64),
-        [r.query_qualities for r in records],
         upstream=_flank_record(case, case.up, orientation),
         downstream=_flank_record(case, case.dn, orientation),
         ref_orientation=orientation,
@@ -242,9 +257,11 @@ def test_every_placement_gives_the_true_tuple(case: ReadCase, orientation: str):
     for i, form in enumerate(forms):
         if case.drop_reason is not None:
             expected_drop = DROP_REASON_BY_FORM.get(case.case_id, {}).get(form, case.drop_reason)
-            assert result.drop_reason[i] == expected_drop, form
+            assert drop_reasons(result, i) == {expected_drop}, form
+            assert not result.kept[i] and result.tracts[i] is None, form
             continue
-        assert result.drop_reason[i] is None, form
+        assert drop_reasons(result, i) == set(), form
+        assert result.kept[i], form
         expected = ASSIGNED_TUPLE.get(case.case_id, case.true_tuple)
         assert run_tuple(result.tracts[i]) == expected, form
 
@@ -262,7 +279,9 @@ def test_paths_per_case(case: ReadCase, orientation: str):
 def test_both_orientations_give_the_same_tract(case: ReadCase):
     plus, minus = _place(case, "+"), _place(case, "-")
     assert list(plus.tracts) == list(minus.tracts)
-    assert list(plus.drop_reason) == list(minus.drop_reason)
+    for field in ("upstream_drop", "downstream_drop", "flanks_crossed", "upstream_path",
+                  "downstream_path"):
+        assert list(getattr(plus, field)) == list(getattr(minus, field)), field
 
 
 def _all_strings(alphabet: str, max_len: int):
@@ -333,7 +352,9 @@ def test_every_drop_reason_is_used():
     seen = set()
     for case in CASES:
         for orientation in "+-":
-            seen |= set(_place(case, orientation).drop_reason) - {None}
+            result = _place(case, orientation)
+            for i in range(len(result.kept)):
+                seen |= drop_reasons(result, i)
     assert seen == set(flank_placement.DROP_REASONS)
 
 
@@ -353,25 +374,23 @@ def test_window_must_cover_the_length_change(monkeypatch, orientation: str):
     assert _place(case, orientation).tracts[i] != case.true_tract
 
 
-def test_tract_qualities_follow_the_tract():
-    case = next(c for c in CASES if c.case_id == "invariant_side")
-    for orientation in "+-":
-        records = [rec for _, rec in all_records(case, orientation)]
-        quals = [np.arange(len(r.query_sequence), dtype=np.uint8) for r in records]
-        result = place_flanks(
-            [r.query_sequence for r in records],
-            [r.cigartuples for r in records],
-            np.array([r.reference_start for r in records], dtype=np.int64),
-            quals,
-            upstream=_flank_record(case, case.up, orientation),
-            downstream=_flank_record(case, case.dn, orientation),
-            ref_orientation=orientation,
-            reference_window=chromosome(case.locus, orientation),
-            reference_window_start=0,
-        )
-        q = quals[0] if orientation == "+" else quals[0][::-1]
-        lo = int(result.upstream_run_side[0]) + 1
-        assert list(result.tract_qualities[0]) == list(q[lo:lo + len(case.true_tract)])
+def test_run_side_indices_bound_the_tract():
+    """The polyG-orientation read between the two run-side indices is the tract.
+
+    The pair merge reads the tract qualities over these indices.
+    """
+    for case in CASES:
+        for orientation in "+-":
+            records = [rec for _, rec in all_records(case, orientation)]
+            result = _place(case, orientation)
+            for i, rec in enumerate(records):
+                if not result.kept[i]:
+                    continue
+                read = rec.query_sequence if orientation == "+" \
+                    else revcomp(rec.query_sequence)
+                lo, hi = result.upstream_run_side[i] + 1, result.downstream_run_side[i]
+                assert read[lo:hi] == result.tracts[i]
+                assert type(result.tracts[i]) is str
 
 
 def test_loci_table_is_polyg_oriented():
@@ -380,3 +399,149 @@ def test_loci_table_is_polyg_oriented():
         assert set(locus.tract) == {"G"}
         assert locus.upstream[-1] != "G"
         assert locus.downstream[0] != "G"
+
+
+# ---------------------------------------------------------------------------
+# A drop reason per side
+# ---------------------------------------------------------------------------
+
+
+def _place_reads(case: ReadCase, orientation: str, cigars=None) -> FlankPlacement:
+    """Place every alignment of `case`, optionally with the CIGARs replaced."""
+    records = [rec for _, rec in all_records(case, orientation)]
+    return place_flanks(
+        [r.query_sequence for r in records],
+        cigars if cigars is not None else [r.cigartuples for r in records],
+        np.array([r.reference_start for r in records], dtype=np.int64),
+        upstream=_flank_record(case, case.up, orientation),
+        downstream=_flank_record(case, case.dn, orientation),
+        ref_orientation=orientation,
+        reference_window=chromosome(case.locus, orientation),
+        reference_window_start=0,
+    )
+
+
+@pytest.mark.parametrize("orientation", ["+", "-"])
+def test_both_sides_report_their_own_reason(orientation):
+    """A G at the upstream run-side base and two edits in the downstream flank."""
+    up151 = _up("PolyG151")
+    dn151 = _dn("PolyG151")
+    case = _case("both_sides_fail", "PolyG151: G at the edge T, two downstream edits",
+                 "PolyG151", up_ctx=up151[:-1] + "G", tract=G * 12,
+                 dn_ctx=_sub(_sub(dn151, 3, "C"), 6, "A"),
+                 drop_reason="g_at_run_side", true_tract=None)
+    forms = [p.form for p in placements(case)]
+    result = _place_reads(case, orientation)
+    i = forms.index("gapless")
+    assert result.upstream_drop[i] == "g_at_run_side"
+    assert result.downstream_drop[i] == "flank_not_placed"
+    assert not result.flanks_crossed[i] and not result.kept[i]
+    assert result.upstream_path[i] is None and result.downstream_path[i] is None
+
+
+@pytest.mark.parametrize("orientation", ["+", "-"])
+def test_a_read_inside_the_tract_is_not_covered_on_either_side(orientation):
+    locus = LOCI["PolyG151"]
+    case = _case("inside_tract", "PolyG151: a read of 10 tract Gs", "PolyG151",
+                 up_ctx="", tract=G * 10, dn_ctx="", start=len(locus.upstream) + 1,
+                 drop_reason="flank_not_covered", true_tract=None)
+    case = dataclasses.replace(case, ref_end=case.ref_start + 10)
+    result = _place_reads(case, orientation)
+    assert set(result.upstream_drop) == {"flank_not_covered"}
+    assert set(result.downstream_drop) == {"flank_not_covered"}
+
+
+def test_a_crossing_has_no_side_reason():
+    case = next(c for c in CASES if c.case_id == "tract_and_edge_deleted")
+    result = _place(case, "+")
+    crossed = np.flatnonzero(result.flanks_crossed)
+    assert crossed.size
+    for i in crossed:
+        assert result.upstream_drop[i] is None and result.downstream_drop[i] is None
+        assert result.upstream_path[i] is not None and result.downstream_path[i] is not None
+
+
+# ---------------------------------------------------------------------------
+# A masked flank position on each path
+# ---------------------------------------------------------------------------
+
+# PolyG151 upstream flank ATATTTAGAT: the donor has a G at offset 2.
+_UP151 = _up("PolyG151")
+_MASKED_G = _sub(_UP151, len(_UP151) - 8, "G")
+MASKED_CASES = {
+    "fast": _case("masked_fast", "PolyG151: G at masked offset 2", "PolyG151",
+                  up_masked=(2,), up_ctx=_MASKED_G, tract=G * 12),
+    "cigar": _case("masked_cigar", "PolyG151: G at masked offset 2, one T of TTT deleted",
+                   "PolyG151", up_masked=(2,), up_ctx=_del(_MASKED_G, len(_UP151) - 6),
+                   tract=G * 12),
+    "local": _case("masked_local", "PolyG151: G at masked offset 2 and a mismatch",
+                   "PolyG151", up_masked=(2,),
+                   up_ctx=_sub(_MASKED_G, len(_UP151) - 4, "C"), tract=G * 12),
+}
+
+
+@pytest.mark.parametrize("path", sorted(MASKED_CASES))
+@pytest.mark.parametrize("orientation", ["+", "-"])
+def test_masked_position_on_each_path(path, orientation):
+    case = MASKED_CASES[path]
+    result = _place_reads(case, orientation)
+    assert result.kept.all()
+    assert {run_tuple(t) for t in result.tracts} == {(12,)}
+    forms = [p.form for p in placements(case)]
+    form = {"fast": "gapless", "cigar": "gap_shift",
+            "local": "gapless"}[path]
+    on_form = {result.upstream_path[i] for i, f in enumerate(forms) if f == form}
+    assert on_form == {path}
+    # Without the mask the G is one more edit: the fast read takes the
+    # window search, and the other two lose the read.
+    unmasked = dataclasses.replace(case, up=dataclasses.replace(case.up, masked_offsets=()))
+    plain = _place_reads(unmasked, orientation)
+    i = forms.index(form)
+    if path == "fast":
+        assert plain.upstream_path[i] == "local"
+    else:
+        assert plain.upstream_drop[i] == "flank_not_placed"
+
+
+# ---------------------------------------------------------------------------
+# The one-M arithmetic path against the CIGAR walk
+# ---------------------------------------------------------------------------
+
+
+def _split_m(cigar):
+    """The same alignment, written as more than one CIGAR operation."""
+    (op, length), = cigar
+    if length < 3:
+        return [(5, 2), (op, length)]
+    return [(7, 1), (8, length - 2), (0, 1)]
+
+
+@pytest.mark.parametrize("orientation", ["+", "-"])
+def test_one_m_arithmetic_matches_the_cigar_walk(orientation):
+    rng = random.Random(5)
+    seqs, cigars, starts, split = [], [], [], []
+    case = next(c for c in CASES if c.case_id == "edge_variant_hom")
+    chrom = chromosome(case.locus, orientation)
+    full = chrom
+    # Every read start and length over the chromosome, with read errors:
+    # projections inside the read, past its ends, and on both flanks.
+    for _ in range(3000):
+        start = rng.randrange(0, len(full) - 5)
+        length = rng.randrange(5, len(full) - start + 1)
+        read = list(full[start:start + length])
+        for _ in range(rng.randrange(3)):
+            read[rng.randrange(length)] = rng.choice("ACGTNacgtn")
+        seqs.append("".join(read))
+        cigars.append([(rng.choice((0, 7, 8)), length)])
+        starts.append(start)
+        split.append(_split_m(cigars[-1]))
+    kw = dict(upstream=_flank_record(case, case.up, orientation),
+              downstream=_flank_record(case, case.dn, orientation),
+              ref_orientation=orientation, reference_window=chrom,
+              reference_window_start=0)
+    one = place_flanks(seqs, cigars, np.array(starts), **kw)
+    walked = place_flanks(seqs, split, np.array(starts), **kw)
+    for field in dataclasses.fields(FlankPlacement):
+        assert list(getattr(one, field.name)) == list(getattr(walked, field.name)), field.name
+    assert one.kept.any() and (~one.kept).any()
+    assert set(one.upstream_path) >= {"fast", "local", None}

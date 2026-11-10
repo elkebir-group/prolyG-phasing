@@ -23,12 +23,14 @@ The rule that places one flank in one read:
    not counted. Only positions with at most one flank edit are kept.
 4. The lowest score wins. On a tie, a non-G run-side base wins over a G.
    On a further tie, the position nearest the run wins.
-5. If the winning run-side base is a G, the read is dropped as
-   ``"g_at_run_side"``. If no position is kept, the read is dropped as
-   ``"flank_not_covered"`` when the projected flank is not inside the read,
-   and as ``"flank_not_placed"`` otherwise. If the downstream run-side base
-   is not after the upstream one, the read is dropped as
-   ``"flanks_crossed"``.
+5. If the winning run-side base is a G, the side drops as
+   ``"g_at_run_side"``. If no position is kept, the side drops as
+   ``"flank_not_covered"`` when the projected flank is not inside the
+   read, and as ``"flank_not_placed"`` otherwise. Both sides are placed
+   in every read, so a read can drop on both sides. If both sides are
+   placed and the downstream run-side base is not after the upstream one,
+   the read drops as ``"flanks_crossed"``. That reason belongs to the
+   read, not to a side.
 
 The projection costs nothing extra when it is exact, so the rule reports
 three paths. "fast": the alignment covers the flank with M operations and
@@ -36,6 +38,11 @@ the read equals the flank at every unmasked position. "cigar": the
 alignment has an indel inside the flank, and the projection wins. "local":
 any other placement. A fast placement has score 0, and no other position
 can score 0, so a fast read needs no window search.
+
+A read whose CIGAR is one M operation has no indel to move, and its
+projection is the run-side position minus the alignment start. These reads
+are placed by arithmetic over the whole block. Only the other reads walk
+their CIGAR, once for both sides.
 
 A read that carries an extra or a missing copy of the run-side base next
 to the run is the same string as a read from a molecule where that base
@@ -49,7 +56,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from prolyg_phasing.io._anchors import revcomp
+from prolyg_phasing.io._anchors import COMP, revcomp
 
 # Read positions on each side of the projected run-side base that the
 # window search scores. It must cover the largest change of tract length
@@ -61,14 +68,31 @@ _FAR = 2
 
 _G = ord("G")
 
-DROP_REASONS = ("g_at_run_side", "flank_not_placed", "flank_not_covered", "flanks_crossed")
 PATHS = ("fast", "cigar", "local")
+SIDE_DROP_REASONS = ("g_at_run_side", "flank_not_placed", "flank_not_covered")
+DROP_REASONS = (*SIDE_DROP_REASONS, "flanks_crossed")
+
+# Codes of the per-side outputs; 0 is "none".
+_FAST, _CIGAR, _LOCAL = 1, 2, 3
+_G_AT_RUN_SIDE, _NOT_PLACED, _NOT_COVERED = 1, 2, 3
+_PATH_NAMES = np.array([None, *PATHS], dtype=object)
+_SIDE_DROP_NAMES = np.array([None, *SIDE_DROP_REASONS], dtype=object)
 
 # CIGAR operation codes.
 _M_OPS = (0, 7, 8)          # M, =, X: consume read and reference
 _QUERY_OPS = (1, 4, 6)      # I, S, P: consume read only (P as pysam walks it)
 _REF_OPS = (2, 3)           # D, N: consume reference only
-_INS, _DEL, _SOFT = 1, 2, 4
+_INS, _DEL, _SOFT, _HARD = 1, 2, 4, 5
+
+# Byte maps from a stored read base to its polyG-orientation base: the
+# upper case at a "+" locus, the complement of the upper case at a "-"
+# locus. They give the same bases as `str.upper` and `revcomp`.
+_UPPER = np.arange(256, dtype=np.uint8)
+_UPPER[ord("a"):ord("z") + 1] -= 32
+_COMPLEMENT = _UPPER.copy()
+for _base, _complement in zip("ACGTN", "ACGTN".translate(COMP), strict=True):
+    _COMPLEMENT[ord(_base)] = ord(_complement)
+_COMPLEMENT = _COMPLEMENT[_UPPER]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -105,25 +129,49 @@ class FlankRecord:
     def is_upstream(self) -> bool:
         return self.run_side_offset == len(self.bases) - 1
 
+    @property
+    def run_side_position(self) -> int:
+        """Reference coordinate of the run-side base."""
+        return self.ref_positions[self.run_side_offset]
+
+    @property
+    def outer_position(self) -> int:
+        """Reference coordinate of the flank base farthest from the repeat."""
+        return self.ref_positions[0 if self.is_upstream else -1]
+
 
 @dataclasses.dataclass(frozen=True)
 class FlankPlacement:
     """Output of :func:`place_flanks`, one entry per read.
 
-    `tracts` and `tract_qualities` are in polyG orientation and are None
-    for a dropped read. `drop_reason` is one of `DROP_REASONS` or None, and
-    `drop_side` names the side that caused it ("upstream", "downstream",
-    or None for a kept read or for "flanks_crossed"). Each side's path is
-    one of `PATHS`, or None when that side is not placed. The run-side
-    arrays hold the placed run-side read index in polyG orientation, or -1.
+    Attributes
+    ----------
+    tracts : ndarray of object
+        The tract in polyG orientation for a kept read, else None.
+    kept : ndarray of bool
+        Both sides placed and not crossed.
+    upstream_path, downstream_path : ndarray of object
+        Each side's path, one of `PATHS`, or None when the side is not
+        placed.
+    upstream_drop, downstream_drop : ndarray of object
+        Each side's drop reason, one of `SIDE_DROP_REASONS`, or None when
+        the side is placed.
+    flanks_crossed : ndarray of bool
+        Both sides placed, and the downstream run-side base is not after
+        the upstream one.
+    upstream_run_side, downstream_run_side : ndarray of int64
+        The placed run-side read index in polyG orientation, or -1. The
+        tract of a kept read is the polyG-orientation read on
+        ``[upstream_run_side + 1, downstream_run_side)``.
     """
 
-    tracts: list[str | None]
-    tract_qualities: list[np.ndarray | None]
-    drop_reason: list[str | None]
-    drop_side: list[str | None]
-    upstream_path: list[str | None]
-    downstream_path: list[str | None]
+    tracts: np.ndarray
+    kept: np.ndarray
+    upstream_path: np.ndarray
+    downstream_path: np.ndarray
+    upstream_drop: np.ndarray
+    downstream_drop: np.ndarray
+    flanks_crossed: np.ndarray
     upstream_run_side: np.ndarray
     downstream_run_side: np.ndarray
 
@@ -157,6 +205,20 @@ def _pattern(flank: str, upstream: bool, masked_offsets: Sequence[int]
     return np.frombuffer(pattern.encode("ascii"), dtype=np.uint8), mask
 
 
+def _outward_bases(matrix: np.ndarray, lengths: np.ndarray, rows: np.ndarray,
+                   run_side: np.ndarray, n_bases: int, upstream: bool
+                   ) -> tuple[np.ndarray, np.ndarray]:
+    """Read bases outward from each run-side index, and whether each is inside the read."""
+    steps = np.arange(n_bases)
+    if upstream:
+        idx = run_side[:, None] - 1 - steps
+    else:
+        idx = run_side[:, None] + 1 + steps
+    valid = (idx >= 0) & (idx < lengths[rows][:, None])
+    text = matrix[rows[:, None], np.clip(idx, 0, matrix.shape[1] - 1)]
+    return text, valid
+
+
 def _banded_distance(matrix: np.ndarray, lengths: np.ndarray, rows: np.ndarray,
                      run_side: np.ndarray, pattern: np.ndarray, mask: np.ndarray,
                      upstream: bool) -> np.ndarray:
@@ -170,14 +232,7 @@ def _banded_distance(matrix: np.ndarray, lengths: np.ndarray, rows: np.ndarray,
     m = len(rows)
     if m == 0:
         return np.zeros(0, dtype=np.int64)
-    steps = np.arange(n + 1)
-    if upstream:
-        idx = run_side[:, None] - 1 - steps
-    else:
-        idx = run_side[:, None] + 1 + steps
-    row_len = lengths[rows][:, None]
-    valid = (idx >= 0) & (idx < row_len)
-    text = matrix[rows[:, None], np.clip(idx, 0, matrix.shape[1] - 1)]
+    text, valid = _outward_bases(matrix, lengths, rows, run_side, n + 1, upstream)
 
     def match(text_part, valid_part, pat, pat_mask):
         return ((text_part == pat) | pat_mask) & valid_part
@@ -204,6 +259,20 @@ def _banded_distance(matrix: np.ndarray, lengths: np.ndarray, rows: np.ndarray,
                     np.where((mismatches == 1) | deletion | insertion, 1, _FAR))
     inside = (run_side >= 0) & (run_side < lengths[rows])
     return np.where(inside, dist, _FAR).astype(np.int64)
+
+
+def _exact_match(matrix: np.ndarray, lengths: np.ndarray, rows: np.ndarray,
+                 run_side: np.ndarray, pattern: np.ndarray, mask: np.ndarray,
+                 upstream: bool) -> np.ndarray:
+    """Whether the read equals `pattern` at every unmasked flank position.
+
+    For a flank inside the read this is a band-1 distance of 0, without
+    the indel terms.
+    """
+    if len(rows) == 0:
+        return np.zeros(0, dtype=bool)
+    text, valid = _outward_bases(matrix, lengths, rows, run_side, len(pattern), upstream)
+    return (((text == pattern) | mask) & valid).all(axis=1)
 
 
 def banded_flank_distance(flank: str, reads: Sequence[str], run_side_indices: np.ndarray,
@@ -267,6 +336,25 @@ def window_reference_position(index: int, *, ref_orientation: str, window_start:
     return window_start + index
 
 
+def _polyg_cigar(cigar: Sequence[tuple[int, int]], reference_start: int, *,
+                 ref_orientation: str, window_start: int, window_len: int
+                 ) -> tuple[list[list[int]], int]:
+    """One CIGAR without hard clips, and its start, in polyG orientation.
+
+    The CIGAR is a list of mutable ``[op, length]`` pairs, reversed at a
+    "-" locus. The start is the polyG-orientation window index of the
+    first aligned reference base.
+    """
+    cig = [[op, length] for op, length in cigar if op != _HARD]
+    start = reference_start
+    if ref_orientation == "-":
+        span = sum(length for op, length in cig if op in _M_OPS or op in _REF_OPS)
+        cig.reverse()
+        start = start + span - 1
+    return cig, window_index(start, ref_orientation=ref_orientation,
+                             window_start=window_start, window_len=window_len)
+
+
 def polyg_alignments(
     read_seqs: Sequence[str],
     cigars: Sequence[Sequence[tuple[int, int]]],
@@ -290,18 +378,37 @@ def polyg_alignments(
     starts = np.empty(n_reads, dtype=np.int64)
     for i in range(n_reads):
         seq = read_seqs[i].upper()
-        cig = [[op, length] for op, length in cigars[i] if op != 5]
-        start = int(reference_starts[i])
-        if minus:
-            span = sum(length for op, length in cig if op in _M_OPS or op in _REF_OPS)
-            seq = revcomp(seq)
-            cig.reverse()
-            start = start + span - 1
-        starts[i] = window_index(start, ref_orientation=ref_orientation,
-                                 window_start=window_start, window_len=window_len)
-        reads.append(seq)
+        cig, starts[i] = _polyg_cigar(cigars[i], int(reference_starts[i]),
+                                      ref_orientation=ref_orientation,
+                                      window_start=window_start, window_len=window_len)
+        reads.append(revcomp(seq) if minus else seq)
         polyg_cigars.append(cig)
     return reads, polyg_cigars, starts
+
+
+def _polyg_matrix(read_seqs: Sequence[str], minus: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Reads in polyG orientation as a right-padded (n, width) uint8 matrix, and lengths.
+
+    The same bases as :func:`polyg_alignments` gives, built by one gather
+    over the joined reads instead of one string operation per read.
+    """
+    n_reads = len(read_seqs)
+    lengths = np.fromiter((len(s) for s in read_seqs), dtype=np.int64, count=n_reads)
+    width = max(int(lengths.max()) if n_reads else 0, 1)
+    flat = np.frombuffer("".join(read_seqs).encode("ascii"), dtype=np.uint8)
+    if flat.size == 0:
+        return np.zeros((n_reads, width), dtype=np.uint8), lengths
+    offsets = np.cumsum(lengths) - lengths
+    cols = np.arange(width, dtype=np.int64)
+    inside = cols[None, :] < lengths[:, None]
+    if minus:
+        source = offsets[:, None] + lengths[:, None] - 1 - cols[None, :]
+        lut = _COMPLEMENT
+    else:
+        source = offsets[:, None] + cols[None, :]
+        lut = _UPPER
+    bases = lut[flat[np.where(inside, source, 0)]]
+    return np.where(inside, bases, np.uint8(0)), lengths
 
 
 def _shift_indels(cigar: list[list[int]], start: int, read: str, reference: str,
@@ -352,53 +459,69 @@ def _shift_indels(cigar: list[list[int]], start: int, read: str, reference: str,
                 p += length
 
 
+def _walk_alignment(cigar: list[list[int]], start: int, read_len: int,
+                    positions: Sequence[int], intervals: Sequence[tuple[int, int]]
+                    ) -> tuple[list[int], list[bool], list[bool], list[bool]]:
+    """One walk of a polyG-orientation CIGAR for several positions and intervals.
+
+    For each reference position: the read index aligned to it, and whether
+    an M operation covers it. A deleted position maps to the next read
+    base. A position outside the aligned span maps by linear extension past
+    the alignment's end, through any soft clip. For each reference interval
+    ``[lo, hi)``: whether the alignment has an indel over it, and whether a
+    soft clip reaches into it.
+    """
+    projection: list[int | None] = [None] * len(positions)
+    on_m = [False] * len(positions)
+    indel = [False] * len(intervals)
+    clip = [False] * len(intervals)
+    q, p = 0, start
+    last = len(cigar) - 1
+    for k, (op, length) in enumerate(cigar):
+        if op in _M_OPS:
+            for j, position in enumerate(positions):
+                if projection[j] is None and p <= position < p + length:
+                    projection[j] = q + position - p
+                    on_m[j] = True
+            q += length
+            p += length
+        elif op in _QUERY_OPS:
+            if op == _INS:
+                for j, (lo, hi) in enumerate(intervals):
+                    if lo < p < hi:
+                        indel[j] = True
+            elif op == _SOFT:
+                for j, (lo, hi) in enumerate(intervals):
+                    if (k == 0 and p > lo) or (k == last and p < hi):
+                        clip[j] = True
+            q += length
+        elif op in _REF_OPS:
+            for j, position in enumerate(positions):
+                if projection[j] is None and p <= position < p + length:
+                    projection[j] = q
+            for j, (lo, hi) in enumerate(intervals):
+                if lo < p + length and p < hi:
+                    indel[j] = True
+            p += length
+    for j, position in enumerate(positions):
+        if projection[j] is None:
+            if position < start:
+                lead = cigar[0][1] if cigar[0][0] == _SOFT else 0
+                projection[j] = lead - (start - position)
+            else:
+                trail = cigar[-1][1] if cigar[-1][0] == _SOFT else 0
+                projection[j] = read_len - trail + (position - p)
+    return projection, on_m, indel, clip
+
+
 def _project(cigar: list[list[int]], start: int, position: int, read_len: int
              ) -> tuple[int, bool]:
     """Read index aligned to reference `position`, and whether it is an M column.
 
-    A deleted position maps to the next read base. A position outside the
-    aligned span maps by linear extension past the alignment's end,
-    through any soft clip.
+    See :func:`_walk_alignment`.
     """
-    q, p = 0, start
-    for op, length in cigar:
-        if op in _M_OPS:
-            if p <= position < p + length:
-                return q + position - p, True
-            q += length
-            p += length
-        elif op in _QUERY_OPS:
-            q += length
-        elif op in _REF_OPS:
-            if p <= position < p + length:
-                return q, False
-            p += length
-    if position < start:
-        lead = cigar[0][1] if cigar[0][0] == _SOFT else 0
-        return lead - (start - position), False
-    trail = cigar[-1][1] if cigar[-1][0] == _SOFT else 0
-    return read_len - trail + (position - p), False
-
-
-def _flank_events(cigar: list[list[int]], start: int, lo: int, hi: int) -> tuple[bool, bool]:
-    """Whether the alignment has an indel, or a soft clip, over reference ``[lo, hi)``."""
-    p = start
-    indel = clip = False
-    last = len(cigar) - 1
-    for k, (op, length) in enumerate(cigar):
-        if op in _M_OPS:
-            p += length
-        elif op in _REF_OPS:
-            if lo < p + length and p < hi:
-                indel = True
-            p += length
-        elif op == _INS:
-            if lo < p < hi:
-                indel = True
-        elif op == _SOFT:
-            if (k == 0 and p > lo) or (k == last and p < hi):
-                clip = True
-    return indel, clip
+    projection, on_m, _, _ = _walk_alignment(cigar, start, read_len, (position,), ())
+    return projection[0], on_m[0]
 
 
 # ---------------------------------------------------------------------------
@@ -406,11 +529,75 @@ def _flank_events(cigar: list[list[int]], start: int, lo: int, hi: int) -> tuple
 # ---------------------------------------------------------------------------
 
 
+def _place_side(matrix: np.ndarray, lengths: np.ndarray, flank: FlankRecord,
+                projection: np.ndarray, on_m: np.ndarray, indel: np.ndarray,
+                clip: np.ndarray, window_len: int
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Place one flank in every read: run-side index (-1), path code, drop code."""
+    n_reads = len(lengths)
+    is_up = flank.is_upstream
+    k = len(flank.bases)
+    pattern, mask = _pattern(flank.bases, is_up, flank.masked_offsets)
+    far_end = projection - (k - 1) if is_up else projection + (k - 1)
+    covered = ((np.minimum(projection, far_end) >= 0)
+               & (np.maximum(projection, far_end) < lengths))
+    chosen = np.full(n_reads, -1, dtype=np.int64)
+    path = np.zeros(n_reads, dtype=np.int8)
+    drop = np.zeros(n_reads, dtype=np.int8)
+
+    # Fast path: the projection, with no indel or clip over the flank.
+    fast = np.flatnonzero(on_m & ~indel & ~clip & covered)
+    b = projection[fast]
+    ok = _exact_match(matrix, lengths, fast, b, pattern, mask, is_up)
+    ok &= matrix[fast, b] != _G
+    fast = fast[ok]
+    chosen[fast] = projection[fast]
+    path[fast] = _FAST
+
+    # Window search for every other read.
+    rest_mask = np.ones(n_reads, dtype=bool)
+    rest_mask[fast] = False
+    rest = np.flatnonzero(rest_mask)
+    if rest.size == 0:
+        return chosen, path, drop
+    width = 2 * _LOCAL_WINDOW + 1
+    shift = np.arange(-_LOCAL_WINDOW, _LOCAL_WINDOW + 1)
+    cand = (projection[rest][:, None] + shift[None, :]).ravel()
+    cand_rows = np.repeat(rest, width)
+    dist = _banded_distance(matrix, lengths, cand_rows, cand, pattern, mask, is_up)
+    inside = (cand >= 0) & (cand < lengths[cand_rows])
+    is_g = np.zeros(cand.shape, dtype=bool)
+    is_g[inside] = matrix[cand_rows[inside], cand[inside]] == _G
+    score = dist + (np.tile(shift, rest.size) != 0)
+    nearness = cand if is_up else -cand
+    # Order: score, then non-G, then nearest the run. Positions with more
+    # than one flank edit cannot win.
+    span = 2 * (window_len + int(lengths.max()) + 2 * _LOCAL_WINDOW + 4)
+    key = (score * 2 + is_g) * span - (nearness - nearness.min())
+    key = np.where(dist <= 1, key, np.iinfo(np.int64).max)
+    key = key.reshape(rest.size, width)
+    best = key.argmin(axis=1)
+    pick = np.arange(rest.size)
+    found = key[pick, best] != np.iinfo(np.int64).max
+    best_b = cand.reshape(rest.size, width)[pick, best]
+    best_g = is_g.reshape(rest.size, width)[pick, best]
+
+    missing = rest[~found]
+    drop[missing] = np.where(covered[missing], _NOT_PLACED, _NOT_COVERED)
+    drop[rest[found & best_g]] = _G_AT_RUN_SIDE
+    placed = found & ~best_g
+    rows = rest[placed]
+    b = best_b[placed]
+    chosen[rows] = b
+    cigar_path = (b == projection[rows]) & on_m[rows] & indel[rows] & ~clip[rows]
+    path[rows] = np.where(cigar_path, _CIGAR, _LOCAL)
+    return chosen, path, drop
+
+
 def place_flanks(
     read_seqs: Sequence[str],
     cigars: Sequence[Sequence[tuple[int, int]]],
-    reference_starts: np.ndarray,
-    base_qualities: Sequence[np.ndarray | None],
+    reference_starts: np.ndarray | Sequence[int],
     *,
     upstream: FlankRecord,
     downstream: FlankRecord,
@@ -426,10 +613,8 @@ def place_flanks(
         Read sequences as stored in the BAM (reference orientation).
     cigars : sequence of sequence of (op, length)
         CIGAR tuples, as `pysam` reports them.
-    reference_starts : ndarray of int
+    reference_starts : array of int
         0-based reference start of each alignment.
-    base_qualities : sequence of ndarray or None
-        Base qualities in stored order; None gives None tract qualities.
     upstream, downstream : FlankRecord
         The two flanks of the locus.
     ref_orientation : str
@@ -449,134 +634,80 @@ def place_flanks(
     minus = ref_orientation == "-"
     polyg_reference = revcomp(reference_window.upper()) if minus else reference_window.upper()
 
-    sides = []
-    for flank in (upstream, downstream):
+    flanks = (upstream, downstream)
+    first_index = []
+    run_side_index = []
+    for flank in flanks:
         us = [window_index(r, ref_orientation=ref_orientation,
                            window_start=reference_window_start, window_len=window_len)
               for r in flank.ref_positions]
         if any(b - a != 1 for a, b in zip(us, us[1:], strict=False)):
             raise ValueError("flank ref_positions do not run along the polyG orientation")
-        sides.append((flank, us[0], us[flank.run_side_offset]))
-    middle = (sides[0][2] + sides[1][2]) / 2
+        first_index.append(us[0])
+        run_side_index.append(us[flank.run_side_offset])
+    middle = (run_side_index[0] + run_side_index[1]) / 2
+    intervals = [(lo, lo + len(f.bases)) for lo, f in zip(first_index, flanks, strict=True)]
 
-    reads, polyg_cigars, starts = polyg_alignments(
-        read_seqs, cigars, reference_starts, ref_orientation=ref_orientation,
-        window_start=reference_window_start, window_len=window_len)
-    for i in range(n_reads):
-        cig = polyg_cigars[i]
-        if any(op in (_INS, _DEL) for op, _ in cig):
-            _shift_indels(cig, int(starts[i]), reads[i], polyg_reference, middle)
+    matrix, lengths = _polyg_matrix(read_seqs, minus)
+    width = matrix.shape[1]
+    starts = np.asarray(reference_starts, dtype=np.int64)
 
-    matrix, lengths = _pack(reads) if n_reads else (np.zeros((0, 1), np.uint8),
-                                                     np.zeros(0, np.int64))
+    # A read whose CIGAR is one M operation aligns its whole length, so its
+    # projection is the run-side index minus its polyG-orientation start.
+    one_m = np.fromiter((len(c) == 1 and c[0][0] in _M_OPS for c in cigars),
+                        dtype=bool, count=n_reads)
+    if minus:
+        polyg_start = reference_window_start + window_len - 1 - (starts + lengths - 1)
+    else:
+        polyg_start = starts - reference_window_start
+    projection = np.asarray(run_side_index, dtype=np.int64)[:, None] - polyg_start[None, :]
+    on_m = (projection >= 0) & (projection < lengths[None, :])
+    indel = np.zeros((2, n_reads), dtype=bool)
+    clip = np.zeros((2, n_reads), dtype=bool)
 
-    run_side = []
-    side_paths = []
-    side_drop = []
-    for flank, lo, rs in sides:
-        is_up = flank.is_upstream
-        k = len(flank.bases)
-        b0 = np.empty(n_reads, dtype=np.int64)
-        on_m = np.empty(n_reads, dtype=bool)
-        clean = np.empty(n_reads, dtype=bool)
-        has_indel = np.empty(n_reads, dtype=bool)
-        has_clip = np.empty(n_reads, dtype=bool)
-        for i in range(n_reads):
-            cig = polyg_cigars[i]
-            b0[i], on_m[i] = _project(cig, int(starts[i]), rs, int(lengths[i]))
-            indel, clip = _flank_events(cig, int(starts[i]), lo, lo + k)
-            has_indel[i] = indel
-            has_clip[i] = clip
-            clean[i] = on_m[i] and not indel and not clip
+    # Every other read walks its CIGAR once, for both sides.
+    other = np.flatnonzero(~one_m).tolist()
+    text = matrix.tobytes().decode("latin-1")
+    if other:
+        lengths_list = lengths.tolist()
+        for i in other:
+            cig, start = _polyg_cigar(cigars[i], int(starts[i]), ref_orientation=ref_orientation,
+                                      window_start=reference_window_start,
+                                      window_len=window_len)
+            read_len = lengths_list[i]
+            if any(op == _INS or op == _DEL for op, _ in cig):
+                _shift_indels(cig, start, text[i * width:i * width + read_len],
+                              polyg_reference, middle)
+            proj, m, ind, cl = _walk_alignment(cig, start, read_len, run_side_index,
+                                               intervals)
+            projection[:, i] = proj
+            on_m[:, i] = m
+            indel[:, i] = ind
+            clip[:, i] = cl
 
-        pattern, mask = _pattern(flank.bases, is_up, flank.masked_offsets)
-        far_end = b0 - (k - 1) if is_up else b0 + (k - 1)
-        covered = (np.minimum(b0, far_end) >= 0) & (np.maximum(b0, far_end) < lengths)
+    up_b, up_path, up_drop = _place_side(matrix, lengths, upstream, projection[0], on_m[0],
+                                         indel[0], clip[0], window_len)
+    dn_b, dn_path, dn_drop = _place_side(matrix, lengths, downstream, projection[1],
+                                         on_m[1], indel[1], clip[1], window_len)
 
-        # Fast path: the projection, with no indel or clip over the flank.
-        rows = np.arange(n_reads)
-        fast_rows = rows[clean & covered]
-        d0 = _banded_distance(matrix, lengths, fast_rows, b0[fast_rows], pattern, mask, is_up)
-        g0 = matrix[fast_rows, b0[fast_rows]] == _G
-        fast = fast_rows[(d0 == 0) & ~g0]
-
-        chosen = np.full(n_reads, -1, dtype=np.int64)
-        path: list[str | None] = [None] * n_reads
-        drop: list[str | None] = [None] * n_reads
-        chosen[fast] = b0[fast]
-        for i in fast.tolist():
-            path[i] = "fast"
-
-        # Window search for every other read.
-        rest = np.setdiff1d(rows, fast, assume_unique=True)
-        if rest.size:
-            width = 2 * _LOCAL_WINDOW + 1
-            shift = np.arange(-_LOCAL_WINDOW, _LOCAL_WINDOW + 1)
-            cand = (b0[rest][:, None] + shift[None, :]).ravel()
-            cand_rows = np.repeat(rest, width)
-            dist = _banded_distance(matrix, lengths, cand_rows, cand, pattern, mask, is_up)
-            inside = (cand >= 0) & (cand < lengths[cand_rows])
-            is_g = np.zeros(cand.shape, dtype=bool)
-            is_g[inside] = matrix[cand_rows[inside], cand[inside]] == _G
-            score = dist + (np.tile(shift, rest.size) != 0)
-            nearness = cand if is_up else -cand
-            # Order: score, then non-G, then nearest the run. Positions with
-            # more than one flank edit cannot win.
-            span = 2 * (window_len + int(lengths.max()) + 2 * _LOCAL_WINDOW + 4)
-            key = (score * 2 + is_g) * span - (nearness - nearness.min())
-            key = np.where(dist <= 1, key, np.iinfo(np.int64).max)
-            key = key.reshape(rest.size, width)
-            best = key.argmin(axis=1)
-            found = key[np.arange(rest.size), best] != np.iinfo(np.int64).max
-            best_b = cand.reshape(rest.size, width)[np.arange(rest.size), best]
-            best_g = is_g.reshape(rest.size, width)[np.arange(rest.size), best]
-            for j, i in enumerate(rest.tolist()):
-                if not found[j]:
-                    drop[i] = "flank_not_placed" if covered[i] else "flank_not_covered"
-                elif best_g[j]:
-                    drop[i] = "g_at_run_side"
-                else:
-                    b = int(best_b[j])
-                    chosen[i] = b
-                    if b == b0[i] and on_m[i] and has_indel[i] and not has_clip[i]:
-                        path[i] = "cigar"
-                    else:
-                        path[i] = "local"
-        run_side.append(chosen)
-        side_paths.append(path)
-        side_drop.append(drop)
-
-    tracts: list[str | None] = [None] * n_reads
-    tract_quals: list[np.ndarray | None] = [None] * n_reads
-    reasons: list[str | None] = [None] * n_reads
-    drop_side: list[str | None] = [None] * n_reads
-    up_b, dn_b = run_side
-    for i in range(n_reads):
-        if side_drop[0][i] is not None:
-            reasons[i], drop_side[i] = side_drop[0][i], "upstream"
-            continue
-        if side_drop[1][i] is not None:
-            reasons[i], drop_side[i] = side_drop[1][i], "downstream"
-            continue
-        lo, hi = int(up_b[i]) + 1, int(dn_b[i])
-        if hi < lo:
-            reasons[i] = "flanks_crossed"
-            continue
-        tracts[i] = reads[i][lo:hi]
-        quals = base_qualities[i]
-        if quals is not None:
-            q = np.asarray(quals)
-            if minus:
-                q = q[::-1]
-            tract_quals[i] = q[lo:hi].copy()
+    placed = (up_b >= 0) & (dn_b >= 0)
+    crossed = placed & (dn_b <= up_b)
+    kept = placed & ~crossed
+    tracts = np.full(n_reads, None, dtype=object)
+    rows = np.flatnonzero(kept)
+    if rows.size:
+        lo = (rows * width + up_b[rows] + 1).tolist()
+        hi = (rows * width + dn_b[rows]).tolist()
+        tracts[rows] = [text[a:b] for a, b in zip(lo, hi, strict=True)]
 
     return FlankPlacement(
         tracts=tracts,
-        tract_qualities=tract_quals,
-        drop_reason=reasons,
-        drop_side=drop_side,
-        upstream_path=side_paths[0],
-        downstream_path=side_paths[1],
+        kept=kept,
+        upstream_path=_PATH_NAMES[up_path],
+        downstream_path=_PATH_NAMES[dn_path],
+        upstream_drop=_SIDE_DROP_NAMES[up_drop],
+        downstream_drop=_SIDE_DROP_NAMES[dn_drop],
+        flanks_crossed=crossed,
         upstream_run_side=up_b,
         downstream_run_side=dn_b,
     )

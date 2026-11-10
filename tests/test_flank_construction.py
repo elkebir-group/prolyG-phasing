@@ -401,7 +401,7 @@ def test_build_flanks_end_to_end(tmp_path):
         chrom = chromosome(locus, o)
         out = place_flanks(
             [r.query_sequence for r in records], [r.cigartuples for r in records],
-            np.array([r.reference_start for r in records]), [None] * len(records),
+            np.array([r.reference_start for r in records]),
             upstream=up, downstream=dn, ref_orientation=o, reference_window=chrom,
             reference_window_start=0)
         assert {run_tuple(t) for t in out.tracts} == {(13,)}
