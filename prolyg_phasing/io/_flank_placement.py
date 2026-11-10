@@ -39,10 +39,11 @@ alignment has an indel inside the flank, and the projection wins. "local":
 any other placement. A fast placement has score 0, and no other position
 can score 0, so a fast read needs no window search.
 
-A read whose CIGAR is one M operation has no indel to move, and its
-projection is the run-side position minus the alignment start. These reads
-are placed by arithmetic over the whole block. Only the other reads walk
-their CIGAR, once for both sides.
+The CIGARs of a block of reads are walked once for both sides, as arrays
+over the whole block. A read whose CIGAR is one M operation has no indel to
+move, and its projection is the run-side position minus the alignment
+start. A read with one indel moves it over the whole block; only a read
+with more than one indel moves them one read at a time.
 
 A read that carries an extra or a missing copy of the run-side base next
 to the run is the same string as a read from a molecule where that base
@@ -53,6 +54,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import itertools
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -86,15 +88,15 @@ _QUERY_OPS = (1, 4, 6)      # I, S, P: consume read only (P as pysam walks it)
 _REF_OPS = (2, 3)           # D, N: consume reference only
 _INS, _DEL, _SOFT, _HARD = 1, 2, 4, 5
 
-# Byte maps from a stored read base to its polyG-orientation base: the
+# Byte tables from a stored read base to its polyG-orientation base: the
 # upper case at a "+" locus, the complement of the upper case at a "-"
 # locus. They give the same bases as `str.upper` and `revcomp`.
-_UPPER = np.arange(256, dtype=np.uint8)
-_UPPER[ord("a"):ord("z") + 1] -= 32
-_COMPLEMENT = _UPPER.copy()
+_LOWER = bytes(range(ord("a"), ord("z") + 1))
+_UPPER_BYTES = bytes.maketrans(_LOWER, _LOWER.upper())
+_COMPLEMENT_BYTES = bytearray(_UPPER_BYTES)
 for _base, _complement in zip("ACGTN", "ACGTN".translate(COMP), strict=True):
-    _COMPLEMENT[ord(_base)] = ord(_complement)
-_COMPLEMENT = _COMPLEMENT[_UPPER]
+    _COMPLEMENT_BYTES[ord(_base)] = _COMPLEMENT_BYTES[ord(_base.lower())] = ord(_complement)
+_COMPLEMENT_BYTES = bytes(_COMPLEMENT_BYTES)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -444,26 +446,20 @@ def polyg_alignments(
 def _polyg_matrix(read_seqs: Sequence[str], minus: bool) -> tuple[np.ndarray, np.ndarray]:
     """Reads in polyG orientation as a right-padded (n, width) uint8 matrix, and lengths.
 
-    The same bases as :func:`polyg_alignments` gives, built by one gather
-    over the joined reads instead of one string operation per read.
+    The same bases as :func:`polyg_alignments` gives. At a "-" locus each
+    read is padded on the left, complemented as one byte string, and the
+    matrix columns are reversed.
     """
     n_reads = len(read_seqs)
-    lengths = np.fromiter((len(s) for s in read_seqs), dtype=np.int64, count=n_reads)
+    lengths = np.fromiter(map(len, read_seqs), dtype=np.int64, count=n_reads)
     width = max(int(lengths.max()) if n_reads else 0, 1)
-    flat = np.frombuffer("".join(read_seqs).encode("ascii"), dtype=np.uint8)
-    if flat.size == 0:
-        return np.zeros((n_reads, width), dtype=np.uint8), lengths
-    offsets = np.cumsum(lengths) - lengths
-    cols = np.arange(width, dtype=np.int64)
-    inside = cols[None, :] < lengths[:, None]
     if minus:
-        source = offsets[:, None] + lengths[:, None] - 1 - cols[None, :]
-        lut = _COMPLEMENT
-    else:
-        source = offsets[:, None] + cols[None, :]
-        lut = _UPPER
-    bases = lut[flat[np.where(inside, source, 0)]]
-    return np.where(inside, bases, np.uint8(0)), lengths
+        flat = "".join([s.rjust(width, "\0") for s in read_seqs]).encode("ascii")
+        matrix = np.frombuffer(flat.translate(_COMPLEMENT_BYTES), dtype=np.uint8)
+        return np.ascontiguousarray(matrix.reshape(n_reads, width)[:, ::-1]), lengths
+    flat = "".join([s.ljust(width, "\0") for s in read_seqs]).encode("ascii")
+    matrix = np.frombuffer(flat.translate(_UPPER_BYTES), dtype=np.uint8)
+    return matrix.reshape(n_reads, width), lengths
 
 
 def _shift_indels(cigar: list[list[int]], start: int, read: str, reference: str,
@@ -514,69 +510,237 @@ def _shift_indels(cigar: list[list[int]], start: int, read: str, reference: str,
                 p += length
 
 
-def _walk_alignment(cigar: list[list[int]], start: int, read_len: int,
-                    positions: Sequence[int], intervals: Sequence[tuple[int, int]]
-                    ) -> tuple[list[int], list[bool], list[bool], list[bool]]:
-    """One walk of a polyG-orientation CIGAR for several positions and intervals.
-
-    For each reference position: the read index aligned to it, and whether
-    an M operation covers it. A deleted position maps to the next read
-    base. A position outside the aligned span maps by linear extension past
-    the alignment's end, through any soft clip. For each reference interval
-    ``[lo, hi)``: whether the alignment has an indel over it, and whether a
-    soft clip reaches into it.
-    """
-    projection: list[int | None] = [None] * len(positions)
-    on_m = [False] * len(positions)
-    indel = [False] * len(intervals)
-    clip = [False] * len(intervals)
-    q, p = 0, start
-    last = len(cigar) - 1
-    for k, (op, length) in enumerate(cigar):
-        if op in _M_OPS:
-            for j, position in enumerate(positions):
-                if projection[j] is None and p <= position < p + length:
-                    projection[j] = q + position - p
-                    on_m[j] = True
-            q += length
-            p += length
-        elif op in _QUERY_OPS:
-            if op == _INS:
-                for j, (lo, hi) in enumerate(intervals):
-                    if lo < p < hi:
-                        indel[j] = True
-            elif op == _SOFT:
-                for j, (lo, hi) in enumerate(intervals):
-                    if (k == 0 and p > lo) or (k == last and p < hi):
-                        clip[j] = True
-            q += length
-        elif op in _REF_OPS:
-            for j, position in enumerate(positions):
-                if projection[j] is None and p <= position < p + length:
-                    projection[j] = q
-            for j, (lo, hi) in enumerate(intervals):
-                if lo < p + length and p < hi:
-                    indel[j] = True
-            p += length
-    for j, position in enumerate(positions):
-        if projection[j] is None:
-            if position < start:
-                lead = cigar[0][1] if cigar[0][0] == _SOFT else 0
-                projection[j] = lead - (start - position)
-            else:
-                trail = cigar[-1][1] if cigar[-1][0] == _SOFT else 0
-                projection[j] = read_len - trail + (position - p)
-    return projection, on_m, indel, clip
-
-
 def _project(cigar: list[list[int]], start: int, position: int, read_len: int
              ) -> tuple[int, bool]:
     """Read index aligned to reference `position`, and whether it is an M column.
 
-    See :func:`_walk_alignment`.
+    A deleted position maps to the next read base. A position outside the
+    aligned span maps by linear extension past the alignment's end,
+    through any soft clip. :func:`_alignment_geometry` computes the same
+    for a block of reads.
     """
-    projection, on_m, _, _ = _walk_alignment(cigar, start, read_len, (position,), ())
-    return projection[0], on_m[0]
+    q, p = 0, start
+    for op, length in cigar:
+        if op in _M_OPS:
+            if p <= position < p + length:
+                return q + position - p, True
+            q += length
+            p += length
+        elif op in _QUERY_OPS:
+            q += length
+        elif op in _REF_OPS:
+            if p <= position < p + length:
+                return q, False
+            p += length
+    if position < start:
+        lead = cigar[0][1] if cigar[0][0] == _SOFT else 0
+        return lead - (start - position), False
+    trail = cigar[-1][1] if cigar[-1][0] == _SOFT else 0
+    return read_len - trail + (position - p), False
+
+
+@dataclasses.dataclass
+class _Alignments:
+    """A block of polyG-orientation CIGARs as (n_reads, n_ops) arrays.
+
+    Hard clips are removed and, at a "-" locus, each CIGAR is reversed.
+    Each row holds its `n_ops` operations first; the padding has op -1 and
+    length 0. `start` is the polyG-orientation window index of the first
+    aligned reference base, and `span` the reference bases the alignment
+    covers.
+    """
+
+    ops: np.ndarray
+    lengths: np.ndarray
+    n_ops: np.ndarray
+    start: np.ndarray
+    span: np.ndarray
+
+    def offsets(self) -> tuple[np.ndarray, np.ndarray]:
+        """Read index and window index at which each operation starts."""
+        query = np.isin(self.ops, _M_OPS + _QUERY_OPS)
+        reference = np.isin(self.ops, _M_OPS + _REF_OPS)
+        q = np.cumsum(self.lengths * query, axis=1) - self.lengths * query
+        p = np.cumsum(self.lengths * reference, axis=1) - self.lengths * reference
+        return q, p + self.start[:, None]
+
+
+def _polyg_cigar_arrays(cigars: Sequence[Sequence[tuple[int, int]]],
+                        reference_starts: np.ndarray, *, ref_orientation: str,
+                        window_start: int, window_len: int) -> _Alignments:
+    """The CIGARs of a block of reads in polyG orientation, as arrays.
+
+    The same operations and starts as :func:`_polyg_cigar` gives one read
+    at a time.
+    """
+    n_reads = len(cigars)
+    n_ops = np.fromiter((len(c) for c in cigars), dtype=np.int64, count=n_reads)
+    total = int(n_ops.sum())
+    flat = np.fromiter(itertools.chain.from_iterable(cigars),
+                       dtype=np.dtype((np.int64, 2)), count=total)
+    width = max(int(n_ops.max()) if n_reads else 0, 1)
+    rows = np.repeat(np.arange(n_reads), n_ops)
+    cols = np.arange(total) - np.repeat(np.cumsum(n_ops) - n_ops, n_ops)
+    ops = np.full((n_reads, width), -1, dtype=np.int64)
+    lengths = np.zeros((n_reads, width), dtype=np.int64)
+    ops[rows, cols] = flat[:, 0]
+    lengths[rows, cols] = flat[:, 1]
+
+    # Drop hard clips: a stable sort moves the kept operations first.
+    kept = (ops != -1) & (ops != _HARD)
+    if not kept.sum(axis=1).tolist() == n_ops.tolist():
+        order = np.argsort(~kept, axis=1, kind="stable")
+        ops = np.take_along_axis(ops, order, axis=1)
+        lengths = np.take_along_axis(lengths, order, axis=1)
+        n_ops = kept.sum(axis=1)
+        pad = np.arange(width)[None, :] >= n_ops[:, None]
+        ops[pad] = -1
+        lengths[pad] = 0
+    span = (lengths * np.isin(ops, _M_OPS + _REF_OPS)).sum(axis=1)
+    starts = np.asarray(reference_starts, dtype=np.int64)
+    if ref_orientation == "-":
+        index = n_ops[:, None] - 1 - np.arange(width)[None, :]
+        inside = index >= 0
+        index = np.where(inside, index, 0)
+        ops = np.where(inside, np.take_along_axis(ops, index, axis=1), -1)
+        lengths = np.where(inside, np.take_along_axis(lengths, index, axis=1), 0)
+        start = window_start + window_len - 1 - (starts + span - 1)
+    else:
+        start = starts - window_start
+    return _Alignments(ops, lengths, n_ops, start, span)
+
+
+def _shift_single_indels(aln: _Alignments, rows: np.ndarray, matrix: np.ndarray,
+                         read_lengths: np.ndarray, reference: np.ndarray,
+                         middle: float) -> None:
+    """:func:`_shift_indels` for reads with exactly one indel, over the block, in place.
+
+    With one indel the order of the one-base moves does not matter, so
+    each read moves its indel step by step until the bases stop it.
+    """
+    is_indel = (aln.ops[rows] == _INS) | (aln.ops[rows] == _DEL)
+    k = is_indel.argmax(axis=1)
+    n_ops = aln.n_ops[rows]
+    movable = (k > 0) & (k < n_ops - 1)
+    left_op = aln.ops[rows, np.maximum(k - 1, 0)]
+    right_op = aln.ops[rows, np.minimum(k + 1, aln.ops.shape[1] - 1)]
+    movable &= np.isin(left_op, _M_OPS) & np.isin(right_op, _M_OPS)
+    rows, k = rows[movable], k[movable]
+    if rows.size == 0:
+        return
+    q_start, p_start = aln.offsets()
+    q = q_start[rows, k]
+    p = p_start[rows, k]
+    op = aln.ops[rows, k]
+    size = aln.lengths[rows, k]
+    a = aln.lengths[rows, k - 1].copy()
+    b = aln.lengths[rows, k + 1].copy()
+    leftward = p < middle
+    ins = op == _INS
+    n_ref = len(reference)
+    read_len = read_lengths[rows]
+    width = matrix.shape[1]
+
+    def read_at(i):
+        return matrix[rows, np.clip(i, 0, width - 1)]
+
+    def ref_at(i):
+        return reference[np.clip(i, 0, n_ref - 1)]
+
+    active = np.ones(rows.size, dtype=bool)
+    while active.any():
+        # A move to the left keeps the alignment when the base that changes
+        # sides of the gap equals the gap's base at the other end.
+        same_left = np.where(
+            ins, read_at(q - 1) == read_at(q + size - 1),
+            (p - 1 >= 0) & (p + size - 1 < n_ref) & (ref_at(p - 1) == ref_at(p + size - 1)))
+        same_right = np.where(
+            ins, (q + size < read_len) & (read_at(q) == read_at(q + size)),
+            (p >= 0) & (p + size < n_ref) & (ref_at(p) == ref_at(p + size)))
+        go_left = active & leftward & (a > 1) & same_left
+        go_right = active & ~leftward & (b > 1) & same_right
+        step = go_right.astype(np.int64) - go_left.astype(np.int64)
+        q += step
+        p += step
+        a += step
+        b -= step
+        active = go_left | go_right
+    aln.lengths[rows, k - 1] = a
+    aln.lengths[rows, k + 1] = b
+
+
+def _shift_block_indels(aln: _Alignments, matrix: np.ndarray, read_lengths: np.ndarray,
+                        reference: str, middle: float) -> None:
+    """:func:`_shift_indels` for every read of a block, in place.
+
+    A read with one indel moves it over the whole block. A read with more
+    than one indel moves them one read at a time, because one indel can
+    stop another.
+    """
+    n_indels = ((aln.ops == _INS) | (aln.ops == _DEL)).sum(axis=1)
+    reference_bases = np.frombuffer(reference.encode("ascii"), dtype=np.uint8)
+    _shift_single_indels(aln, np.flatnonzero(n_indels == 1), matrix, read_lengths,
+                         reference_bases, middle)
+    several = np.flatnonzero(n_indels > 1).tolist()
+    if not several:
+        return
+    width = matrix.shape[1]
+    text = matrix.tobytes().decode("latin-1")
+    for i in several:
+        n_ops = int(aln.n_ops[i])
+        cig = [[op, length] for op, length in zip(aln.ops[i, :n_ops].tolist(),
+                                                  aln.lengths[i, :n_ops].tolist(),
+                                                  strict=True)]
+        _shift_indels(cig, int(aln.start[i]), text[i * width:i * width + int(read_lengths[i])],
+                      reference, middle)
+        aln.lengths[i, :n_ops] = [length for _, length in cig]
+
+
+def _alignment_geometry(aln: _Alignments, read_lengths: np.ndarray,
+                        positions: Sequence[int], intervals: Sequence[tuple[int, int]]
+                        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Projection of positions, and indel or clip over intervals, for a block of reads.
+
+    For each reference position: the read index aligned to it, and whether
+    an M operation covers it (see :func:`_project`). For each reference
+    interval ``[lo, hi)``: whether the alignment has an indel over it, and
+    whether a soft clip reaches into it. Each output has one row per
+    position or interval and one column per read.
+    """
+    n_reads = len(read_lengths)
+    q_start, p_start = aln.offsets()
+    ops, lengths = aln.ops, aln.lengths
+    is_m = np.isin(ops, _M_OPS)
+    on_reference = np.isin(ops, _M_OPS + _REF_OPS)
+    pick = np.arange(n_reads)
+    last = np.maximum(aln.n_ops - 1, 0)
+    lead = np.where(ops[:, 0] == _SOFT, lengths[:, 0], 0)
+    trail = np.where(ops[pick, last] == _SOFT, lengths[pick, last], 0)
+    end = aln.start + aln.span
+
+    projection = np.empty((len(positions), n_reads), dtype=np.int64)
+    on_m = np.empty((len(positions), n_reads), dtype=bool)
+    for s, position in enumerate(positions):
+        covers = on_reference & (p_start <= position) & (position < p_start + lengths)
+        found = covers.any(axis=1)
+        j = covers.argmax(axis=1)
+        m = is_m[pick, j]
+        inside = q_start[pick, j] + np.where(m, position - p_start[pick, j], 0)
+        outside = np.where(position < aln.start, lead - (aln.start - position),
+                           read_lengths - trail + (position - end))
+        projection[s] = np.where(found, inside, outside)
+        on_m[s] = found & m
+
+    indel = np.empty((len(intervals), n_reads), dtype=bool)
+    clip = np.empty((len(intervals), n_reads), dtype=bool)
+    gap = on_reference & ~is_m
+    for s, (lo, hi) in enumerate(intervals):
+        over_gap = gap & (lo < p_start + lengths) & (p_start < hi)
+        over_insertion = (ops == _INS) & (lo < p_start) & (p_start < hi)
+        indel[s] = (over_gap | over_insertion).any(axis=1)
+        clip[s] = (((ops[:, 0] == _SOFT) & (aln.start > lo))
+                   | ((ops[pick, last] == _SOFT) & (p_start[pick, last] < hi)))
+    return projection, on_m, indel, clip
 
 
 # ---------------------------------------------------------------------------
@@ -707,38 +871,12 @@ def place_flanks(
     width = matrix.shape[1]
     starts = np.asarray(reference_starts, dtype=np.int64)
 
-    # A read whose CIGAR is one M operation aligns its whole length, so its
-    # projection is the run-side index minus its polyG-orientation start.
-    one_m = np.fromiter((len(c) == 1 and c[0][0] in _M_OPS for c in cigars),
-                        dtype=bool, count=n_reads)
-    if minus:
-        polyg_start = reference_window_start + window_len - 1 - (starts + lengths - 1)
-    else:
-        polyg_start = starts - reference_window_start
-    projection = np.asarray(run_side_index, dtype=np.int64)[:, None] - polyg_start[None, :]
-    on_m = (projection >= 0) & (projection < lengths[None, :])
-    indel = np.zeros((2, n_reads), dtype=bool)
-    clip = np.zeros((2, n_reads), dtype=bool)
-
-    # Every other read walks its CIGAR once, for both sides.
-    other = np.flatnonzero(~one_m).tolist()
+    aln = _polyg_cigar_arrays(cigars, starts, ref_orientation=ref_orientation,
+                              window_start=reference_window_start, window_len=window_len)
+    _shift_block_indels(aln, matrix, lengths, polyg_reference, middle)
+    projection, on_m, indel, clip = _alignment_geometry(aln, lengths, run_side_index,
+                                                        intervals)
     text = matrix.tobytes().decode("latin-1")
-    if other:
-        lengths_list = lengths.tolist()
-        for i in other:
-            cig, start = _polyg_cigar(cigars[i], int(starts[i]), ref_orientation=ref_orientation,
-                                      window_start=reference_window_start,
-                                      window_len=window_len)
-            read_len = lengths_list[i]
-            if any(op == _INS or op == _DEL for op, _ in cig):
-                _shift_indels(cig, start, text[i * width:i * width + read_len],
-                              polyg_reference, middle)
-            proj, m, ind, cl = _walk_alignment(cig, start, read_len, run_side_index,
-                                               intervals)
-            projection[:, i] = proj
-            on_m[:, i] = m
-            indel[:, i] = ind
-            clip[:, i] = cl
 
     up_b, up_path, up_drop = _place_side(matrix, lengths, upstream, projection[0], on_m[0],
                                          indel[0], clip[0], window_len)

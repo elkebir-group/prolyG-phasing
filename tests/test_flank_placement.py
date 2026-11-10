@@ -545,3 +545,104 @@ def test_one_m_arithmetic_matches_the_cigar_walk(orientation):
         assert list(getattr(one, field.name)) == list(getattr(walked, field.name)), field.name
     assert one.kept.any() and (~one.kept).any()
     assert set(one.upstream_path) >= {"fast", "local", None}
+
+
+# ---------------------------------------------------------------------------
+# The CIGAR walk over the block against a walk of one read at a time
+# ---------------------------------------------------------------------------
+
+
+def _reference_events(cigar, start, lo, hi):
+    """Indel and soft clip over reference ``[lo, hi)``, by a plain walk of one CIGAR."""
+    p = start
+    indel = clip = False
+    last = len(cigar) - 1
+    for k, (op, length) in enumerate(cigar):
+        if op in (0, 7, 8):
+            p += length
+        elif op in (2, 3):
+            if lo < p + length and p < hi:
+                indel = True
+            p += length
+        elif op == 1:
+            if lo < p < hi:
+                indel = True
+        elif op == 4:
+            if (k == 0 and p > lo) or (k == last and p < hi):
+                clip = True
+    return indel, clip
+
+
+def _random_alignments(rng, chrom, n):
+    """Reads with random CIGARs: M, =, X, I, D, N, P, soft and hard clips."""
+    query_ops = {0, 1, 4, 6, 7, 8}
+    seqs, cigars, starts = [], [], []
+    for _ in range(n):
+        ops = []
+        if rng.random() < 0.3:
+            ops.append((5, rng.randrange(1, 4)))
+        if rng.random() < 0.3:
+            ops.append((4, rng.randrange(1, 8)))
+        for _ in range(rng.randrange(1, 5)):
+            ops.append((rng.choice([0, 0, 0, 7, 8]), rng.randrange(1, 30)))
+            r = rng.random()
+            if r < 0.3:
+                ops.append((1, rng.randrange(1, 4)))
+            elif r < 0.6:
+                ops.append((2, rng.randrange(1, 4)))
+            elif r < 0.65:
+                ops.append((3, rng.randrange(1, 4)))
+            elif r < 0.7:
+                ops.append((6, rng.randrange(1, 3)))
+        ops.append((0, rng.randrange(1, 30)))
+        if rng.random() < 0.3:
+            ops.append((4, rng.randrange(1, 8)))
+        if rng.random() < 0.2:
+            ops.append((5, rng.randrange(1, 4)))
+        start = rng.randrange(0, len(chrom) - 20)
+        length = sum(n_bases for op, n_bases in ops if op in query_ops)
+        bases = chrom[start:start + length].ljust(length, "G")
+        seqs.append("".join(c if rng.random() > 0.1 else rng.choice("ACGTG") for c in bases))
+        cigars.append(ops)
+        starts.append(start)
+    return seqs, cigars, np.array(starts)
+
+
+@pytest.mark.parametrize("orientation", ["+", "-"])
+def test_block_walk_matches_one_read_at_a_time(orientation):
+    rng = random.Random(23)
+    case = next(c for c in CASES if c.case_id == "edge_variant_hom")
+    chrom = chromosome(case.locus, orientation)
+    polyg_reference = chrom if orientation == "+" else revcomp(chrom)
+    seqs, cigars, starts = _random_alignments(rng, chrom, 2000)
+    positions = [CHROM_PAD + 25, CHROM_PAD + 46]
+    intervals = [(CHROM_PAD + 16, CHROM_PAD + 26), (CHROM_PAD + 46, CHROM_PAD + 56)]
+    middle = 63.5
+
+    matrix, lengths = flank_placement._polyg_matrix(seqs, orientation == "-")
+    aln = flank_placement._polyg_cigar_arrays(cigars, starts, ref_orientation=orientation,
+                                              window_start=0, window_len=len(chrom))
+    flank_placement._shift_block_indels(aln, matrix, lengths, polyg_reference, middle)
+    projection, on_m, indel, clip = flank_placement._alignment_geometry(
+        aln, lengths, positions, intervals)
+
+    reads, _, _ = flank_placement.polyg_alignments(
+        seqs, cigars, starts, ref_orientation=orientation, window_start=0,
+        window_len=len(chrom))
+    n_single = 0
+    for i in range(len(seqs)):
+        cig, start = flank_placement._polyg_cigar(
+            cigars[i], int(starts[i]), ref_orientation=orientation, window_start=0,
+            window_len=len(chrom))
+        assert start == aln.start[i]
+        n_single += sum(op in (1, 2) for op, _ in cig) == 1
+        flank_placement._shift_indels(cig, start, reads[i], polyg_reference, middle)
+        n_ops = int(aln.n_ops[i])
+        assert [list(x) for x in zip(aln.ops[i, :n_ops].tolist(),
+                                     aln.lengths[i, :n_ops].tolist(), strict=True)] == cig
+        for s, position in enumerate(positions):
+            assert (projection[s, i], on_m[s, i]) == flank_placement._project(
+                cig, start, position, len(reads[i]))
+        for s, (lo, hi) in enumerate(intervals):
+            assert (indel[s, i], clip[s, i]) == _reference_events(cig, start, lo, hi)
+    assert n_single > 100
