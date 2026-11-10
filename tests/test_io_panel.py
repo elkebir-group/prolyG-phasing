@@ -15,6 +15,7 @@ from collections.abc import Mapping
 import numpy as np
 import pytest
 
+from prolyg_phasing.io._flank_placement import FlankRecord
 from prolyg_phasing.io.panel import (
     EXTRACTION_SCHEMA_VERSION,
     ExtractedPanel,
@@ -46,7 +47,7 @@ from ._panel_fixtures import _make_locus_single_run, _make_provenance
         ("GGGATGGG", (3, 3)),               # multi-base interrupter
         ("GGGAGGGCGG", (3, 3, 2)),          # S=3
         ("GGGGGGGGGGGGG", (13,)),           # interrupter deletion → S=1 (alt seq vs S=2 ref)
-        ("", (0,)),                         # empty inter-anchor (anchors adjacent)
+        ("", (0,)),                         # empty tract (flanks adjacent)
         ("AGGG", (0, 3)),                   # zero-length first run
         ("GGGA", (3, 0)),                   # zero-length last run
     ],
@@ -75,8 +76,9 @@ def _two_locus_panel_with_flanking() -> ExtractedPanel:
 
     locus2 = _make_locus_single_run(
         [("20001", "A", "GGGAGGG", 4)],
-        n_runs=2, ref_inter_anchor_seq="GGGAGGG", reference_run_lengths=(3, 3),
+        n_runs=2, reference_tract="GGGAGGG", reference_run_lengths=(3, 3),
         bed_name="Locus2", chrom="chr2", bed_start=200, bed_end=207,
+        upstream_flank=FlankRecord("ACGTACGTAC", tuple(range(188, 198)), 9, (3, 6)),
     )
     return ExtractedPanel(
         loci={"Locus1": locus1, "Locus2": locus2},
@@ -106,6 +108,8 @@ def test_save_load_db_roundtrip(tmp_path):
     assert rec.flanking_up_ref_pos_start == 90
 
     rec2 = loaded.loci["Locus2"]
+    assert rec2.upstream_flank == panel.loci["Locus2"].upstream_flank
+    assert rec2.upstream_flank.masked_offsets == (3, 6)
     assert rec2.n_runs == 2
     assert rec2.reference_run_lengths == (3, 3)
     assert rec2.chrom == "chr2"
@@ -222,7 +226,7 @@ def test_observed_pattern_frequencies_single_pattern():
         ("10004", "A", "GGGAGGG", 5),
         ("10004", "B", "GGGAGGG", 3),
         ("10007", "A", "GGGAGGG", 2),
-    ], n_runs=2, ref_inter_anchor_seq="GGGAGGG", reference_run_lengths=(3, 3))
+    ], n_runs=2, reference_tract="GGGAGGG", reference_run_lengths=(3, 3))
     freqs = observed_pattern_frequencies(locus)
     assert freqs == {("A",): 1.0}
 
@@ -232,7 +236,7 @@ def test_observed_pattern_frequencies_two_patterns_per_mi():
     locus = _make_locus_single_run([
         ("10004", "A", "GGGAGGG", 5),  # MI 10004 → pattern A
         ("10007", "A", "GGGTGGG", 5),  # MI 10007 → pattern T
-    ], n_runs=2, ref_inter_anchor_seq="GGGAGGG", reference_run_lengths=(3, 3))
+    ], n_runs=2, reference_tract="GGGAGGG", reference_run_lengths=(3, 3))
     freqs = observed_pattern_frequencies(locus)
     assert freqs == {("A",): 0.5, ("T",): 0.5}
 
@@ -243,7 +247,7 @@ def test_observed_pattern_frequencies_per_mi_majority_resolves_within_mi_mix():
         ("10004", "A", "GGGAGGG", 4),  # majority pattern A
         ("10004", "B", "GGGTGGG", 1),  # minor pattern T within same MI
         ("10007", "A", "GGGTGGG", 3),  # MI 10007 is pure T
-    ], n_runs=2, ref_inter_anchor_seq="GGGAGGG", reference_run_lengths=(3, 3))
+    ], n_runs=2, reference_tract="GGGAGGG", reference_run_lengths=(3, 3))
     freqs = observed_pattern_frequencies(locus)
     # 1 MI assigned to A, 1 to T → each is 0.5 of n_rfs (2 MIs total).
     assert freqs == {("A",): 0.5, ("T",): 0.5}
@@ -258,7 +262,7 @@ def test_observed_pattern_frequencies_robust_to_amplification_bias():
         *[(f"1000{i}", "A", "GGGAGGG", 1) for i in range(5, 14)],
         # MI 99999 is the noisy outlier with pattern T, only 1 read
         ("99999", "A", "GGGTGGG", 1),
-    ], n_runs=2, ref_inter_anchor_seq="GGGAGGG", reference_run_lengths=(3, 3))
+    ], n_runs=2, reference_tract="GGGAGGG", reference_run_lengths=(3, 3))
     freqs = observed_pattern_frequencies(locus)
     # 10 MIs at A, 1 MI at T; despite the 100:1 read ratio, T is still 1/11.
     assert freqs[("A",)] == pytest.approx(10 / 11)
@@ -276,7 +280,7 @@ def test_majority_pattern_per_rf():
         ("10004", "A", "GGGAGGG", 3),
         ("10004", "B", "GGGAGGG", 2),
         ("10007", "A", "GGGTGGG", 1),
-    ], n_runs=2, ref_inter_anchor_seq="GGGAGGG", reference_run_lengths=(3, 3))
+    ], n_runs=2, reference_tract="GGGAGGG", reference_run_lengths=(3, 3))
     maj = majority_pattern_per_rf(locus)
     assert maj == {"10004": ("A",), "10007": ("T",)}
 
@@ -286,7 +290,7 @@ def test_select_patterns_above_freq():
         # 9 MIs at "A" (90% of MIs), 1 MI at "T" (10%)
         *[(f"1000{i}", "A", "GGGAGGG", 1) for i in range(9)],
         ("99999", "A", "GGGTGGG", 1),
-    ], n_runs=2, ref_inter_anchor_seq="GGGAGGG", reference_run_lengths=(3, 3))
+    ], n_runs=2, reference_tract="GGGAGGG", reference_run_lengths=(3, 3))
     # 0.0 keeps all
     assert select_patterns_above_freq(locus, min_freq=0.0) == {("A",), ("T",)}
     # 0.05 keeps both (T is 10%)
@@ -305,7 +309,7 @@ def test_pattern_breakdown_columns_and_values():
         ("10004", "A", "GGGAGGG", 3),      # parsed (3,3) tuple, MI majority "A"
         ("10004", "B", "GGGAGGG", 2),
         ("10007", "A", "GGGGGGGGGGG", 1),  # fused S=1 → tuple None for S=2 locus
-    ], n_runs=2, ref_inter_anchor_seq="GGGAGGG", reference_run_lengths=(3, 3))
+    ], n_runs=2, reference_tract="GGGAGGG", reference_run_lengths=(3, 3))
     df = locus.pattern_breakdown()
     assert list(df.columns) == [
         "mi", "strand", "seq", "count", "pattern", "tuple", "tuple_str",
@@ -394,17 +398,18 @@ def test_locus_column_agrees_between_the_database_and_memory(tmp_path):
     panel = ExtractedPanel(
         loci={
             "L1": _mixed_locus(bed_name="L1"),
-            "L2": _mixed_locus(bed_name="L2", anchorability_status="no_anchor"),
+            "L2": _mixed_locus(bed_name="L2", reference_window_status="unrecoverable"),
         },
         n_alleles=10, provenance=_make_provenance(),
     )
     db = tmp_path / "panel.db"
     panel.save_db(db)
     loaded = ExtractedPanel.load_db(db)
-    for name in ("anchorability_status", "chrom", "n_runs", "reference_run_lengths"):
+    for name in ("reference_window_status", "chrom", "n_runs", "reference_run_lengths",
+                 "upstream_flank"):
         assert loaded.locus_column(name) == panel.locus_column(name)
-    assert loaded.locus_column("anchorability_status") == {
-        "L1": "anchorable", "L2": "no_anchor",
+    assert loaded.locus_column("reference_window_status") == {
+        "L1": "recovered", "L2": "unrecoverable",
     }
     with pytest.raises(ValueError):
         loaded.locus_column("row_blob")

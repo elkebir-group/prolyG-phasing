@@ -11,12 +11,28 @@ from __future__ import annotations
 
 import numpy as np
 
+from prolyg_phasing.io._flank_placement import FlankRecord
 from prolyg_phasing.io.panel import (
+    _FLANK_DROP_COLUMNS,
     EXTRACTION_SCHEMA_VERSION,
     ExtractedLocus,
     ExtractionProvenance,
     parse_run_lengths,
 )
+
+# Flanks of a synthetic "+" locus whose repeat lies on [100, 107).
+UPSTREAM_FLANK = FlankRecord("ACGTACGTAC", tuple(range(90, 100)), 9)
+DOWNSTREAM_FLANK = FlankRecord("TGCATGCATG", tuple(range(107, 117)), 0)
+
+# Every flank-placement drop counter at zero.
+ZERO_FLANK_DROPS = dict.fromkeys(_FLANK_DROP_COLUMNS, 0)
+
+# The flank-table fields of a synthetic provenance.
+FLANK_TABLE_PROVENANCE = {
+    "flank_table_path": "/synthetic/normal_flank_sides.tsv",
+    "flank_table_sha256": "0" * 64,
+    "flank_table_sample": "NORMAL",
+}
 
 
 def _make_provenance() -> ExtractionProvenance:
@@ -28,7 +44,7 @@ def _make_provenance() -> ExtractionProvenance:
         min_mapq=40,
         drop_chimeric=True,
         max_tlen=1000,
-        anchor_hamming_max=1,
+        **FLANK_TABLE_PROVENANCE,
         pair_disagreement_policy="merge_by_quality",
         extraction_schema_version=EXTRACTION_SCHEMA_VERSION,
         n_alleles_margin=1,
@@ -39,16 +55,16 @@ def _make_locus_single_run(
     mi_rows: list[tuple[str, str, str, int]],
     *,
     n_runs: int = 1,
-    ref_inter_anchor_seq: str = "GGGGGGG",
+    reference_tract: str = "GGGGGGG",
     reference_run_lengths: tuple[int, ...] = (7,),
     bed_name: str = "Locus1",
     chrom: str = "chr1",
     bed_start: int = 100,
     bed_end: int = 107,
     ref_orientation: str = "+",
-    upstream_anchor: str = "ACGTACGTAC",
-    downstream_anchor: str = "TGCATGCATG",
-    anchorability_status: str = "anchorable",
+    upstream_flank: FlankRecord = UPSTREAM_FLANK,
+    downstream_flank: FlankRecord = DOWNSTREAM_FLANK,
+    reference_window_status: str = "recovered",
 ) -> ExtractedLocus:
     """Build an ExtractedLocus from a list of (mi, strand, seq, count) tuples."""
     if mi_rows:
@@ -71,18 +87,18 @@ def _make_locus_single_run(
     return ExtractedLocus(
         mi=mi, strand=strand, seq=seq, count=count,
         n_runs=n_runs,
-        ref_inter_anchor_seq=ref_inter_anchor_seq,
+        reference_tract=reference_tract,
         reference_run_lengths=reference_run_lengths,
         chrom=chrom, bed_start=bed_start, bed_end=bed_end, bed_name=bed_name,
         ref_orientation=ref_orientation,
-        upstream_anchor=upstream_anchor, downstream_anchor=downstream_anchor,
-        anchorability_status=anchorability_status,
+        upstream_flank=upstream_flank, downstream_flank=downstream_flank,
+        reference_window_status=reference_window_status,
         max_observed_run_length=max_obs,
         n_alignments_overlap_locus=int(count.sum()) * 2,  # rough placeholder
         n_alignments_drop_mapq=0,
         n_alignments_drop_sa=0,
         n_alignments_drop_tlen=0,
-        n_alignments_drop_anchor=0,
+        **ZERO_FLANK_DROPS,
         n_read_pairs=int(count.sum()),
         n_read_pairs_drop_disagree=0, n_read_pairs_merged=0,
         n_reads=int(count.sum()),

@@ -5,7 +5,7 @@ has to keep is the per-aligned-position one:
 
     for every aligned (query, reference) position pair of the alignment
     whose base quality clears ``min_base_q``, the base at that reference
-    position appears at its canonical distance from the anchor; every
+    position appears at its canonical distance from the flank; every
     other distance reads ``"."``.
 
 `reference_side` below states exactly that, walking pysam's own
@@ -73,19 +73,16 @@ def side_to_map(side) -> dict[int, str]:
     return {start + i: c for i, c in enumerate(bases) if c != "."}
 
 
-def reference_side(r, *, bed_start, bed_end, g_walk_up, g_walk_dn, anchor_k,
-                   ref_orientation, min_base_q):
+def reference_side(r, *, lo, hi, ref_orientation, min_base_q):
     """The per-position contract, walked with pysam's get_aligned_pairs."""
     seq = r.query_sequence.upper()
     quals = r.query_qualities
     up: dict[int, str] = {}
     dn: dict[int, str] = {}
     if ref_orientation == "+":
-        up_bound = bed_start - g_walk_up - anchor_k
-        dn_bound = bed_end + g_walk_dn + anchor_k
+        up_bound, dn_bound = lo, hi
     else:
-        up_bound = bed_end + g_walk_up + anchor_k
-        dn_bound = bed_start - g_walk_dn - anchor_k
+        up_bound, dn_bound = hi, lo
     for qpos, refpos in r.get_aligned_pairs(with_seq=False):
         if qpos is None or refpos is None:
             continue
@@ -176,10 +173,10 @@ def test_alignment_flanking_matches_per_position_contract(
 ):
     bed_start, bed_end = 300, 314
     # Start the alignment well upstream so it straddles the bed and both
-    # anchors, and so both sides get covered.
+    # flanks, and so both sides get covered.
     seg = make_alignment(header, 260, cigar)
-    kw = dict(bed_start=bed_start, bed_end=bed_end, g_walk_up=2, g_walk_dn=1,
-              anchor_k=FLANKING_SEQ_LEN, ref_orientation=ref_orientation, min_base_q=20)
+    kw = dict(lo=bed_start - 2 - FLANKING_SEQ_LEN, hi=bed_end + 1 + FLANKING_SEQ_LEN,
+              ref_orientation=ref_orientation, min_base_q=20)
     up, dn = _alignment_flanking(seg, **kw)
     assert (side_to_map(up), side_to_map(dn)) == reference_side(seg, **kw)
 
@@ -192,8 +189,7 @@ def test_alignment_flanking_masks_sub_threshold_bases(header, ref_orientation):
     for i in range(4, 9):
         quality[i] = "#"
     seg = make_alignment(header, 260, cigar, quality_str="".join(quality))
-    kw = dict(bed_start=300, bed_end=314, g_walk_up=2, g_walk_dn=1,
-              anchor_k=FLANKING_SEQ_LEN, ref_orientation=ref_orientation, min_base_q=20)
+    kw = dict(lo=288, hi=325, ref_orientation=ref_orientation, min_base_q=20)
     up, dn = _alignment_flanking(seg, **kw)
     assert (side_to_map(up), side_to_map(dn)) == reference_side(seg, **kw)
     # The masked positions really are absent, not merely re-ordered.
@@ -209,10 +205,7 @@ def test_alignment_flanking_without_cigar_is_two_empty_sides(header):
     seg.reference_id = 0
     seg.reference_start = 260
     seg.mapping_quality = 60
-    up, dn = _alignment_flanking(
-        seg, bed_start=300, bed_end=314, g_walk_up=0, g_walk_dn=0,
-        anchor_k=FLANKING_SEQ_LEN, ref_orientation="+", min_base_q=20,
-    )
+    up, dn = _alignment_flanking(seg, lo=290, hi=324, ref_orientation="+", min_base_q=20)
     assert (up, dn) == ((0, ""), (0, ""))
 
 
@@ -231,9 +224,8 @@ def test_alignment_flanking_matches_contract_on_random_cigars(header, seed):
             seq="".join(rng.choice("ACGTNacgtn") for _ in range(query_len)),
             quality_str="".join(chr(33 + rng.randint(0, 41)) for _ in range(query_len)),
         )
-        kw = dict(bed_start=300, bed_end=300 + rng.randint(1, 20),
-                  g_walk_up=rng.randint(0, 5), g_walk_dn=rng.randint(0, 5),
-                  anchor_k=FLANKING_SEQ_LEN,
+        lo = 300 - rng.randint(0, 5) - FLANKING_SEQ_LEN
+        kw = dict(lo=lo, hi=300 + rng.randint(1, 20) + rng.randint(0, 5) + FLANKING_SEQ_LEN,
                   ref_orientation=rng.choice(["+", "-"]),
                   min_base_q=rng.choice([0, 20, 40]))
         up, dn = _alignment_flanking(seg, **kw)

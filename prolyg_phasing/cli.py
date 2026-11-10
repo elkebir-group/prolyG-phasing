@@ -36,11 +36,13 @@ _EXTRACT_DESCRIPTION = """\
 Walk a sorted, indexed BAM against a BED panel and write the extracted
 panel to a panel.db (SQLite) file.
 
-Two passes per locus: (1) reconstruct the reference window from MD tags,
-determine polyG-canonical orientation, and try to build upstream +
-downstream anchors; (2) if anchorable, fetch alignments overlapping the
-BED interval, apply the QC filters below, pair-collapse R1+R2 by read
-name, and emit per-(molecule, strand, sequence) read counts.
+Every sample of a donor, the tumor included, is read with the flanks of
+the donor's matched normal (--flanks, written by build-flanks). Two steps
+per locus: (1) reconstruct the reference window from MD tags, determine
+polyG-canonical orientation, and check both flanks against it; (2) fetch
+alignments overlapping the BED interval, apply the QC filters below,
+place both flanks in each read, pair-collapse R1+R2 by read name, and
+emit per-(molecule, strand, sequence) read counts.
 
 The BAM must carry MD tags (reference reconstruction) and MI tags (one
 per molecule/UMI family — required for every family-level count and
@@ -53,6 +55,10 @@ def _add_extract_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--bed", required=True, type=Path,
                     help="4-column BED panel: chrom, start, end, name — "
                          "one row per polyG locus to extract.")
+    p.add_argument("--flanks", required=True, type=Path,
+                    help="The {out_prefix}_flank_sides.tsv that build-flanks "
+                         "wrote for this donor's matched normal. It must hold "
+                         "exactly the loci of the BED.")
     p.add_argument("--out-db", required=True, type=Path,
                     help="Path to write the panel.db (SQLite) runtime "
                          "artifact. Parent directory is not created.")
@@ -64,10 +70,6 @@ def _add_extract_args(p: argparse.ArgumentParser) -> None:
                          "dropping them.")
     p.add_argument("--max-tlen", type=int, default=1000,
                     help="Drop alignments with |TLEN| greater than this.")
-    p.add_argument("--anchor-hamming-max", type=int, default=1,
-                    help="Maximum Hamming distance allowed when placing "
-                         "the upstream/downstream anchor sequence in a "
-                         "read; a placement past this is rejected.")
     p.add_argument("--n-alleles-margin", type=int, default=1,
                     help="Headroom added over the panel-wide max observed "
                          "run length when sizing the allele-count axis "
@@ -85,10 +87,10 @@ def _run_extract(args: argparse.Namespace) -> None:
     panel = extract_panel(
         bam_path=args.bam,
         bed_path=args.bed,
+        flanks_path=args.flanks,
         min_mapq=args.min_mapq,
         drop_chimeric=args.drop_chimeric,
         max_tlen=args.max_tlen,
-        anchor_hamming_max=args.anchor_hamming_max,
         n_alleles_margin=args.n_alleles_margin,
         min_base_q=args.min_flanking_base_q,
         verbose=args.verbose,
