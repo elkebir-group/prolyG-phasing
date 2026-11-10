@@ -1,4 +1,5 @@
-"""Command-line entry point: ``prolyg-phasing extract`` / ``phase`` / ``ref-phase``.
+"""Command-line entry point: ``prolyg-phasing extract`` / ``build-flanks`` / ``phase`` /
+``ref-phase``.
 
 Thin argparse wrappers, one per stage. Run directly against one BAM (or one
 already-extracted ``panel.db``), or drive ``extract``/``phase`` over many
@@ -14,6 +15,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from prolyg_phasing.io._flank_construction import (
+    build_flanks,
+    worker_count,
+    write_flank_tables,
+)
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import ExtractedPanel
 from prolyg_phasing.io.phasing_tables import (
@@ -89,6 +95,40 @@ def _run_extract(args: argparse.Namespace) -> None:
     )
     panel.save_db(args.out_db)
     print(f"wrote {args.out_db} ({len(panel.loci)} loci)")
+
+
+_BUILD_FLANKS_DESCRIPTION = """\
+Build one flank per locus side from a matched normal BAM, and write three
+files: {out_prefix}_flank_candidates.tsv (one row per candidate base),
+{out_prefix}_flank_sides.tsv (one row per locus side; the flank records
+that extraction reads) and {out_prefix}_error_rate.json (the error rate e).
+
+At each locus side, the candidates are the non-G reference bases next to
+the repeat. Each one is called "read error" or "G in the donor" from the
+share of the normal's reads that show a G there. The flank starts at the
+first candidate called read error. The read filters are the extraction's
+defaults. Loci run in parallel; the worker count comes from the free cores
+and memory of this machine."""
+
+
+def _add_build_flanks_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--bam", required=True, type=Path,
+                    help="Matched normal BAM, sorted and indexed, with MD and MI tags.")
+    p.add_argument("--bed", required=True, type=Path,
+                    help="4-column BED panel: chrom, start, end, name.")
+    p.add_argument("--out-prefix", required=True, type=Path,
+                    help="Path prefix of the three output files. The parent "
+                         "directory is not created.")
+
+
+def _run_build_flanks(args: argparse.Namespace) -> None:
+    n_workers = worker_count()
+    result = build_flanks(args.bam, args.bed, n_workers=n_workers)
+    paths = write_flank_tables(result, args.out_prefix)
+    er = result.error_rate
+    print(f"e = {er.e:.4e} ({er.x}/{er.n} at {er.n_positions} positions); "
+          f"{len(result.records)} loci; {n_workers} workers; wrote "
+          + ", ".join(str(p) for p in paths))
 
 
 _PHASE_DESCRIPTION = """\
@@ -288,6 +328,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     _add_extract_args(extract_p)
     extract_p.set_defaults(func=_run_extract)
+
+    build_flanks_p = sub.add_parser(
+        "build-flanks",
+        help="Build per-side flank records from a matched normal BAM.",
+        description=_BUILD_FLANKS_DESCRIPTION,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    _add_build_flanks_args(build_flanks_p)
+    build_flanks_p.set_defaults(func=_run_build_flanks)
 
     phase_p = sub.add_parser(
         "phase",
