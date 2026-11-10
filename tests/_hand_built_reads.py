@@ -217,7 +217,8 @@ def build_cases() -> list[ReadCase]:
     # Deleted edge base: reference CC G10, reads C G6; flank at the outer C.
     c.append(_case("deleted_edge_base", "PolyG454: reads C G6", "PolyG454",
                    k_up=1, tract=G * 6))
-    # A read error shows a G at the edge base of an invariant side: the read is dropped, not lengthened.
+    # A read error shows a G at the edge base of an invariant side:
+    # the read is dropped, not lengthened.
     c.append(_case("false_g_invariant", "PolyG151: G at the edge T", "PolyG151",
                    up_ctx=_up("PolyG151")[:-1] + "G",
                    tract=G * 12, drop_reason="g_at_run_side", true_tract=None))
