@@ -616,3 +616,40 @@ def flank_edit_distance(flank: str, read: str, run_side_index: int, *, upstream:
             cur[j] = min(prev[j - 1] + sub, prev[j] + 1, cur[j - 1] + 1)
         prev = cur
     return min(prev)
+
+
+def flank_mismatches(flank: str, read: str, run_side_index: int, *, upstream: bool,
+                     masked: tuple[int, ...] = ()) -> int:
+    """Mismatches of the gapless placement; a flank base past the read end is one."""
+    k = len(flank)
+    n = 0
+    for offset in range(k):
+        if offset == (k - 1 if upstream else 0) or offset in masked:
+            continue
+        i = run_side_index - (k - 1 - offset) if upstream else run_side_index + offset
+        if not 0 <= i < len(read) or read[i] != flank[offset]:
+            n += 1
+    return n
+
+
+# Costs of the weighted flank match: one mismatch, one 1-base indel, and two
+# or more edits.
+MISMATCH_COST, INDEL_COST, TWO_OR_MORE_EDITS = 1, 2, 3
+
+
+def flank_edit_cost(flank: str, read: str, run_side_index: int, *, upstream: bool,
+                    masked: tuple[int, ...] = ()) -> int:
+    """Weighted cost of the flank placement, from the plain DP edit distance.
+
+    No edit costs 0, one mismatch 1, one 1-base indel 2, and two or more
+    edits 3. The reference for the kernel's band-1 search.
+    """
+    distance = flank_edit_distance(flank, read, run_side_index, upstream=upstream,
+                                   masked=masked)
+    if distance == 0:
+        return 0
+    if distance > 1:
+        return TWO_OR_MORE_EDITS
+    if flank_mismatches(flank, read, run_side_index, upstream=upstream, masked=masked) == 1:
+        return MISMATCH_COST
+    return INDEL_COST

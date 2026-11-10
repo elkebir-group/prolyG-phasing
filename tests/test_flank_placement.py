@@ -42,6 +42,7 @@ from tests._hand_built_reads import (
     all_records,
     build_cases,
     chromosome,
+    flank_edit_cost,
     flank_edit_distance,
     placements,
     run_stutter_with_flank_error_cases,
@@ -69,7 +70,7 @@ EXPECTED_PATHS: dict[str, set[str]] = {
     "tgg_flank_missing_copy": {"fast"},
     "tandem_copy_flank": {"fast"},
     "post_run_deletion": {"fast", "cigar", "local"},
-    "post_run_insertion": {"fast", "cigar", "local"},
+    "post_run_insertion": {"fast", "local"},
     "post_run_deletion_aa": {"fast", "cigar", "local"},
     "pre_run_deletion": {"fast", "cigar", "local"},
     "snv_in_flank": {"fast", "local"},
@@ -83,7 +84,7 @@ EXPECTED_PATHS: dict[str, set[str]] = {
     "near_end_downstream": {"fast", "local"},
     "near_end_upstream": {"fast", "local"},
     "boundary_t_deletion": {"fast", "local"},
-    "boundary_t_insertion": {"fast", "cigar", "local"},
+    "boundary_t_insertion": {"fast", "local"},
     "tgg_flank_substitution": {"fast", "local"},
     "tandem_copy_error_in_near_copy": {"fast", "local"},
     "soft_clip_in_flank": {"fast", "local"},
@@ -104,18 +105,22 @@ DROP_REASON_BY_FORM: dict[str, dict[str, str]] = {
     },
 }
 
-# Reads that are ambiguous by construction. Each read string also comes,
-# with no error, from a molecule with another tuple, so no rule that reads
-# the string can recover the molecule the read was built from. The kernel
-# puts the extra or missing base in the flank, and these are the tuples
-# that gives.
+# Reads whose string also comes, with no error or with one flank error
+# fewer, from a molecule with another tuple, so no rule that reads the
+# string can recover the molecule the read was built from. The kernel puts
+# a missing copy of the run-side base in the flank, and an extra non-G base
+# after the run in the tract, as a boundary zero run: a flank indel costs
+# twice a mismatch. These are the tuples that gives.
 ASSIGNED_TUPLE: dict[str, tuple[int, ...]] = {
     # Reference allele T T G10 with one T deleted reads as T G10, which is
     # also a molecule with the edge T deleted.
     "boundary_t_deletion": (10,),
     # G14 with a T inserted after the run reads as G14 T T..., which is also
     # a molecule with a T interrupter at the end of the tract.
-    "boundary_t_insertion": (14,),
+    "boundary_t_insertion": (14, 0),
+    # G14 with a C inserted in CCC reads as G14 T CCCC..., which is also a
+    # molecule with a T at the end of the tract and a C run-side base.
+    "post_run_insertion": (14, 0),
 }
 
 
@@ -304,9 +309,41 @@ def test_band1_search_matches_the_reference_exhaustively():
                 flank, [r for r, _ in rows], np.array([b for _, b in rows]),
                 upstream=upstream, masked_offsets=(),
             )
-            want = [min(flank_edit_distance(flank, r, b, upstream=upstream), 2)
-                    for r, b in rows]
-            assert list(np.minimum(got, 2)) == want
+            want = [flank_edit_cost(flank, r, b, upstream=upstream) for r, b in rows]
+            assert list(got) == want
+
+
+def test_one_edit_limit_on_random_placements():
+    """One mismatch or one 1-base indel is admitted; two edits of any kind never are.
+
+    12,000 placements of a 10-base flank with 0 to 2 random edits, checked
+    against the plain DP edit distance.
+    """
+    rng = random.Random(3)
+    admitted = rejected = 0
+    for _ in range(300):
+        flank = "".join(rng.choice("ACGT") for _ in range(FLANK_LEN))
+        reads = []
+        for _ in range(40):
+            read = list(flank)
+            for _ in range(rng.randrange(3)):
+                i = rng.randrange(len(read))
+                kind = rng.randrange(3)
+                if kind == 0:
+                    read[i] = rng.choice("ACGT")
+                elif kind == 1:
+                    del read[i]
+                else:
+                    read.insert(i, rng.choice("ACGT"))
+            reads.append("AAAAA" + "".join(read) + "CCCCC")
+        run_side = np.array([len(r) - 6 for r in reads])
+        got = banded_flank_distance(flank, reads, run_side, upstream=True, masked_offsets=())
+        for read, b, cost in zip(reads, run_side, got.tolist(), strict=True):
+            one_edit = flank_edit_distance(flank, read, int(b), upstream=True) <= 1
+            assert (cost < flank_placement._FAR) == one_edit
+            admitted += one_edit
+            rejected += not one_edit
+    assert admitted > 1000 and rejected > 1000
 
 
 def test_band1_search_matches_the_reference_on_random_reads():
@@ -334,10 +371,9 @@ def test_band1_search_matches_the_reference_on_random_reads():
             run_side = np.array([len(r) - 6 if upstream else 5 for r in reads])
             got = banded_flank_distance(flank, reads, run_side, upstream=upstream,
                                         masked_offsets=masked)
-            want = [min(flank_edit_distance(flank, r, int(b), upstream=upstream,
-                                            masked=masked), 2)
+            want = [flank_edit_cost(flank, r, int(b), upstream=upstream, masked=masked)
                     for r, b in zip(reads, run_side, strict=True)]
-            assert list(np.minimum(got, 2)) == want
+            assert list(got) == want
 
 
 def test_every_path_is_used_on_both_sides():
@@ -666,11 +702,6 @@ def _accepted_outcomes(case: ReadCase) -> set:
     return outcomes
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "The kernel gives the run one base more than the mate does: the projection "
-    "bonus keeps the aligner's choice between two placements with one flank edit "
-    "each, and the non-G tie-break reads a G at the run-side base as a deleted "
-    "flank base."))
 @pytest.mark.parametrize("case", STUTTER_CASES, ids=[c.case_id for c in STUTTER_CASES])
 @pytest.mark.parametrize("orientation", ["+", "-"])
 def test_run_stutter_with_a_flank_error_gives_the_mate_tuple(case: ReadCase, orientation):

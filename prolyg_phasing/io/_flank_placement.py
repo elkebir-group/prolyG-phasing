@@ -16,11 +16,13 @@ The rule that places one flank in one read:
 2. Project the flank's run-side base through that alignment onto the read.
    Into a soft clip, extend the projection linearly.
 3. Score each read position within `_LOCAL_WINDOW` bases of the projection
-   as a run-side position. The score is the number of flank edits there
-   plus 1 if the position is not the projection. Flank edits are counted
-   by a banded edit distance with band 1 over the other nine flank bases.
-   A masked flank position matches any base. The run-side base itself is
-   not counted. Only positions with at most one flank edit are kept.
+   as a run-side position. The score is the cost of the flank edit there
+   plus 1 if the position is not the projection. A flank mismatch costs
+   `_MISMATCH_COST` (1) and a 1-base flank indel costs `_INDEL_COST` (2).
+   The edit is found by a banded edit distance with band 1 over the other
+   nine flank bases. A masked flank position matches any base. The
+   run-side base itself is not counted. Only positions with at most one
+   flank edit, one mismatch or one 1-base indel, are kept.
 4. The lowest score wins. On a tie, a non-G run-side base wins over a G.
    On a further tie, the position nearest the run wins.
 5. If the winning run-side base is a G, the side drops as
@@ -36,8 +38,9 @@ The projection costs nothing extra when it is exact, so the rule reports
 three paths. "fast": the alignment covers the flank with M operations and
 the read equals the flank at every unmasked position. "cigar": the
 alignment has an indel inside the flank, and the projection wins. "local":
-any other placement. A fast placement has score 0, and no other position
-can score 0, so a fast read needs no window search.
+any other placement. A fast placement has score 0. Every other position
+pays 1 for leaving the projection, so no other position can score 0, and a
+fast read needs no window search.
 
 The CIGARs of a block of reads are walked once for both sides, as arrays
 over the whole block. A read whose CIGAR is one M operation has no indel to
@@ -45,9 +48,12 @@ move, and its projection is the run-side position minus the alignment
 start. A read with one indel moves it over the whole block; only a read
 with more than one indel moves them one read at a time.
 
-A read that carries an extra or a missing copy of the run-side base next
-to the run is the same string as a read from a molecule where that base
-belongs to the tract. The rule puts the extra or missing base in the flank.
+A read with an extra non-G base right after the run, or with a missing copy
+of the run-side base next to the run, is the same string as a read from a
+molecule with another tract. Read as the run-side base, an extra base
+scores 1 for leaving the projection; read as a flank insertion, it scores
+2. So an extra base goes to the tract, as a boundary zero run. A missing
+copy of the run-side base goes to the flank.
 """
 
 from __future__ import annotations
@@ -67,8 +73,18 @@ from prolyg_phasing.io._anchors import COMP, revcomp
 # that the aligner shows as mismatches or a soft clip instead of a gap.
 _LOCAL_WINDOW = 8
 
-# Distances above one edit are not told apart.
-_FAR = 2
+# Cost of one flank mismatch in the window score. Substitutions outnumber
+# small indels in Illumina reads outside homopolymers.
+_MISMATCH_COST = 1
+
+# Cost of one 1-base flank indel in the window score; twice a mismatch,
+# since substitutions outnumber small indels in Illumina reads outside
+# homopolymers.
+_INDEL_COST = 2
+
+# The cost of a placement with two or more flank edits. It is above every
+# allowed cost, so such a placement never wins.
+_FAR = _INDEL_COST + 1
 
 _G = ord("G")
 
@@ -282,8 +298,9 @@ def _banded_distance(matrix: np.ndarray, lengths: np.ndarray, rows: np.ndarray,
     """Band-1 distance of `pattern` placed next to `run_side` in each of `rows`.
 
     The pattern starts next to the run-side base and runs outward; its outer
-    end is free in the read. Returns 0, 1, or `_FAR` for two or more edits.
-    A run-side index outside the read scores `_FAR`.
+    end is free in the read. Returns 0 for no edit, `_MISMATCH_COST` for one
+    mismatch, `_INDEL_COST` for one 1-base indel, and `_FAR` for two or more
+    edits. A run-side index outside the read scores `_FAR`.
     """
     n = len(pattern)
     m = len(rows)
@@ -313,7 +330,8 @@ def _banded_distance(matrix: np.ndarray, lengths: np.ndarray, rows: np.ndarray,
     mismatches = n - eq0.sum(axis=1)
 
     dist = np.where(mismatches == 0, 0,
-                    np.where((mismatches == 1) | deletion | insertion, 1, _FAR))
+                    np.where(mismatches == 1, _MISMATCH_COST,
+                             np.where(deletion | insertion, _INDEL_COST, _FAR)))
     inside = (run_side >= 0) & (run_side < lengths[rows])
     return np.where(inside, dist, _FAR).astype(np.int64)
 
@@ -323,8 +341,8 @@ def _exact_match(matrix: np.ndarray, lengths: np.ndarray, rows: np.ndarray,
                  upstream: bool) -> np.ndarray:
     """Whether the read equals `pattern` at every unmasked flank position.
 
-    For a flank inside the read this is a band-1 distance of 0, without
-    the indel terms.
+    For a flank inside the read this is a band-1 cost of 0, without the
+    indel terms.
     """
     if len(rows) == 0:
         return np.zeros(0, dtype=bool)
@@ -334,11 +352,12 @@ def _exact_match(matrix: np.ndarray, lengths: np.ndarray, rows: np.ndarray,
 
 def banded_flank_distance(flank: str, reads: Sequence[str], run_side_indices: np.ndarray,
                           *, upstream: bool, masked_offsets: Sequence[int]) -> np.ndarray:
-    """Flank edits when the flank's run-side base sits on ``reads[i][run_side_indices[i]]``.
+    """Flank edit cost when the flank's run-side base sits on ``reads[i][run_side_indices[i]]``.
 
     The run-side base is not counted. The other flank bases align to the
     read bases on the far side of it, with the outer end free, by edit
-    distance with band 1. A masked offset matches any base.
+    distance with band 1. A masked offset matches any base. One mismatch
+    costs `_MISMATCH_COST` and one 1-base indel `_INDEL_COST`.
 
     Parameters
     ----------
@@ -357,7 +376,8 @@ def banded_flank_distance(flank: str, reads: Sequence[str], run_side_indices: np
     Returns
     -------
     ndarray of int64
-        0 or 1 edits, or 2 for two or more.
+        0 for no edit, 1 for one mismatch, 2 for one 1-base indel, and 3
+        (`_FAR`) for two or more edits.
     """
     if not len(reads):
         return np.zeros(0, dtype=np.int64)
@@ -793,7 +813,7 @@ def _place_side(matrix: np.ndarray, lengths: np.ndarray, flank: FlankRecord,
     # than one flank edit cannot win.
     span = 2 * (window_len + int(lengths.max()) + 2 * _LOCAL_WINDOW + 4)
     key = (score * 2 + is_g) * span - (nearness - nearness.min())
-    key = np.where(dist <= 1, key, np.iinfo(np.int64).max)
+    key = np.where(dist < _FAR, key, np.iinfo(np.int64).max)
     key = key.reshape(rest.size, width)
     best = key.argmin(axis=1)
     pick = np.arange(rest.size)
