@@ -4,7 +4,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from prolyg_phasing.io.panel import ExtractedLocus, ExtractedPanel, ExtractionProvenance
+from prolyg_phasing.io.panel import (
+    EXTRACTION_SCHEMA_VERSION,
+    ExtractedLocus,
+    ExtractedPanel,
+    ExtractionProvenance,
+)
 from prolyg_phasing.io.phasing_tables import (
     build_haplotype_calls,
     build_locus_summary,
@@ -12,6 +17,12 @@ from prolyg_phasing.io.phasing_tables import (
     haplotypes_from_snv_calls_table,
 )
 from prolyg_phasing.phasing import PhasingPanel
+from tests._panel_fixtures import (
+    DOWNSTREAM_FLANK,
+    FLANK_TABLE_PROVENANCE,
+    UPSTREAM_FLANK,
+    ZERO_FLANK_DROPS,
+)
 
 
 def _make_provenance() -> ExtractionProvenance:
@@ -23,10 +34,10 @@ def _make_provenance() -> ExtractionProvenance:
         min_mapq=40,
         drop_chimeric=True,
         max_tlen=1000,
-        anchor_hamming_max=1,
-        pair_disagreement_policy="drop",
+        **FLANK_TABLE_PROVENANCE,
+        pair_disagreement_policy="merge_by_quality",
+        extraction_schema_version=EXTRACTION_SCHEMA_VERSION,
         n_alleles_margin=1,
-        extraction_schema_version="2",
     )
 
 
@@ -62,16 +73,16 @@ def _make_locus(
 
     return ExtractedLocus(
         mi=mi, strand=strand, seq=seq, count=count,
-        n_runs=1, ref_inter_anchor_seq="GGGGGG", reference_run_lengths=(6,),
+        n_runs=1, reference_tract="GGGGGG", reference_run_lengths=(6,),
         chrom="chr1", bed_start=100, bed_end=106, bed_name="LocusX",
         ref_orientation="+",
-        upstream_anchor="ACGTACGTAC", downstream_anchor="TGCATGCATG",
-        anchorability_status="anchorable",
+        upstream_flank=UPSTREAM_FLANK, downstream_flank=DOWNSTREAM_FLANK,
+        reference_window_status="recovered",
         max_observed_run_length=6,
         n_alignments_overlap_locus=total * 2,
         n_alignments_drop_mapq=0, n_alignments_drop_sa=0,
-        n_alignments_drop_tlen=0, n_alignments_drop_anchor=0,
-        n_read_pairs=total, n_read_pairs_drop_disagree=0, n_reads=total,
+        n_alignments_drop_tlen=0, **ZERO_FLANK_DROPS,
+        n_read_pairs=total, n_read_pairs_drop_disagree=0, n_read_pairs_merged=0, n_reads=total,
         flanking_id=flanking_id, flanking_seq=flanking_seq,
         flanking_up_width=up_width, flanking_dn_width=dn_width,
         flanking_up_ref_pos_start=1000, flanking_dn_ref_pos_start=2000,

@@ -1,4 +1,5 @@
-"""Command-line entry point: ``prolyg-phasing extract`` / ``phase`` / ``ref-phase``.
+"""Command-line entry point: ``prolyg-phasing extract`` / ``build-flanks`` / ``phase`` /
+``ref-phase``.
 
 Thin argparse wrappers, one per stage. Run directly against one BAM (or one
 already-extracted ``panel.db``), or drive ``extract``/``phase`` over many
@@ -14,6 +15,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from prolyg_phasing.io._flank_construction import (
+    build_flanks,
+    worker_count,
+    write_flank_tables,
+)
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import ExtractedPanel
 from prolyg_phasing.io.phasing_tables import (
@@ -30,11 +36,13 @@ _EXTRACT_DESCRIPTION = """\
 Walk a sorted, indexed BAM against a BED panel and write the extracted
 panel to a panel.db (SQLite) file.
 
-Two passes per locus: (1) reconstruct the reference window from MD tags,
-determine polyG-canonical orientation, and try to build upstream +
-downstream anchors; (2) if anchorable, fetch alignments overlapping the
-BED interval, apply the QC filters below, pair-collapse R1+R2 by read
-name, and emit per-(molecule, strand, sequence) read counts.
+Every sample of a donor, the tumor included, is read with the flanks of
+the donor's matched normal (--flanks, written by build-flanks). Two steps
+per locus: (1) reconstruct the reference window from MD tags, determine
+polyG-canonical orientation, and check both flanks against it; (2) fetch
+alignments overlapping the BED interval, apply the QC filters below,
+place both flanks in each read, pair-collapse R1+R2 by read name, and
+emit per-(molecule, strand, sequence) read counts.
 
 The BAM must carry MD tags (reference reconstruction) and MI tags (one
 per molecule/UMI family — required for every family-level count and
@@ -47,6 +55,10 @@ def _add_extract_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--bed", required=True, type=Path,
                     help="4-column BED panel: chrom, start, end, name — "
                          "one row per polyG locus to extract.")
+    p.add_argument("--flanks", required=True, type=Path,
+                    help="The {out_prefix}_flank_sides.tsv that build-flanks "
+                         "wrote for this donor's matched normal. It must hold "
+                         "exactly the loci of the BED.")
     p.add_argument("--out-db", required=True, type=Path,
                     help="Path to write the panel.db (SQLite) runtime "
                          "artifact. Parent directory is not created.")
@@ -58,16 +70,6 @@ def _add_extract_args(p: argparse.ArgumentParser) -> None:
                          "dropping them.")
     p.add_argument("--max-tlen", type=int, default=1000,
                     help="Drop alignments with |TLEN| greater than this.")
-    p.add_argument("--anchor-hamming-max", type=int, default=1,
-                    help="Maximum Hamming distance allowed when placing "
-                         "the upstream/downstream anchor sequence in a "
-                         "read; a placement past this is rejected.")
-    p.add_argument("--pair-disagreement-policy", default="drop",
-                    choices=["drop"],
-                    help="What to do when a read pair's R1 and R2 report "
-                         "different inter-anchor sequence. Only 'drop' "
-                         "(discard the pair, count it in "
-                         "n_read_pairs_drop_disagree) is implemented.")
     p.add_argument("--n-alleles-margin", type=int, default=1,
                     help="Headroom added over the panel-wide max observed "
                          "run length when sizing the allele-count axis "
@@ -85,17 +87,61 @@ def _run_extract(args: argparse.Namespace) -> None:
     panel = extract_panel(
         bam_path=args.bam,
         bed_path=args.bed,
+        flanks_path=args.flanks,
         min_mapq=args.min_mapq,
         drop_chimeric=args.drop_chimeric,
         max_tlen=args.max_tlen,
-        anchor_hamming_max=args.anchor_hamming_max,
-        pair_disagreement_policy=args.pair_disagreement_policy,
         n_alleles_margin=args.n_alleles_margin,
         min_base_q=args.min_flanking_base_q,
         verbose=args.verbose,
     )
     panel.save_db(args.out_db)
     print(f"wrote {args.out_db} ({len(panel.loci)} loci)")
+
+
+_BUILD_FLANKS_DESCRIPTION = """\
+Build one flank per locus side from a matched normal BAM, and write three
+files: {out_prefix}_flank_candidates.tsv (one row per candidate base),
+{out_prefix}_flank_sides.tsv (one row per locus side; the flank records
+that extraction reads) and {out_prefix}_error_rate.json (the error rate e).
+
+At each locus side, the candidates are the non-G reference bases next to
+the repeat. Each one is called "read error" or "G in the donor" from the
+share of the normal's reads that show a G there. The flank starts at the
+first candidate called read error. The read filters are the extraction's
+defaults. Loci run in parallel; the worker count comes from the free cores
+and memory of this machine.
+
+Each BED locus side gets a row in the side TSV. A locus whose reference
+window no read rebuilds has the status ref_window_unrecoverable on both
+sides and no flank; extraction records it with that status and no reads.
+
+Each output names the sample. The name is the BAM's read-group SM; give
+--sample only for a BAM with no SM."""
+
+
+def _add_build_flanks_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--bam", required=True, type=Path,
+                    help="Matched normal BAM, sorted and indexed, with MD and MI tags.")
+    p.add_argument("--bed", required=True, type=Path,
+                    help="4-column BED panel: chrom, start, end, name.")
+    p.add_argument("--out-prefix", required=True, type=Path,
+                    help="Path prefix of the three output files. The parent "
+                         "directory is not created.")
+    p.add_argument("--sample", default=None,
+                    help="Sample name to write into the outputs. Required when "
+                         "the BAM has no read-group SM; when it has one, it "
+                         "must equal it.")
+
+
+def _run_build_flanks(args: argparse.Namespace) -> None:
+    n_workers = worker_count()
+    result = build_flanks(args.bam, args.bed, n_workers=n_workers, sample=args.sample)
+    paths = write_flank_tables(result, args.out_prefix)
+    er = result.error_rate
+    print(f"{result.sample}: e = {er.e:.4e} ({er.x}/{er.n} at {er.n_positions} positions); "
+          f"{len(result.records)} loci; {n_workers} workers; wrote "
+          + ", ".join(str(p) for p in paths))
 
 
 _PHASE_DESCRIPTION = """\
@@ -295,6 +341,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     _add_extract_args(extract_p)
     extract_p.set_defaults(func=_run_extract)
+
+    build_flanks_p = sub.add_parser(
+        "build-flanks",
+        help="Build per-side flank records from a matched normal BAM.",
+        description=_BUILD_FLANKS_DESCRIPTION,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    _add_build_flanks_args(build_flanks_p)
+    build_flanks_p.set_defaults(func=_run_build_flanks)
 
     phase_p = sub.add_parser(
         "phase",

@@ -3,7 +3,8 @@
 Builds a tiny in-memory BAM with controlled reads at one or two loci,
 then runs `extract_panel` and verifies:
 
-- anchor construction off MD tags
+- the reference window off MD tags, read with the flanks that
+  `build_flanks` builds from a matched-normal BAM of the same fixture
 - alignment filters (MAPQ, SA, TLEN)
 - pair-collapse (R1+R2 agree → 1 read, disagree → drop)
 - per-locus QC counters
@@ -17,11 +18,15 @@ extraction feeding it cleanly is covered from prolyG's side —
 
 from __future__ import annotations
 
+import hashlib
+import sys
 from pathlib import Path
 
 import pysam
 import pytest
 
+import prolyg_phasing.io._flank_construction as fc
+from prolyg_phasing.io._anchors import revcomp
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import ExtractedPanel
 
@@ -32,7 +37,7 @@ from prolyg_phasing.io.panel import ExtractedPanel
 
 # A 200-bp synthetic reference, single chromosome. Bases 60..73 (inclusive
 # half-open 60..74) carry the polyG region we'll target with the BED;
-# anchored by ACGTACGTAC upstream (50..60) and TGCATGCATG downstream (74..84).
+# flanked by ACGTACGTAC upstream (50..60) and TGCATGCATG downstream (74..84).
 # Reference structure: ACGTACGTAC GGGGGGGAGGGGGG TGCATGCATG
 #  - pre-polyG context (50..60):   ACGTACGTAC
 #  - polyG region (60..74):         GGGGGGGAGGGGGG  (S=2, runs (7, 6))
@@ -45,11 +50,12 @@ REFERENCE = (
     + ("A" * (200 - 50 - 10 - 14 - 10))
 )
 assert len(REFERENCE) == 200
-# Expected anchors built by the walker:
-# - upstream walk left from pos 60 through Gs: 0 steps; pos 59 is 'C'.
-#   Anchor ends at 59, 10 bp upstream = positions 50..60 = "ACGTACGTAC".
-# - downstream walk right from pos 74 through Gs: 0 steps; pos 74 is 'T'.
-#   Anchor starts at 74, 10 bp = positions 74..84 = "TGCATGCATG".
+# Expected flanks from the fixture's matched normal, which carries the
+# reference at every read:
+# - upstream: pos 59 ('C') is the edge base and is called read error, so
+#   the flank is positions 50..60 = "ACGTACGTAC".
+# - downstream: pos 74 ('T') is the edge base, so the flank is positions
+#   74..84 = "TGCATGCATG".
 
 CHROM = "synth"
 BED_START = 60
@@ -91,6 +97,7 @@ def _add_read(
     tlen: int = 200,
     has_sa: bool = False,
     quality_str: str | None = None,
+    no_qualities: bool = False,
 ) -> None:
     """Add one synthetic alignment to a pysam.AlignmentFile open for writing.
 
@@ -103,7 +110,8 @@ def _add_read(
     if quality_str is None:
         quality_str = "I" * len(read_seq)
     assert len(quality_str) == len(read_seq), "quality_str must match read length"
-    seg.query_qualities = pysam.qualitystring_to_array(quality_str)
+    if not no_qualities:
+        seg.query_qualities = pysam.qualitystring_to_array(quality_str)
     seg.flag = 0
     if not is_read1:
         seg.is_read2 = True
@@ -132,14 +140,14 @@ def _add_read(
     bam.write(seg)
 
 
-def _make_test_bam(tmp_path: Path, reads: list[dict]) -> Path:
-    """Create a sorted, indexed BAM at tmp_path/test.bam with the given reads."""
-    bam_path = tmp_path / "test.bam"
+def _make_test_bam(tmp_path: Path, reads: list[dict], name: str = "test") -> Path:
+    """Create a sorted, indexed BAM at tmp_path/{name}.bam with the given reads."""
+    bam_path = tmp_path / f"{name}.bam"
     header = {
         "HD": {"VN": "1.6", "SO": "coordinate"},
         "SQ": [{"SN": CHROM, "LN": len(REFERENCE)}],
     }
-    unsorted = tmp_path / "test.unsorted.bam"
+    unsorted = tmp_path / f"{name}.unsorted.bam"
     with pysam.AlignmentFile(str(unsorted), "wb", header=header) as bam:
         for r in reads:
             _add_read(bam, **r)
@@ -147,6 +155,42 @@ def _make_test_bam(tmp_path: Path, reads: list[dict]) -> Path:
     pysam.sort("-o", str(bam_path), str(unsorted))
     pysam.index(str(bam_path))
     return bam_path
+
+
+# Read pairs of the reference molecule in the fixture's matched normal: at
+# least the 20 reads the error rate needs at each pooled candidate.
+_NORMAL_PAIRS = 15
+
+_FLANK_TABLES: dict[str, Path] = {}
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _flank_table_dir(tmp_path_factory):
+    _FLANK_TABLES.clear()
+    _FLANK_TABLES["dir"] = tmp_path_factory.mktemp("normal")
+    yield
+    _FLANK_TABLES.clear()
+
+
+def _flank_table() -> Path:
+    """The side TSV that `build_flanks` writes for the fixture's matched normal.
+
+    The normal carries the current `REFERENCE` in every read. One table is
+    built per reference.
+    """
+    key = hashlib.sha256(REFERENCE.encode()).hexdigest()[:12]
+    if key not in _FLANK_TABLES:
+        out = _FLANK_TABLES["dir"] / key
+        out.mkdir()
+        seq, rs = _canonical_read_seq(REFERENCE[BED_START:BED_END])
+        reads = [dict(qname=f"n{i}", read_seq=seq, ref_start=rs, mi=f"{i}/A",
+                      is_read1=r1, tlen=120)
+                 for i in range(_NORMAL_PAIRS) for r1 in (True, False)]
+        bam = _make_test_bam(out, reads, name="normal")
+        bed = _make_bed(out, [(CHROM, BED_START, BED_END, "Locus1")])
+        result = fc.build_flanks(bam, bed, n_workers=1, sample="NORMAL")
+        _FLANK_TABLES[key] = fc.write_flank_tables(result, out / "normal")[1]
+    return _FLANK_TABLES[key]
 
 
 def _make_bed(tmp_path: Path, rows: list[tuple[str, str, int, int]]) -> Path:
@@ -216,17 +260,21 @@ def test_extract_canonical_panel(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
     assert isinstance(panel, ExtractedPanel)
     assert set(panel.loci.keys()) == {"Locus1"}
 
     loc = panel.loci["Locus1"]
-    assert loc.anchorability_status == "anchorable"
+    assert loc.reference_window_status == "recovered"
     assert loc.ref_orientation == "+"
     assert loc.n_runs == 2
+    assert loc.reference_tract == _REF_POLYG
     assert loc.reference_run_lengths == (7, 6)
-    assert loc.upstream_anchor == "ACGTACGTAC"
-    assert loc.downstream_anchor == "TGCATGCATG"
+    assert loc.upstream_flank.bases == "ACGTACGTAC"
+    assert loc.upstream_flank.ref_positions == tuple(range(50, 60))
+    assert loc.downstream_flank.bases == "TGCATGCATG"
+    assert loc.downstream_flank.ref_positions == tuple(range(74, 84))
+    assert loc.n_alignments_drop_flank == 0
     # 2 + 1 + 1 = 4 reads (post-pair-collapse)
     assert int(loc.count.sum()) == 4
     assert loc.n_reads == 4
@@ -248,7 +296,7 @@ def test_pair_disagreement_drops_fragment(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
     loc = panel.loci["Locus1"]
     assert loc.n_read_pairs == 1
     assert loc.n_read_pairs_drop_disagree == 1
@@ -284,7 +332,7 @@ def test_mapq_filter(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
     loc = panel.loci["Locus1"]
     assert loc.n_alignments_drop_mapq == 2
     assert loc.n_reads == 1  # only the seed survives
@@ -303,7 +351,7 @@ def test_sa_tag_drops_chimeric(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
     loc = panel.loci["Locus1"]
     assert loc.n_alignments_drop_sa == 2
     assert loc.n_reads == 1  # only the seed survives
@@ -322,18 +370,181 @@ def test_tlen_filter(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path, max_tlen=1000)
+    panel = extract_panel(bam_path, bed_path, _flank_table(), max_tlen=1000)
     loc = panel.loci["Locus1"]
     assert loc.n_alignments_drop_tlen == 2
     assert loc.n_reads == 1  # only the seed survives
 
 
-def test_pair_disagreement_policy_only_drop_supported(tmp_path):
-    """`pair_disagreement_policy != 'drop'` raises NotImplementedError."""
+# ---------------------------------------------------------------------------
+# Pair merge by base quality
+# ---------------------------------------------------------------------------
+
+_HIGH_Q = "I"  # Q40
+_LOW_Q = "-"   # Q12
+_NO_CALL_Q = "#"  # Q2
+
+
+def _tract_with(index_to_base: dict[int, str]) -> str:
+    """The reference polyG tract with single bases replaced by index."""
+    tract = list(_REF_POLYG)
+    for i, base in index_to_base.items():
+        tract[i] = base
+    return "".join(tract)
+
+
+def _quality_at(read_index_to_q: dict[int, str]) -> str:
+    """A 150-base quality string of Q40 with single positions overridden."""
+    q = [_HIGH_Q] * 150
+    for i, char in read_index_to_q.items():
+        q[i] = char
+    return "".join(q)
+
+
+def _pair_reads(
+    tract_a: str, tract_b: str, qual_a: str | None, qual_b: str | None,
+    *, orientation: str = "+", no_qualities_b: bool = False,
+) -> list[dict]:
+    """Two mates of one fragment; tracts are given in polyG orientation."""
+    to_read = (lambda t: t) if orientation == "+" else revcomp
+    seq_a, rs = _canonical_read_seq(to_read(tract_a))
+    seq_b, _ = _canonical_read_seq(to_read(tract_b))
+    return [
+        dict(qname="q1", read_seq=seq_a, ref_start=rs, mi="10004/A",
+             is_read1=True, tlen=120, quality_str=qual_a),
+        dict(qname="q1", read_seq=seq_b, ref_start=rs, mi="10004/A",
+             is_read1=False, tlen=120, quality_str=qual_b,
+             no_qualities=no_qualities_b),
+    ]
+
+
+def _extract_one_locus(tmp_path, reads):
+    bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
-    bam_path = _make_test_bam(tmp_path, [])  # empty BAM
-    with pytest.raises(NotImplementedError):
-        extract_panel(bam_path, bed_path, pair_disagreement_policy="r1")
+    return extract_panel(bam_path, bed_path, _flank_table()).loci["Locus1"]
+
+
+def test_pair_merge_higher_quality_base_wins(tmp_path):
+    """One differing base: the Q40 call beats the Q12 call; the pair counts once."""
+    # Tract index 0 is read index BED_START + 0 on a "+" locus.
+    reads = _pair_reads(
+        _tract_with({0: "G"}), _tract_with({0: "T"}),
+        _quality_at({}), _quality_at({BED_START: _LOW_Q}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs == 1
+    assert loc.n_read_pairs_merged == 1
+    assert loc.n_read_pairs_drop_disagree == 0
+    assert int(loc.count.sum()) == 1
+    assert list(loc.seq) == [_tract_with({0: "G"})]
+
+
+def test_pair_merge_winner_differs_by_position(tmp_path):
+    """Two differing bases, each mate wins one."""
+    tract_a = _tract_with({2: "C", 5: "T"})
+    tract_b = _tract_with({2: "A", 5: "G"})
+    # Mate A wins index 2 (B is low); mate B wins index 5 (A is low).
+    reads = _pair_reads(
+        tract_a, tract_b,
+        _quality_at({BED_START + 5: _LOW_Q}),
+        _quality_at({BED_START + 2: _LOW_Q}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs_merged == 1
+    assert int(loc.count.sum()) == 1
+    assert list(loc.seq) == [_tract_with({2: "C", 5: "G"})]
+
+
+def test_pair_merge_equal_quality_drops(tmp_path):
+    """Equal qualities at the differing base: the pair is dropped."""
+    reads = _pair_reads(
+        _tract_with({0: "G"}), _tract_with({0: "T"}),
+        _quality_at({}), _quality_at({}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs == 1
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 1
+    assert int(loc.count.sum()) == 0
+
+
+def test_pair_merge_one_tied_position_drops(tmp_path):
+    """A tie at any one differing position drops the pair, even if another resolves."""
+    reads = _pair_reads(
+        _tract_with({2: "C", 5: "T"}), _tract_with({2: "A", 5: "G"}),
+        _quality_at({}), _quality_at({BED_START + 2: _LOW_Q}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 1
+
+
+def test_pair_merge_length_difference_drops(tmp_path):
+    """Tracts of different length are dropped, whatever the qualities."""
+    seq_a, rs = _canonical_read_seq(_REF_POLYG)
+    # One extra G in the tract; the read stays 150 bases long.
+    seq_b = (REFERENCE[:BED_START] + "G" + _REF_POLYG + REFERENCE[BED_END:])[:150]
+    reads = [
+        dict(qname="q1", read_seq=seq_a, ref_start=rs, mi="10004/A",
+             is_read1=True, tlen=120, quality_str=_quality_at({})),
+        dict(qname="q1", read_seq=seq_b, ref_start=rs, mi="10004/A",
+             is_read1=False, tlen=120, quality_str=_quality_at({BED_START: _LOW_Q})),
+    ]
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs == 1
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 1
+    assert int(loc.count.sum()) == 0
+
+
+def test_pair_merge_on_minus_locus_reverses_qualities(tmp_path, monkeypatch):
+    """On a "-" locus the qualities follow the reverse complement of the read."""
+    plus_ref = REFERENCE
+    minus_ref = (
+        plus_ref[:50] + revcomp(plus_ref[50:84]) + plus_ref[84:]
+    )
+    monkeypatch.setattr(sys.modules[__name__], "REFERENCE", minus_ref)
+    # Tract index 0 (polyG orientation) is read index BED_END - 1.
+    reads = _pair_reads(
+        _tract_with({0: "G"}), _tract_with({0: "T"}),
+        _quality_at({}), _quality_at({BED_END - 1: _LOW_Q}),
+        orientation="-",
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.ref_orientation == "-"
+    assert loc.n_read_pairs_merged == 1
+    assert int(loc.count.sum()) == 1
+    assert list(loc.seq) == [_tract_with({0: "G"})]
+
+
+def test_pair_merge_low_quality_n_loses_to_called_base(tmp_path):
+    """An N at Q2 against a called base keeps the called base."""
+    reads = _pair_reads(
+        _tract_with({3: "N"}), _tract_with({3: "A"}),
+        _quality_at({BED_START + 3: _NO_CALL_Q}), _quality_at({}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs_merged == 1
+    assert list(loc.seq) == [_tract_with({3: "A"})]
+
+
+def test_pair_merge_without_qualities_drops(tmp_path):
+    """A mate with no stored qualities cannot be merged; the pair is dropped."""
+    reads = _pair_reads(
+        _tract_with({0: "G"}), _tract_with({0: "T"}),
+        _quality_at({}), None, no_qualities_b=True,
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 1
+    assert int(loc.count.sum()) == 0
+
+
+def test_provenance_records_merge_rule(tmp_path):
+    """A panel states the pair-disagreement rule it was built with."""
+    bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
+    panel = extract_panel(_make_test_bam(tmp_path, []), bed_path, _flank_table())
+    assert panel.provenance.pair_disagreement_policy == "merge_by_quality"
 
 
 def test_provenance_records_kwargs(tmp_path):
@@ -341,19 +552,21 @@ def test_provenance_records_kwargs(tmp_path):
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
     bam_path = _make_test_bam(tmp_path, [])
 
+    flanks = _flank_table()
     panel = extract_panel(
-        bam_path, bed_path,
-        min_mapq=30, drop_chimeric=False, max_tlen=2000,
-        anchor_hamming_max=2, n_alleles_margin=5,
+        bam_path, bed_path, flanks,
+        min_mapq=30, drop_chimeric=False, max_tlen=2000, n_alleles_margin=5,
     )
     p = panel.provenance
     assert p.min_mapq == 30
     assert p.drop_chimeric is False
     assert p.max_tlen == 2000
-    assert p.anchor_hamming_max == 2
     assert p.n_alleles_margin == 5
     assert p.bam_path == str(bam_path)
     assert p.bed_path == str(bed_path)
+    assert p.flank_table_path == str(flanks)
+    assert p.flank_table_sha256 == hashlib.sha256(flanks.read_bytes()).hexdigest()
+    assert p.flank_table_sample == "NORMAL"
 
 
 def test_save_load_roundtrip_with_real_extraction(tmp_path):
@@ -369,7 +582,7 @@ def test_save_load_roundtrip_with_real_extraction(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
 
     db = tmp_path / "panel.db"
     panel.save_db(db)
@@ -399,7 +612,7 @@ def test_flanking_captured_with_expected_geometry(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
     loc = panel.loci["Locus1"]
 
     # Read covers ref [0, 150); upstream flanking is ref < 50 → 50 bp;
@@ -437,13 +650,13 @@ def test_flanking_snv_creates_two_flanking_ids(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
     loc = panel.loci["Locus1"]
 
     assert len(loc.flanking_seq) == 2
     # The flanking_id column distinguishes the two reads.
     assert sorted(loc.flanking_id.tolist()) == [0, 1]
-    # Up-segment at distance (49 - 20) = 29 from the upstream anchor.
+    # Up-segment at distance (49 - 20) = 29 from the upstream flank.
     up_strs = [str(s).split("|")[0] for s in loc.flanking_seq]
     # Both strings are length 50; they differ at exactly position (50 - 1 - 29) = 20
     # (canonical-far-to-near layout: position i = (width - 1 - distance)).
@@ -469,7 +682,7 @@ def test_flanking_low_q_masked_to_dot(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
     loc = panel.loci["Locus1"]
 
     up_part = str(loc.flanking_seq[0]).split("|")[0]
@@ -491,7 +704,7 @@ def test_flanking_pair_disagreement_drops_position(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
     loc = panel.loci["Locus1"]
     # The polyG ia_seq itself agrees, so the pair survives.
     assert loc.n_read_pairs == 1
@@ -514,7 +727,7 @@ def test_flanking_survives_save_load_roundtrip(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
     db = tmp_path / "panel.db"
     panel.save_db(db)
     loaded = ExtractedPanel.load_db(db)
@@ -535,8 +748,8 @@ def test_flanking_mate_recovery_downstream(tmp_path):
 
     R1 spans the polyG and reaches dn distance 65 (ref [0, 150) covers the
     upstream flank, polyG, and downstream flank up to ref 149).
-    R2 sits at ref [170, 200) — purely past the downstream anchor, no
-    polyG bases, no anchors. With mate-recovery, R2's bases populate dn
+    R2 sits at ref [170, 200) — purely past the downstream flank, no
+    polyG bases, no flanks. With mate-recovery, R2's bases populate dn
     distances 86..115 via the wide fetch. The gap between R1's reach
     (dist 65) and R2's coverage (dist 86) renders as ``.`` for distances
     66..85 — exactly the gap-preservation invariant we need.
@@ -545,7 +758,7 @@ def test_flanking_mate_recovery_downstream(tmp_path):
     base came from R2's alignment, not from any inference path.
     """
     seq_r1, rs1 = _canonical_read_seq(_REF_POLYG)
-    # R2: ref [170, 200) — entirely past the downstream anchor.
+    # R2: ref [170, 200) — entirely past the downstream flank.
     seq_r2 = REFERENCE[170:200]
     # Inject one SNV: read position 15 → ref pos 185 → dn distance 101.
     seq_r2 = _mutate_at(seq_r2, 15, "T")  # reference base at 185 is 'A'
@@ -558,7 +771,7 @@ def test_flanking_mate_recovery_downstream(tmp_path):
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
 
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
     loc = panel.loci["Locus1"]
 
     # Width grows to include R2's distal reach: max dn distance is 115 → width 116.
@@ -585,11 +798,11 @@ def test_flanking_mate_recovery_downstream(tmp_path):
 def test_flanking_orphan_pair_dropped(tmp_path):
     """A fragment whose mates both miss the polyG bed is dropped.
 
-    Setup: one bed-spanning filler fragment ``q_filler`` (so the anchor
-    walker can reconstruct the reference window) plus an orphan
+    Setup: one bed-spanning filler fragment ``q_filler`` (so the extractor can
+    reconstruct the reference window) plus an orphan
     fragment ``q_orphan`` with both mates entirely downstream of the
     polyG. Only the filler should survive — the orphan has no
-    bed-spanning mate and cannot be MI-anchored.
+    bed-spanning mate and cannot be assigned an MI.
     """
     seq_filler, rs = _canonical_read_seq(_REF_POLYG)
     seq_orphan = REFERENCE[170:200]
@@ -605,7 +818,7 @@ def test_flanking_orphan_pair_dropped(tmp_path):
     ]
     bam_path = _make_test_bam(tmp_path, reads)
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
-    panel = extract_panel(bam_path, bed_path)
+    panel = extract_panel(bam_path, bed_path, _flank_table())
     loc = panel.loci["Locus1"]
     # Only the filler is in the accepted set; the orphan's MI never appears.
     assert set(loc.mi.tolist()) == {"10004"}
@@ -615,6 +828,17 @@ def test_extraction_schema_version_in_provenance(tmp_path):
     """Provenance records the schema version and min_base_q."""
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
     bam_path = _make_test_bam(tmp_path, [])
-    panel = extract_panel(bam_path, bed_path, min_base_q=25)
-    assert panel.provenance.extraction_schema_version == "2"
+    panel = extract_panel(bam_path, bed_path, _flank_table(), min_base_q=25)
+    assert panel.provenance.extraction_schema_version == "3"
     assert panel.provenance.min_base_q == 25
+
+
+def test_locus_without_a_reference_window(tmp_path):
+    """No read rebuilds the reference window: no reads, and the flanks are kept."""
+    bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
+    panel = extract_panel(_make_test_bam(tmp_path, []), bed_path, _flank_table())
+    loc = panel.loci["Locus1"]
+    assert loc.reference_window_status == "ref_window_unrecoverable"
+    assert loc.n_reads == 0
+    assert loc.reference_tract == ""
+    assert loc.upstream_flank.bases == "ACGTACGTAC"

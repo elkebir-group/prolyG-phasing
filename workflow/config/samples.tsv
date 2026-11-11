@@ -1,2 +1,2 @@
-sample_id	bam
-SAMPLE1	workflow/example/example.bam
+sample_id	bam	normal
+SAMPLE1	workflow/example/example.bam	SAMPLE1
