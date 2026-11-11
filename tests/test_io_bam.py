@@ -838,7 +838,7 @@ def test_locus_without_a_reference_window(tmp_path):
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
     panel = extract_panel(_make_test_bam(tmp_path, []), bed_path, _flank_table())
     loc = panel.loci["Locus1"]
-    assert loc.reference_window_status == "unrecoverable"
+    assert loc.reference_window_status == "ref_window_unrecoverable"
     assert loc.n_reads == 0
     assert loc.reference_tract == ""
     assert loc.upstream_flank.bases == "ACGTACGTAC"

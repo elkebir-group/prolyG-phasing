@@ -112,6 +112,10 @@ first candidate called read error. The read filters are the extraction's
 defaults. Loci run in parallel; the worker count comes from the free cores
 and memory of this machine.
 
+Each BED locus side gets a row in the side TSV. A locus whose reference
+window no read rebuilds has the status ref_window_unrecoverable on both
+sides and no flank; extraction records it with that status and no reads.
+
 Each output names the sample. The name is the BAM's read-group SM; give
 --sample only for a BAM with no SM."""
 

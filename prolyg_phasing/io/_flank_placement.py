@@ -160,40 +160,75 @@ class FlankRecord:
         return self.ref_positions[0 if self.is_upstream else -1]
 
 
+# The reference window status of a locus side in the flank table and of a
+# locus in the panel: a read rebuilt the window, or none did and the side
+# has no flank.
+WINDOW_RECOVERED = "recovered"
+WINDOW_UNRECOVERABLE = "ref_window_unrecoverable"
+
+# Side-table fields that a side with no reference window leaves empty.
+_FLANK_FIELDS = ("flank_bases", "flank_ref_positions", "masked_offsets")
+
+
 @dataclasses.dataclass(frozen=True)
 class FlankTable:
     """The per-side flank table of one matched normal.
+
+    Every BED locus is in exactly one of `records` and
+    `no_reference_window`. A locus with no reference window has no flank
+    record, so it cannot be placed by mistake.
 
     Attributes
     ----------
     sample : str
         The sample whose reads built the flanks.
     records : dict of str to (FlankRecord, FlankRecord)
-        Upstream and downstream flank per locus.
+        Upstream and downstream flank per locus with a reference window.
+    no_reference_window : frozenset of str
+        Loci whose reference window no read of the sample rebuilt.
     """
 
     sample: str
     records: dict[str, tuple[FlankRecord, FlankRecord]]
+    no_reference_window: frozenset[str]
+
+    @property
+    def loci(self) -> set[str]:
+        """Every locus of the table."""
+        return set(self.records) | self.no_reference_window
 
 
 def read_flank_table(path: str | Path) -> FlankTable:
     """The flank records and the sample of a side TSV that `build-flanks` writes.
 
-    Raises ValueError when the table has no ``sample`` column, names more
-    than one sample, or lacks one side of a locus.
+    Raises ValueError when the table has no ``sample`` or
+    ``reference_window_status`` column, names more than one sample, lacks
+    one side of a locus, gives the two sides of a locus different
+    statuses, or has flank fields on a side with no reference window.
     """
     with open(path, newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
-        if "sample" not in (reader.fieldnames or ()):
-            raise ValueError(f"{path}: the flank table has no sample column; rebuild it "
-                             "with build-flanks")
+        for column in ("sample", "reference_window_status"):
+            if column not in (reader.fieldnames or ()):
+                raise ValueError(f"{path}: the flank table has no {column} column; "
+                                 "rebuild it with build-flanks")
         rows = list(reader)
     samples = {row["sample"] for row in rows}
     if len(samples) != 1:
         raise ValueError(f"{path}: the flank table must name one sample, not "
                          f"{sorted(samples)}")
-    by_locus: dict[str, dict[str, FlankRecord]] = {}
+    by_locus: dict[str, dict[str, FlankRecord | None]] = {}
     for row in rows:
+        status = row["reference_window_status"]
+        if status == WINDOW_UNRECOVERABLE:
+            if any(row[field] for field in _FLANK_FIELDS):
+                raise ValueError(f"{path}: {row['locus']} {row['side']} has no reference "
+                                 "window but carries flank fields")
+            by_locus.setdefault(row["locus"], {})[row["side"]] = None
+            continue
+        if status != WINDOW_RECOVERED:
+            raise ValueError(f"{path}: {row['locus']} {row['side']} has the unknown "
+                             f"reference window status {status!r}")
         positions = tuple(int(p) for p in row["flank_ref_positions"].split(","))
         masked = tuple(int(m) for m in row["masked_offsets"].split(",")) \
             if row["masked_offsets"] else ()
@@ -208,9 +243,16 @@ def read_flank_table(path: str | Path) -> FlankTable:
                         if set(pair) != {"upstream", "downstream"})
     if incomplete:
         raise ValueError(f"{path}: loci without both sides: {incomplete}")
+    mixed = sorted(locus for locus, pair in by_locus.items()
+                   if (pair["upstream"] is None) != (pair["downstream"] is None))
+    if mixed:
+        raise ValueError(f"{path}: loci whose two sides differ in reference window "
+                         f"status: {mixed}")
     records = {locus: (pair["upstream"], pair["downstream"])
-               for locus, pair in by_locus.items()}
-    return FlankTable(sample=samples.pop(), records=records)
+               for locus, pair in by_locus.items() if pair["upstream"] is not None}
+    no_window = frozenset(locus for locus, pair in by_locus.items()
+                          if pair["upstream"] is None)
+    return FlankTable(sample=samples.pop(), records=records, no_reference_window=no_window)
 
 
 @dataclasses.dataclass(frozen=True)

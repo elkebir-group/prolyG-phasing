@@ -50,6 +50,8 @@ from prolyg_phasing.io._anchors import (
 )
 from prolyg_phasing.io._flank_placement import (
     SIDE_DROP_REASONS,
+    WINDOW_RECOVERED,
+    WINDOW_UNRECOVERABLE,
     FlankPlacement,
     FlankRecord,
     place_flanks,
@@ -921,11 +923,11 @@ def extract_panel(
     bed_rows = _load_bed(bed_path)
     flank_table = read_flank_table(flanks_path)
     bed_names = [name for name, *_ in bed_rows]
-    missing = [name for name in bed_names if name not in flank_table.records]
+    missing = [name for name in bed_names if name not in flank_table.loci]
     if missing:
         raise ValueError(f"{flanks_path}: no flanks for {len(missing)} BED loci: "
                          f"{missing[:10]}")
-    extra = sorted(set(flank_table.records) - set(bed_names))
+    extra = sorted(flank_table.loci - set(bed_names))
     if extra:
         raise ValueError(f"{flanks_path}: flanks for {len(extra)} loci not in the BED: "
                          f"{extra[:10]}")
@@ -948,9 +950,14 @@ def extract_panel(
 
     try:
         for name, chrom, bed_start, bed_end in bed_iter:
-            flanks = flank_table.records[name]
-            geometry = locus_geometry(bam, name, chrom, bed_start, bed_end, flanks,
-                                      min_mapq=min_mapq)
+            # A locus has no geometry when the matched normal had no reference
+            # window, so it has no flanks, or when this BAM has none.
+            if name in flank_table.no_reference_window:
+                flanks = geometry = None
+            else:
+                flanks = flank_table.records[name]
+                geometry = locus_geometry(bam, name, chrom, bed_start, bed_end, flanks,
+                                          min_mapq=min_mapq)
             if geometry is None:
                 counts: Counter = Counter()
                 flanking_seqs: list[str] = []
@@ -1006,7 +1013,7 @@ def _build_locus(
     bed_start: int,
     bed_end: int,
     *,
-    flanks: tuple[FlankRecord, FlankRecord],
+    flanks: tuple[FlankRecord, FlankRecord] | None,
     geometry: LocusGeometry | None,
     counts: Counter,
     qc: dict,
@@ -1022,7 +1029,8 @@ def _build_locus(
     is kept as diagnostic context but is not authoritative for $S_i$ —
     the inference adapter (prolyG's ``to_loci``) recomputes the
     locus-level run count from the observed patterns, and extraction
-    stays faithful with no pattern filter here. `geometry` is None when
+    stays faithful with no pattern filter here. `flanks` is None when the
+    matched normal had no reference window. `geometry` is None when
     the BAM does not rebuild the reference window of the locus.
     """
     if counts:
@@ -1045,7 +1053,7 @@ def _build_locus(
         ref_run_lengths = parse_run_lengths(reference_tract)
         ref_orientation = geometry.ref_orientation
         g_walk_up, g_walk_dn = geometry.g_walk_up, geometry.g_walk_dn
-        status = "recovered"
+        status = WINDOW_RECOVERED
         # The flanking window starts past each flank's outer base. The
         # upstream field is written most-distant-first, so its start is
         # its most distant base.
@@ -1061,7 +1069,7 @@ def _build_locus(
         ref_run_lengths = ()
         ref_orientation = ""
         g_walk_up = g_walk_dn = 0
-        status = "unrecoverable"
+        status = WINDOW_UNRECOVERABLE
         flanking_up_ref_pos_start = 0
         flanking_dn_ref_pos_start = 0
 
@@ -1092,8 +1100,8 @@ def _build_locus(
         bed_end=bed_end,
         bed_name=name,
         ref_orientation=ref_orientation,
-        upstream_flank=flanks[0],
-        downstream_flank=flanks[1],
+        upstream_flank=None if flanks is None else flanks[0],
+        downstream_flank=None if flanks is None else flanks[1],
         reference_window_status=status,
         max_observed_run_length=per_locus_max,
         n_reads=int(count_arr.sum()),

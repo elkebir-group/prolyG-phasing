@@ -58,6 +58,8 @@ from prolyg_phasing.io._anchors import (
     revcomp,
 )
 from prolyg_phasing.io._flank_placement import (
+    WINDOW_RECOVERED,
+    WINDOW_UNRECOVERABLE,
     FlankRecord,
     _pack,
     _project,
@@ -448,13 +450,21 @@ class LocusReads:
 
 def locus_reads(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
                 bed_end: int) -> LocusReads | None:
-    """Geometry and filtered reads at one locus; None if it has no anchors."""
+    """Geometry and filtered reads at one locus.
+
+    Returns None when no read rebuilds the reference window. Raises
+    ValueError, naming the locus, when the window holds no edge base on a
+    side: the G run reaches the end of the window.
+    """
     window_start = bed_start - REF_WINDOW_PAD
     window = get_reference_window(bam, chrom, window_start, bed_end + REF_WINDOW_PAD,
                                   min_mapq=_FILTERS["min_mapq"])
+    if window is None:
+        return None
     anchors = build_anchors(window, REF_WINDOW_PAD, bed_end - bed_start, k=FLANKING_SEQ_LEN)
     if anchors.status != "anchorable":
-        return None
+        raise ValueError(f"{name}: the reference window holds no edge base and flank on "
+                         f"each side ({anchors.status})")
     polyg_window = revcomp(window) if anchors.ref_orientation == "-" else window
     edges = {
         "upstream": REF_WINDOW_PAD - anchors.g_walk_up - 1,
@@ -489,7 +499,7 @@ class LocusCounts:
 
 def count_locus(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
                 bed_end: int) -> LocusCounts | None:
-    """Count pass at one locus; None if the locus has no anchors."""
+    """Count pass at one locus; None when no read rebuilds the reference window."""
     loc = locus_reads(bam, name, chrom, bed_start, bed_end)
     if loc is None:
         return None
@@ -516,11 +526,11 @@ class FlankConstruction:
     sample : str
         The matched normal whose reads built the flanks.
     records : dict of str to (FlankRecord, FlankRecord)
-        Upstream and downstream flank per locus.
+        Upstream and downstream flank per locus with a reference window.
     candidates : pandas.DataFrame
         One row per candidate.
     sides : pandas.DataFrame
-        One row per locus side.
+        One row per side of every BED locus.
     error_rate : ErrorRate
     """
 
@@ -531,8 +541,26 @@ class FlankConstruction:
     error_rate: ErrorRate
 
 
-def construct_flanks(counts: Sequence[LocusCounts], *, sample: str) -> FlankConstruction:
-    """Error rate, calls and flanks from the count pass of every locus of `sample`."""
+_SIDE_COLUMNS = ("locus", "side", "reference_window_status", "ref_orientation", "flank_d",
+                 "flank_bases", "flank_ref_positions", "masked_offsets",
+                 "no_read_error_candidate", "n_candidates", "n_reads", "n_marker_placed")
+
+# Integer columns of the side table that a side with no reference window
+# leaves empty.
+_SIDE_INT_COLUMNS = ("flank_d", "no_read_error_candidate", "n_reads", "n_marker_placed")
+
+
+def construct_flanks(loci: Sequence[tuple[str, LocusCounts | None]], *, sample: str
+                     ) -> FlankConstruction:
+    """Error rate, calls and flanks from the count pass of every BED locus of `sample`.
+
+    `loci` lists each BED locus in BED order with its counts, or None when
+    no read rebuilt its reference window. Such a locus gets a side row on
+    each side with the status `WINDOW_UNRECOVERABLE` and empty flank fields,
+    no candidate rows and no flank record; it adds nothing to the error
+    rate.
+    """
+    counts = [c for _, c in loci if c is not None]
     rows = []
     for loc in counts:
         for s in SIDES:
@@ -555,7 +583,17 @@ def construct_flanks(counts: Sequence[LocusCounts], *, sample: str) -> FlankCons
     records: dict[str, tuple[FlankRecord, FlankRecord]] = {}
     side_rows = []
     start = 0
-    for loc in counts:
+    for name, loc in loci:
+        if loc is None:
+            for s in SIDES:
+                side_rows.append({
+                    "locus": name, "side": s, "reference_window_status": WINDOW_UNRECOVERABLE,
+                    "ref_orientation": "", "flank_d": None, "flank_bases": "",
+                    "flank_ref_positions": "", "masked_offsets": "",
+                    "no_read_error_candidate": None, "n_candidates": 0, "n_reads": None,
+                    "n_marker_placed": None,
+                })
+            continue
         pair = []
         for s in SIDES:
             side = loc.sides[s]
@@ -566,7 +604,8 @@ def construct_flanks(counts: Sequence[LocusCounts], *, sample: str) -> FlankCons
             start = stop
             pair.append(record)
             side_rows.append({
-                "locus": loc.name, "side": s, "ref_orientation": loc.ref_orientation,
+                "locus": loc.name, "side": s, "reference_window_status": WINDOW_RECOVERED,
+                "ref_orientation": loc.ref_orientation,
                 "flank_d": run_side_d, "flank_bases": record.bases,
                 "flank_ref_positions": ",".join(map(str, record.ref_positions)),
                 "masked_offsets": ",".join(map(str, record.masked_offsets)),
@@ -575,7 +614,10 @@ def construct_flanks(counts: Sequence[LocusCounts], *, sample: str) -> FlankCons
                 "n_marker_placed": loc.n_marker_placed[s],
             })
         records[loc.name] = (pair[0], pair[1])
-    return FlankConstruction(sample, records, cand, pd.DataFrame(side_rows), error_rate)
+    sides = pd.DataFrame(side_rows, columns=_SIDE_COLUMNS)
+    for column in _SIDE_INT_COLUMNS:
+        sides[column] = sides[column].astype("Int64")
+    return FlankConstruction(sample, records, cand, sides, error_rate)
 
 
 _WORKER_BAM: dict[str, pysam.AlignmentFile] = {}
@@ -585,9 +627,9 @@ def _open_worker_bam(bam_path: str) -> None:
     _WORKER_BAM["bam"] = pysam.AlignmentFile(bam_path, "rb")
 
 
-def _count_bed_row(row: tuple[str, str, int, int]) -> LocusCounts | None:
+def _count_bed_row(row: tuple[str, str, int, int]) -> tuple[str, LocusCounts | None]:
     name, chrom, bed_start, bed_end = row
-    return count_locus(_WORKER_BAM["bam"], name, chrom, bed_start, bed_end)
+    return name, count_locus(_WORKER_BAM["bam"], name, chrom, bed_start, bed_end)
 
 
 def worker_count() -> int:
@@ -635,15 +677,16 @@ def build_flanks(bam_path: str | Path, bed_path: str | Path, *, n_workers: int,
                  sample: str | None = None) -> FlankConstruction:
     """Count pass over every BED locus of one matched normal, then the flanks.
 
-    Loci run in parallel over `n_workers` processes. A locus without
-    anchors gets no flank. The sample name comes from :func:`sample_name`.
+    Loci run in parallel over `n_workers` processes. A locus whose reference
+    window no read rebuilds gets no flank and a side row with the status
+    `WINDOW_UNRECOVERABLE`. The sample name comes from :func:`sample_name`.
     """
     sample = sample_name(bam_path, sample)
     rows = _load_bed(Path(bed_path))
     n_workers = max(1, min(n_workers, len(rows)))
     with Pool(n_workers, initializer=_open_worker_bam, initargs=(str(bam_path),)) as pool:
         results = pool.map(_count_bed_row, rows, chunksize=2)
-    return construct_flanks([r for r in results if r is not None], sample=sample)
+    return construct_flanks(results, sample=sample)
 
 
 # ---------------------------------------------------------------------------

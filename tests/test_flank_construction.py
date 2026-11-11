@@ -436,7 +436,8 @@ def test_side_table_round_trips_masked_offsets(tmp_path):
         record, d, flag = fc.choose_flank(side, calls, window, ref_orientation="-",
                                           window_start=7)
         records.append(record)
-        rows.append({"locus": "L", "side": side_name, "ref_orientation": "-", "flank_d": d,
+        rows.append({"locus": "L", "side": side_name, "reference_window_status": "recovered",
+                     "ref_orientation": "-", "flank_d": d,
                      "flank_bases": record.bases,
                      "flank_ref_positions": ",".join(map(str, record.ref_positions)),
                      "masked_offsets": ",".join(map(str, record.masked_offsets)),
@@ -498,3 +499,160 @@ def test_flank_table_without_a_sample_is_rejected(tmp_path):
     path.write_text("locus\tside\tflank_bases\tflank_ref_positions\tmasked_offsets\n")
     with pytest.raises(ValueError, match="no sample column"):
         read_flank_table(path)
+
+
+# ---------------------------------------------------------------------------
+# A locus with no reference window
+# ---------------------------------------------------------------------------
+
+
+def _two_locus_bam(tmp_path: Path) -> tuple[Path, Path]:
+    """PolyG5177 with a whole-contig read, and PolyG151 with no read over its window.
+
+    Every read of PolyG151 starts and ends inside the contig padding, so no
+    read covers the BED interval plus 50 bases on each side.
+    """
+    loci = {"window": LOCI["PolyG5177"], "no_window": LOCI["PolyG151"]}
+    header = pysam.AlignmentHeader.from_dict({
+        "HD": {"VN": "1.6", "SO": "coordinate"},
+        "SQ": [{"SN": contig, "LN": len(chromosome(locus, "+"))}
+               for contig, locus in loci.items()],
+    })
+    unsorted, bam_path = tmp_path / "unsorted.bam", tmp_path / "normal.bam"
+    with pysam.AlignmentFile(str(unsorted), "wb", header=header) as out:
+        for ref_id, (contig, locus) in enumerate(loci.items()):
+            if contig == "window":
+                whole = chromosome(locus, "+")
+                seg = pysam.AlignedSegment(header)
+                seg.query_name = "reference"
+                seg.query_sequence = whole
+                seg.query_qualities = pysam.qualitystring_to_array("I" * len(whole))
+                seg.reference_id = ref_id
+                seg.reference_start = 0
+                seg.mapping_quality = 60
+                seg.cigartuples = [(0, len(whole))]
+                seg.set_tags([("MD", str(len(whole))), ("NM", 0), ("MI", "reference/A", "Z")])
+                out.write(seg)
+            case = _molecule_case(locus.name, locus.reference)
+            p = placements(case)[0]
+            for c in range(30):
+                seg = to_record(header, case, p, "+", f"{contig}_{c}")
+                seg.reference_id = ref_id
+                out.write(seg)
+    pysam.sort("-o", str(bam_path), str(unsorted))
+    pysam.index(str(bam_path))
+    bed = tmp_path / "panel.bed"
+    tract_start = CHROM_PAD + 30
+    bed.write_text("".join(
+        f"{contig}\t{tract_start}\t{tract_start + len(locus.tract)}\t{locus.name}\n"
+        for contig, locus in loci.items()))
+    return bam_path, bed
+
+
+def test_locus_without_a_reference_window_gets_a_status_row(tmp_path):
+    from prolyg_phasing.io.bam import extract_panel
+    from prolyg_phasing.io.panel import ExtractedPanel
+
+    bam_path, bed = _two_locus_bam(tmp_path)
+    result = fc.build_flanks(bam_path, bed, n_workers=1, sample="NORMAL")
+    assert set(result.records) == {"PolyG5177"}
+    assert set(result.candidates["locus"]) == {"PolyG5177"}
+    paths = fc.write_flank_tables(result, tmp_path / "normal")
+
+    sides = pd.read_csv(paths[1], sep="\t", dtype=str, keep_default_na=False)
+    no_window = sides[sides.locus == "PolyG151"]
+    assert list(no_window.side) == ["upstream", "downstream"]
+    assert set(no_window.reference_window_status) == {"ref_window_unrecoverable"}
+    for column in ("ref_orientation", "flank_d", "flank_bases", "flank_ref_positions",
+                   "masked_offsets", "no_read_error_candidate", "n_reads", "n_marker_placed"):
+        assert set(no_window[column]) == {""}, column
+    window = sides[sides.locus == "PolyG5177"]
+    assert set(window.reference_window_status) == {"recovered"}
+    assert all(d.isdigit() for d in window.flank_d)  # integers, not floats with a NA
+
+    table = read_flank_table(paths[1])
+    assert table.no_reference_window == {"PolyG151"}
+    assert set(table.records) == {"PolyG5177"}
+    assert table.records == result.records
+
+    panel = extract_panel(bam_path, bed, paths[1])
+    locus = panel.loci["PolyG151"]
+    assert locus.reference_window_status == "ref_window_unrecoverable"
+    assert locus.n_reads == 0 and len(locus.seq) == 0
+    assert locus.upstream_flank is None and locus.downstream_flank is None
+    assert panel.loci["PolyG5177"].reference_window_status == "recovered"
+    assert panel.loci["PolyG5177"].n_reads > 0
+
+    db = tmp_path / "panel.db"
+    panel.save_db(db)
+    loaded = ExtractedPanel.load_db(db).loci["PolyG151"]
+    assert loaded.reference_window_status == "ref_window_unrecoverable"
+    assert loaded.upstream_flank is None and loaded.downstream_flank is None
+
+
+def test_a_status_row_still_counts_against_the_bed(tmp_path):
+    from prolyg_phasing.io.bam import extract_panel
+
+    bam_path, bed = _two_locus_bam(tmp_path)
+    flanks = fc.write_flank_tables(fc.build_flanks(bam_path, bed, n_workers=1, sample="N"),
+                                   tmp_path / "normal")[1]
+    rows = bed.read_text().splitlines(keepends=True)
+    only_window = tmp_path / "window.bed"
+    only_window.write_text(rows[0])
+    with pytest.raises(ValueError, match=r"loci not in the BED: \['PolyG151'\]"):
+        extract_panel(bam_path, only_window, flanks)
+    sides = pd.read_csv(flanks, sep="\t", dtype=str, keep_default_na=False)
+    short = tmp_path / "short_sides.tsv"
+    sides[sides.locus != "PolyG151"].to_csv(short, sep="\t", index=False)
+    with pytest.raises(ValueError, match=r"no flanks for 1 BED loci: \['PolyG151'\]"):
+        extract_panel(bam_path, bed, short)
+
+
+def _side_table(tmp_path: Path, rows: list[dict]) -> Path:
+    path = tmp_path / "sides.tsv"
+    pd.DataFrame(rows).to_csv(path, sep="\t", index=False)
+    return path
+
+
+def _side_row(side: str, status: str, bases: str = "", positions: str = "") -> dict:
+    return {"sample": "N", "locus": "L", "side": side, "reference_window_status": status,
+            "flank_bases": bases, "flank_ref_positions": positions, "masked_offsets": ""}
+
+
+def test_flank_table_rejects_sides_with_different_statuses(tmp_path):
+    path = _side_table(tmp_path, [
+        _side_row("upstream", "ref_window_unrecoverable"),
+        _side_row("downstream", "recovered", "TTTTTTTTTT", ",".join(map(str, range(10))))])
+    with pytest.raises(ValueError, match="differ in reference window status"):
+        read_flank_table(path)
+
+
+def test_flank_table_rejects_flank_fields_without_a_window(tmp_path):
+    path = _side_table(tmp_path, [
+        _side_row("upstream", "ref_window_unrecoverable", "TTTTTTTTTT"),
+        _side_row("downstream", "ref_window_unrecoverable")])
+    with pytest.raises(ValueError, match="carries flank fields"):
+        read_flank_table(path)
+
+
+def test_a_window_with_no_edge_base_is_an_error(tmp_path):
+    """The G run reaches the end of the reference window: no flank can exist."""
+    contig = "A" * 10 + "G" * 100 + "A" * 10
+    header = pysam.AlignmentHeader.from_dict({
+        "HD": {"VN": "1.6", "SO": "coordinate"}, "SQ": [{"SN": "g", "LN": len(contig)}]})
+    bam_path = tmp_path / "g.bam"
+    with pysam.AlignmentFile(str(bam_path), "wb", header=header) as out:
+        seg = pysam.AlignedSegment(header)
+        seg.query_name = "whole"
+        seg.query_sequence = contig
+        seg.query_qualities = pysam.qualitystring_to_array("I" * len(contig))
+        seg.reference_id = 0
+        seg.reference_start = 0
+        seg.mapping_quality = 60
+        seg.cigartuples = [(0, len(contig))]
+        seg.set_tags([("MD", str(len(contig))), ("NM", 0)])
+        out.write(seg)
+    pysam.index(str(bam_path))
+    with pysam.AlignmentFile(str(bam_path)) as bam, \
+            pytest.raises(ValueError, match="G60: the reference window holds no edge base"):
+        fc.locus_reads(bam, "G60", "g", 60, 70)

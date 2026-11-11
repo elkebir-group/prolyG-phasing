@@ -125,8 +125,8 @@ class ExtractedLocus:
     bed_end: int
     bed_name: str
     ref_orientation: str        # '+' (G-dominant) / '-' (C-dominant; revcomp'd)
-    upstream_flank: FlankRecord
-    downstream_flank: FlankRecord
+    upstream_flank: FlankRecord | None      # None when the matched normal had no
+    downstream_flank: FlankRecord | None    # reference window at this locus
 
     # QC counters. A read dropped by the flank placement counts once in
     # `n_alignments_drop_flank`, and once per failed side in the per-side
@@ -148,7 +148,9 @@ class ExtractedLocus:
     n_read_pairs_merged: int
     n_reads: int                 # = count.sum()
     max_observed_run_length: int
-    reference_window_status: str  # 'recovered' / 'unrecoverable' (no read rebuilds it)
+    # WINDOW_RECOVERED, or WINDOW_UNRECOVERABLE when no read of the matched
+    # normal or of this sample rebuilds the reference window; then no reads.
+    reference_window_status: str
 
     # Schema-v2 additions (flanking extraction). All have defaults so
     # old pickles deserialize into a panel with empty flanking; a fresh
@@ -588,8 +590,10 @@ _DB_INT_COLUMNS = {
 _ROW_ARRAY_FIELDS = ("mi", "strand", "seq", "count", "flanking_id", "flanking_seq")
 
 
-def flank_to_text(flank: FlankRecord) -> str:
-    """A flank record as the JSON text of its panel column."""
+def flank_to_text(flank: FlankRecord | None) -> str | None:
+    """A flank record as the JSON text of its panel column; None stays None (NULL)."""
+    if flank is None:
+        return None
     return json.dumps({
         "bases": flank.bases,
         "ref_positions": list(flank.ref_positions),
@@ -598,8 +602,10 @@ def flank_to_text(flank: FlankRecord) -> str:
     })
 
 
-def flank_from_text(text: str) -> FlankRecord:
+def flank_from_text(text: str | None) -> FlankRecord | None:
     """The flank record of a panel column; the inverse of :func:`flank_to_text`."""
+    if text is None:
+        return None
     d = json.loads(text)
     return FlankRecord(
         bases=d["bases"],

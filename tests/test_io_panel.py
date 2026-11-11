@@ -398,7 +398,7 @@ def test_locus_column_agrees_between_the_database_and_memory(tmp_path):
     panel = ExtractedPanel(
         loci={
             "L1": _mixed_locus(bed_name="L1"),
-            "L2": _mixed_locus(bed_name="L2", reference_window_status="unrecoverable"),
+            "L2": _mixed_locus(bed_name="L2", reference_window_status="ref_window_unrecoverable"),
         },
         n_alleles=10, provenance=_make_provenance(),
     )
@@ -409,7 +409,7 @@ def test_locus_column_agrees_between_the_database_and_memory(tmp_path):
                  "upstream_flank"):
         assert loaded.locus_column(name) == panel.locus_column(name)
     assert loaded.locus_column("reference_window_status") == {
-        "L1": "recovered", "L2": "unrecoverable",
+        "L1": "recovered", "L2": "ref_window_unrecoverable",
     }
     with pytest.raises(ValueError):
         loaded.locus_column("row_blob")
