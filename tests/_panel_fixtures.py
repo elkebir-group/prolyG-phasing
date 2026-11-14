@@ -24,7 +24,7 @@ from prolyg_phasing.io.panel import (
 UPSTREAM_FLANK = FlankRecord("ACGTACGTAC", tuple(range(90, 100)), 9)
 DOWNSTREAM_FLANK = FlankRecord("TGCATGCATG", tuple(range(107, 117)), 0)
 
-# Every flank-placement drop counter at zero.
+# Every flank-placement counter at zero.
 ZERO_FLANK_DROPS = dict.fromkeys(_FLANK_DROP_COLUMNS, 0)
 
 # The flank-table fields of a synthetic provenance.

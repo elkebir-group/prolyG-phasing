@@ -62,8 +62,6 @@ rule build_flanks:
         bed=str(BED_PATH),
     output:
         sides=str(OUT_ROOT / "{sample}" / "flanks" / "{sample}_flank_sides.tsv"),
-        candidates=str(OUT_ROOT / "{sample}" / "flanks" / "{sample}_flank_candidates.tsv"),
-        error_rate=str(OUT_ROOT / "{sample}" / "flanks" / "{sample}_error_rate.json"),
     params:
         out_prefix=str(OUT_ROOT / "{sample}" / "flanks" / "{sample}"),
     threads: workflow.cores

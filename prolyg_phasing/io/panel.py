@@ -128,21 +128,21 @@ class ExtractedLocus:
     upstream_flank: FlankRecord | None      # None when the matched normal had no
     downstream_flank: FlankRecord | None    # reference window at this locus
 
-    # QC counters. A read dropped by the flank placement counts once in
-    # `n_alignments_drop_flank`, and once per failed side in the per-side
-    # counters, or in `n_alignments_drop_flanks_crossed`.
+    # QC counters. `n_alignments_placed` counts the reads with at least one
+    # placement, of any value. A read dropped by the flank placement counts
+    # once in `n_alignments_drop_flank`. It also counts once per side with
+    # no match of that side's flank, or, with both matches, once in
+    # `n_alignments_drop_no_placement` or `n_alignments_drop_negative_value`.
     n_alignments_overlap_locus: int
     n_alignments_drop_mapq: int
     n_alignments_drop_sa: int
     n_alignments_drop_tlen: int
+    n_alignments_placed: int
     n_alignments_drop_flank: int
-    n_alignments_drop_upstream_g_at_run_side: int
     n_alignments_drop_upstream_flank_not_placed: int
-    n_alignments_drop_upstream_flank_not_covered: int
-    n_alignments_drop_downstream_g_at_run_side: int
     n_alignments_drop_downstream_flank_not_placed: int
-    n_alignments_drop_downstream_flank_not_covered: int
-    n_alignments_drop_flanks_crossed: int
+    n_alignments_drop_no_placement: int
+    n_alignments_drop_negative_value: int
     n_read_pairs: int
     n_read_pairs_drop_disagree: int
     n_read_pairs_merged: int
@@ -523,17 +523,15 @@ def majority_pattern_by_family(
 # ---------------------------------------------------------------------------
 
 
-# The flank-placement drop counters: the total, one per side and reason,
-# and the crossed flanks.
+# The flank-placement counters: the placed reads, the dropped total, one
+# drop per side with no flank match, and the two per-read drops.
 _FLANK_DROP_COLUMNS = (
+    "n_alignments_placed",
     "n_alignments_drop_flank",
-    "n_alignments_drop_upstream_g_at_run_side",
     "n_alignments_drop_upstream_flank_not_placed",
-    "n_alignments_drop_upstream_flank_not_covered",
-    "n_alignments_drop_downstream_g_at_run_side",
     "n_alignments_drop_downstream_flank_not_placed",
-    "n_alignments_drop_downstream_flank_not_covered",
-    "n_alignments_drop_flanks_crossed",
+    "n_alignments_drop_no_placement",
+    "n_alignments_drop_negative_value",
 )
 
 _PANEL_META_COLUMNS = [
@@ -598,7 +596,6 @@ def flank_to_text(flank: FlankRecord | None) -> str | None:
         "bases": flank.bases,
         "ref_positions": list(flank.ref_positions),
         "run_side_offset": flank.run_side_offset,
-        "masked_offsets": list(flank.masked_offsets),
     })
 
 
@@ -611,7 +608,6 @@ def flank_from_text(text: str | None) -> FlankRecord | None:
         bases=d["bases"],
         ref_positions=tuple(d["ref_positions"]),
         run_side_offset=d["run_side_offset"],
-        masked_offsets=tuple(d["masked_offsets"]),
     )
 
 

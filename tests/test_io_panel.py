@@ -78,7 +78,8 @@ def _two_locus_panel_with_flanking() -> ExtractedPanel:
         [("20001", "A", "GGGAGGG", 4)],
         n_runs=2, reference_tract="GGGAGGG", reference_run_lengths=(3, 3),
         bed_name="Locus2", chrom="chr2", bed_start=200, bed_end=207,
-        upstream_flank=FlankRecord("ACGTACGTAC", tuple(range(188, 198)), 9, (3, 6)),
+        # A flank that matches 11 reference bases, by a 1-base gap.
+        upstream_flank=FlankRecord("ACGTACGTAC", tuple(range(188, 199)), 10),
     )
     return ExtractedPanel(
         loci={"Locus1": locus1, "Locus2": locus2},
@@ -109,7 +110,7 @@ def test_save_load_db_roundtrip(tmp_path):
 
     rec2 = loaded.loci["Locus2"]
     assert rec2.upstream_flank == panel.loci["Locus2"].upstream_flank
-    assert rec2.upstream_flank.masked_offsets == (3, 6)
+    assert len(rec2.upstream_flank.ref_positions) == 11
     assert rec2.n_runs == 2
     assert rec2.reference_run_lengths == (3, 3)
     assert rec2.chrom == "chr2"

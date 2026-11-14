@@ -18,7 +18,7 @@ from pathlib import Path
 from prolyg_phasing.io._flank_construction import (
     build_flanks,
     worker_count,
-    write_flank_tables,
+    write_flank_table,
 )
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import ExtractedPanel
@@ -100,23 +100,26 @@ def _run_extract(args: argparse.Namespace) -> None:
 
 
 _BUILD_FLANKS_DESCRIPTION = """\
-Build one flank per locus side from a matched normal BAM, and write three
-files: {out_prefix}_flank_candidates.tsv (one row per candidate base),
-{out_prefix}_flank_sides.tsv (one row per locus side; the flank records
-that extraction reads) and {out_prefix}_error_rate.json (the error rate e).
+Choose the two flanks of every locus from a matched normal BAM, and write
+{out_prefix}_flank_sides.tsv: one row per locus side, with the flank
+records that extraction reads.
 
-At each locus side, the candidates are the non-G reference bases next to
-the repeat. Each one is called "read error" or "G in the donor" from the
-share of the normal's reads that show a G there. The flank starts at the
-first candidate called read error. The read filters are the extraction's
-defaults. Loci run in parallel; the worker count comes from the free cores
-and memory of this machine.
+At each locus, the flanks are the pair of 10-base strings that maximizes
+one objective over the normal's reads: the sum over reads of the value of
+each read's best tract, where a G scores 1, any other base -2, and a
+flank match costs 1 for a substitution and 2 or 2.5 for a gap of 1 or 2
+bases. A read with no tract, or a negative value, adds 0. Each flank
+occurs exactly at a tract edge in at least one read. The table adds, per
+locus, the objective, the reads, the reads placed, and the number of
+tied optimal pairs. The read filters are the extraction's defaults. Loci
+run in parallel; the worker count comes from the free cores and memory
+of this machine.
 
-Each BED locus side gets a row in the side TSV. A locus whose reference
-window no read rebuilds has the status ref_window_unrecoverable on both
-sides and no flank; extraction records it with that status and no reads.
+Each BED locus side gets a row. A locus whose reference window no read
+rebuilds has the status ref_window_unrecoverable on both sides and no
+flank; extraction records it with that status and no reads.
 
-Each output names the sample. The name is the BAM's read-group SM; give
+The table names the sample. The name is the BAM's read-group SM; give
 --sample only for a BAM with no SM."""
 
 
@@ -126,7 +129,7 @@ def _add_build_flanks_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--bed", required=True, type=Path,
                     help="4-column BED panel: chrom, start, end, name.")
     p.add_argument("--out-prefix", required=True, type=Path,
-                    help="Path prefix of the three output files. The parent "
+                    help="Path prefix of the output file. The parent "
                          "directory is not created.")
     p.add_argument("--sample", default=None,
                     help="Sample name to write into the outputs. Required when "
@@ -137,11 +140,9 @@ def _add_build_flanks_args(p: argparse.ArgumentParser) -> None:
 def _run_build_flanks(args: argparse.Namespace) -> None:
     n_workers = worker_count()
     result = build_flanks(args.bam, args.bed, n_workers=n_workers, sample=args.sample)
-    paths = write_flank_tables(result, args.out_prefix)
-    er = result.error_rate
-    print(f"{result.sample}: e = {er.e:.4e} ({er.x}/{er.n} at {er.n_positions} positions); "
-          f"{len(result.records)} loci; {n_workers} workers; wrote "
-          + ", ".join(str(p) for p in paths))
+    path = write_flank_table(result, args.out_prefix)
+    print(f"{result.sample}: {len(result.records)} loci with flanks; {n_workers} workers; "
+          f"wrote {path}")
 
 
 _PHASE_DESCRIPTION = """\

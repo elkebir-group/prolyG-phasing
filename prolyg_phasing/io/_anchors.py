@@ -1,15 +1,11 @@
-"""Internal anchor utilities for BAM extraction.
+"""Internal reference utilities for BAM extraction.
 
-Three pieces:
+Two pieces:
 
 1. Reference reconstruction (`get_reference_window`) — pull a window of
    the reference genome from BAM MD tags, no external FASTA required.
-2. Anchor construction (`build_anchors`) — walk boundary Gs out from
-   the BED interval to the first non-G, then take an additional `k` bp
-   to form the upstream and downstream anchor strings.
-3. Anchor search in reads (`hamming_search`) — slide an anchor along
-   every read of a batch and return each read's lowest-Hamming-distance
-   placement.
+2. Reference walk (`build_anchors`) — the locus orientation, and the G
+   bases between each BED end and the first non-G reference base.
 
 All functions are pysam-coupled only where they need to read alignment
 records; the anchor-construction logic itself is pure string work.
@@ -19,9 +15,6 @@ from __future__ import annotations
 
 import dataclasses
 from typing import TYPE_CHECKING
-
-import numpy as np
-from numpy.lib.stride_tricks import as_strided
 
 if TYPE_CHECKING:
     import pysam
@@ -33,104 +26,6 @@ COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 def revcomp(s: str) -> str:
     """Reverse-complement of `s` over IUPAC bases ACGTN (case-preserving)."""
     return s.translate(COMP)[::-1]
-
-
-# Reads are scored against an anchor in blocks of this many at a time.
-# The whole point of the batch is to pay numpy's per-call overhead once
-# for many reads instead of once per read, so the block wants to be
-# large; the cap keeps the (block, offsets, k) comparison buffer to a few
-# MB regardless of how deep the locus is.
-_HAMMING_BLOCK = 4096
-
-
-def hamming_search(read_seqs: list[str], anchor: str) -> tuple[np.ndarray, np.ndarray]:
-    """Slide `anchor` across every read in `read_seqs`; return per-read `(distance, offset)`.
-
-    Reads that carry `anchor` verbatim are settled by a substring
-    search. The rest are scored at every offset, with one set of numpy
-    calls per block of reads rather than one set per read.
-
-    Parameters
-    ----------
-    read_seqs : list of str
-        Reads to search, upper-case ASCII. Lengths may differ.
-    anchor : str
-        The anchor to place, upper-case ASCII.
-
-    Returns
-    -------
-    distances : ndarray of int64, shape (len(read_seqs),)
-        Lowest Hamming distance of `anchor` against each read.
-    offsets : ndarray of int64, shape (len(read_seqs),)
-        Offset into each read at which that distance is attained,
-        leftmost on a tie.
-
-    A read shorter than `anchor` admits no placement and scores
-    ``(len(anchor), -1)``.
-    """
-    k = len(anchor)
-    n = len(read_seqs)
-    distances = np.full(n, k, dtype=np.int64)
-    offsets = np.full(n, -1, dtype=np.int64)
-    if n == 0:
-        return distances, offsets
-
-    # An exact occurrence of the anchor is a distance-0 placement, so it
-    # is a global minimum, and `str.find` returns the leftmost one — the
-    # same tie-break the sliding scan applies. Most reads carry the
-    # anchor verbatim, and `find` is a fast substring search, so this
-    # leaves only the minority of reads to be scored position by
-    # position. Reads shorter than the anchor never match and fall
-    # through to the scan, which scores them ``(k, -1)``.
-    exact = np.fromiter((s.find(anchor) for s in read_seqs), dtype=np.int64, count=n)
-    matched = exact >= 0
-    distances[matched] = 0
-    offsets[matched] = exact[matched]
-
-    to_scan = np.flatnonzero(~matched)
-    if to_scan.size == 0:
-        return distances, offsets
-
-    scan_seqs = [read_seqs[i] for i in to_scan.tolist()]
-    anchor_bytes = np.frombuffer(anchor.encode("ascii"), dtype=np.uint8)
-    lengths = np.fromiter((len(s) for s in scan_seqs), dtype=np.int64, count=len(scan_seqs))
-
-    for lo in range(0, len(scan_seqs), _HAMMING_BLOCK):
-        hi = min(lo + _HAMMING_BLOCK, len(scan_seqs))
-        block = scan_seqs[lo:hi]
-        block_lengths = lengths[lo:hi]
-        width = int(block_lengths.max())
-        if width < k:
-            continue  # every read in the block is shorter than the anchor
-        n_offsets = width - k + 1
-
-        # One ragged-to-rectangular pack per block: right-pad every read
-        # to the block's longest, concatenate, and view as (n_block, width).
-        flat = "".join(s.ljust(width, "\0") for s in block).encode("ascii")
-        matrix = np.frombuffer(flat, dtype=np.uint8).reshape(len(block), width)
-        windows = as_strided(
-            matrix,
-            shape=(len(block), n_offsets, k),
-            strides=(width, 1, 1),
-            writeable=False,
-        )
-        block_distances = (windows != anchor_bytes).sum(axis=2, dtype=np.int16)
-
-        # An offset past a read's own last full-length window scored
-        # against padding, so rule it out: k + 1 exceeds every real
-        # distance (which is at most k), and argmin takes the leftmost
-        # minimum, so the winner is always the leftmost real best.
-        past_end = np.arange(n_offsets)[None, :] > (block_lengths - k)[:, None]
-        block_distances[past_end] = k + 1
-
-        best = block_distances.argmin(axis=1)
-        rows = np.arange(len(block))
-        placeable = block_lengths >= k
-        block_rows = to_scan[lo:hi]
-        distances[block_rows] = np.where(placeable, block_distances[rows, best], k)
-        offsets[block_rows] = np.where(placeable, best, -1)
-
-    return distances, offsets
 
 
 # ---------------------------------------------------------------------------

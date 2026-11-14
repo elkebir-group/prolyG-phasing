@@ -3,8 +3,9 @@
 Each hand-built case of `tests/_hand_built_reads.py` is written to a BAM with
 every alignment an aligner can choose, on a "+" and a "-" copy of its locus.
 `extract_panel` reads it with a flank table that holds the case's flanks.
-Every kept alignment must give the true tuple, and every dropped one must
-add to the counter of its drop reason.
+Every kept alignment must give the case's expected tuple (see
+`tests/test_flank_placement.py`), and every dropped one must add to the
+counter of its drop reason.
 
 The other tests check what the flank moves besides the tract: the phasing
 window, the reference tract and its run lengths, and the checks of the flank
@@ -14,20 +15,18 @@ table against the BED and the reference window.
 from __future__ import annotations
 
 import dataclasses
-from collections import Counter
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import pysam
 import pytest
 
 import prolyg_phasing.io._flank_construction as fc
 from prolyg_phasing.io._anchors import revcomp
-from prolyg_phasing.io._flank_placement import SIDE_DROP_REASONS, FlankRecord
+from prolyg_phasing.io._flank_placement import FlankRecord, reference_flank
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import parse_run_lengths
-from prolyg_phasing.phasing import offset_at_ref_pos, ref_pos_at_offset
+from prolyg_phasing.phasing import ref_pos_at_offset
 from tests._hand_built_reads import (
     CHROM_PAD,
     ReadCase,
@@ -40,11 +39,11 @@ from tests._hand_built_reads import (
     to_record,
 )
 from tests.test_flank_placement import (
-    ASSIGNED_TUPLE,
     CASE_IDS,
     CASES,
-    DROP_REASON_BY_FORM,
-    _flank_record,
+    DROP_REASONS,
+    expected_outcome,
+    flank_record,
 )
 
 ORIENTATIONS = ("+", "-")
@@ -103,8 +102,8 @@ def _write_case(tmp_path: Path, case: ReadCase, *, sample: str = "NORMAL",
     bed.write_text("".join(rows))
 
     if flank_records is None:
-        flank_records = {f"{locus.name}{o}": (_flank_record(case, case.up, o),
-                                             _flank_record(case, case.dn, o))
+        flank_records = {f"{locus.name}{o}": (flank_record(case, case.up, o),
+                                             flank_record(case, case.dn, o))
                          for o in ORIENTATIONS}
     flanks = write_side_table(tmp_path / "normal", sample, flank_records)
     return bam_path, bed, flanks
@@ -118,16 +117,12 @@ def write_side_table(prefix: Path, sample: str,
         for side, record in zip(("upstream", "downstream"), pair, strict=True):
             rows.append({
                 "locus": locus, "side": side, "reference_window_status": "recovered",
-                "ref_orientation": "", "flank_d": 0,
-                "flank_bases": record.bases,
+                "ref_orientation": "", "flank_bases": record.bases,
                 "flank_ref_positions": ",".join(map(str, record.ref_positions)),
-                "masked_offsets": ",".join(map(str, record.masked_offsets)),
-                "no_read_error_candidate": 0, "n_candidates": 0, "n_reads": 0,
-                "n_marker_placed": 0,
+                "objective": 0.0, "n_reads": 0, "n_reads_placed": 0, "n_tied_pairs": 1,
             })
-    result = fc.FlankConstruction(sample, records, pd.DataFrame(), pd.DataFrame(rows),
-                                  fc.ErrorRate(0.0, 0, 1, np.array([0.0])))
-    return fc.write_flank_tables(result, prefix)[1]
+    result = fc.FlankConstruction(sample, records, pd.DataFrame(rows, columns=fc.SIDE_COLUMNS))
+    return fc.write_flank_table(result, prefix)
 
 
 def _overlaps_tract(case: ReadCase, placement) -> bool:
@@ -156,8 +151,12 @@ def _rows_by_read(locus) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _drop_counter(reason: str) -> str:
+    return f"n_alignments_drop_{reason}"
+
+
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
-def test_extraction_gives_the_true_tuple_on_every_alignment(tmp_path, case: ReadCase):
+def test_extraction_gives_the_expected_outcome_on_every_alignment(tmp_path, case: ReadCase):
     bam, bed, flanks = _write_case(tmp_path, case)
     panel = extract_panel(bam, bed, flanks)
     every = placements(case)
@@ -165,29 +164,25 @@ def test_extraction_gives_the_true_tuple_on_every_alignment(tmp_path, case: Read
     # The alignments the read filter sends to the flank placement.
     placed = [i for i, p in enumerate(every) if _overlaps_tract(case, p)]
     assert placed
+    want = expected_outcome(case)
     for o in ORIENTATIONS:
         locus = panel.loci[f"{case.locus.name}{o}"]
         assert locus.reference_window_status == "recovered"
         assert locus.ref_orientation == o
         assert locus.n_alignments_overlap_locus == len(placed) + 1  # and the MI-less read
         kept = _rows_by_read(locus)
-        if case.drop_reason is not None:
+        if isinstance(want, str):
             assert kept == {}
-            expected = Counter(
-                DROP_REASON_BY_FORM.get(case.case_id, {}).get(forms[i], case.drop_reason)
-                for i in placed)
             assert locus.n_alignments_drop_flank == len(placed)
-            for reason in SIDE_DROP_REASONS:
-                got = (getattr(locus, f"n_alignments_drop_upstream_{reason}")
-                       + getattr(locus, f"n_alignments_drop_downstream_{reason}"))
-                assert got == expected[reason], reason
-            assert locus.n_alignments_drop_flanks_crossed == expected["flanks_crossed"]
+            for reason in DROP_REASONS:
+                got = getattr(locus, _drop_counter(reason))
+                assert got == (len(placed) if reason == want else 0), reason
             continue
         assert locus.n_alignments_drop_flank == 0
-        expected_tuple = ASSIGNED_TUPLE.get(case.case_id, case.true_tuple)
+        assert locus.n_alignments_placed == len(placed)
         assert set(kept) == {f"{case.case_id}_{i}" for i in placed}
         for name, tract in kept.items():
-            assert parse_run_lengths(tract) == expected_tuple, (o, forms[int(name.rsplit("_")[-1])])
+            assert parse_run_lengths(tract) == want, (o, forms[int(name.rsplit("_")[-1])])
 
 
 def test_both_sides_count_when_both_fail(tmp_path):
@@ -195,16 +190,17 @@ def test_both_sides_count_when_both_fail(tmp_path):
     case = _case("both_sides_fail", "PolyG151: G at the edge T, two downstream edits",
                  "PolyG151", up_ctx=up151[:-1] + "G", tract="G" * 12,
                  dn_ctx=_sub(_sub(_dn("PolyG151"), 3, "C"), 6, "A"),
-                 drop_reason="g_at_run_side", true_tract=None)
+                 drop_reason="upstream_flank_not_placed", true_tract=None)
     bam, bed, flanks = _write_case(tmp_path, case, forms={"gapless"})
     panel = extract_panel(bam, bed, flanks)
     for o in ORIENTATIONS:
         locus = panel.loci[f"PolyG151{o}"]
         assert locus.n_alignments_drop_flank == 1
-        assert locus.n_alignments_drop_upstream_g_at_run_side == 1
+        assert locus.n_alignments_placed == 0
+        assert locus.n_alignments_drop_upstream_flank_not_placed == 1
         assert locus.n_alignments_drop_downstream_flank_not_placed == 1
-        assert locus.n_alignments_drop_upstream_flank_not_placed == 0
-        assert locus.n_alignments_drop_flanks_crossed == 0
+        assert locus.n_alignments_drop_no_placement == 0
+        assert locus.n_alignments_drop_negative_value == 0
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +211,7 @@ def test_both_sides_count_when_both_fail(tmp_path):
 # bases, past the edge T and the GGG behind it, and the downstream flank
 # moves out 1 base, past the edge A.
 MOVED = next(c for c in CASES if c.case_id == "edge_variant_hom")
+INVARIANT = next(c for c in CASES if c.case_id == "invariant_side")
 
 
 @pytest.mark.parametrize("orientation", ORIENTATIONS)
@@ -225,15 +222,15 @@ def test_reference_tract_runs_between_moved_flanks(tmp_path, orientation):
     # outer T upstream and the T after the edge A downstream.
     assert locus.reference_tract == "GGGT" + "G" * 11 + "A"
     assert locus.reference_run_lengths == (3, 11, 0)
-    assert locus.upstream_flank == _flank_record(MOVED, MOVED.up, orientation)
+    assert locus.upstream_flank == flank_record(MOVED, MOVED.up, orientation)
 
 
 @pytest.mark.parametrize("orientation", ORIENTATIONS)
 def test_phasing_window_starts_past_each_moved_flank(tmp_path, orientation):
     bam, bed, flanks = _write_case(tmp_path, MOVED)
     locus = extract_panel(bam, bed, flanks).loci[f"PolyG5177{orientation}"]
-    up = _flank_record(MOVED, MOVED.up, orientation)
-    dn = _flank_record(MOVED, MOVED.dn, orientation)
+    up = flank_record(MOVED, MOVED.up, orientation)
+    dn = flank_record(MOVED, MOVED.dn, orientation)
     step = 1 if orientation == "+" else -1
     # The flanking base nearest each flank is the reference base just past
     # the flank's outer base.
@@ -264,17 +261,26 @@ def test_phasing_window_starts_past_each_moved_flank(tmp_path, orientation):
 
 
 @pytest.mark.parametrize("orientation", ORIENTATIONS)
-def test_masked_flank_position_is_not_in_the_phasing_window(tmp_path, orientation):
-    """A position the donor carries a G at, inside the flank, is masked in the
-    match and lies inside the flanked interval, so phasing does not see it."""
-    case = next(c for c in CASES if c.case_id == "masked_plus_mismatch")
-    bam, bed, flanks = _write_case(tmp_path, case)
+def test_a_flank_with_a_gap_against_the_reference(tmp_path, orientation):
+    """A donor flank with TT where the reference has TTT matches 11 reference
+    bases. Extraction accepts it, the reads place with the 1-base gap, and the
+    phasing window starts past the outer matched base."""
+    case = INVARIANT
+    donor_up = "CATATTAGAT"
+    records = {}
+    for o in ORIENTATIONS:
+        chrom = chromosome(case.locus, o)
+        polyg = chrom if o == "+" else revcomp(chrom)
+        split = CHROM_PAD + len(case.locus.upstream) + len(case.locus.tract) // 2
+        up = reference_flank(polyg, donor_up, upstream=True, split=split,
+                             ref_orientation=o, window_start=0)
+        records[f"PolyG151{o}"] = (up, flank_record(case, case.dn, o))
+    bam, bed, flanks = _write_case(tmp_path, case, flank_records=records)
     locus = extract_panel(bam, bed, flanks).loci[f"PolyG151{orientation}"]
-    up = _flank_record(case, case.up, orientation)
-    masked_position = up.ref_positions[case.up.masked_offsets[0]]
-    for start, width in ((locus.flanking_up_ref_pos_start, locus.flanking_up_width),
-                         (locus.flanking_dn_ref_pos_start, locus.flanking_dn_width)):
-        assert offset_at_ref_pos(orientation, start, masked_position, width) is None
+    up = records[f"PolyG151{orientation}"][0]
+    assert len(up.ref_positions) == 11
+    assert locus.upstream_flank == up
+    assert {parse_run_lengths(t) for t in locus.seq} == {(12,)}
     nearest_up = ref_pos_at_offset(orientation, locus.flanking_up_ref_pos_start,
                                    locus.flanking_up_width - 1)
     assert nearest_up == up.outer_position + (-1 if orientation == "+" else 1)
@@ -284,12 +290,10 @@ def test_masked_flank_position_is_not_in_the_phasing_window(tmp_path, orientatio
 # The flank table against the BED and the reference
 # ---------------------------------------------------------------------------
 
-INVARIANT = next(c for c in CASES if c.case_id == "invariant_side")
-
 
 def _records(case: ReadCase) -> dict[str, tuple[FlankRecord, FlankRecord]]:
-    return {f"{case.locus.name}{o}": (_flank_record(case, case.up, o),
-                                     _flank_record(case, case.dn, o))
+    return {f"{case.locus.name}{o}": (flank_record(case, case.up, o),
+                                     flank_record(case, case.dn, o))
             for o in ORIENTATIONS}
 
 
@@ -309,12 +313,24 @@ def test_flank_table_with_an_extra_locus_is_an_error(tmp_path):
         extract_panel(bam, bed, flanks)
 
 
-def test_flank_that_differs_from_the_reference_is_an_error(tmp_path):
+def test_flank_that_does_not_match_the_reference_is_an_error(tmp_path):
+    """Two substitutions: the flank does not match the reference window."""
     records = _records(INVARIANT)
     up, dn = records["PolyG151+"]
-    records["PolyG151+"] = (dataclasses.replace(up, bases="C" + up.bases[1:]), dn)
+    records["PolyG151+"] = (dataclasses.replace(up, bases="CC" + up.bases[2:]), dn)
     bam, bed, flanks = _write_case(tmp_path, INVARIANT, flank_records=records)
     with pytest.raises(ValueError, match="PolyG151[+]: the upstream flank"):
+        extract_panel(bam, bed, flanks)
+
+
+def test_flank_recorded_at_other_positions_is_an_error(tmp_path):
+    """The flank matches the window, but not at the positions of the table."""
+    records = _records(INVARIANT)
+    up, dn = records["PolyG151+"]
+    shifted = tuple(p - 1 for p in dn.ref_positions)
+    records["PolyG151+"] = (up, dataclasses.replace(dn, ref_positions=shifted))
+    bam, bed, flanks = _write_case(tmp_path, INVARIANT, flank_records=records)
+    with pytest.raises(ValueError, match="PolyG151[+]: the downstream flank"):
         extract_panel(bam, bed, flanks)
 
 

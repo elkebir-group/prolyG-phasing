@@ -23,8 +23,8 @@ import random
 import pysam
 import pytest
 
+from prolyg_phasing.io._flank_placement import FLANK_LEN
 from prolyg_phasing.io.bam import (
-    FLANKING_SEQ_LEN,
     _alignment_flanking,
     _assemble_side,
     _consensus,
@@ -175,7 +175,7 @@ def test_alignment_flanking_matches_per_position_contract(
     # Start the alignment well upstream so it straddles the bed and both
     # flanks, and so both sides get covered.
     seg = make_alignment(header, 260, cigar)
-    kw = dict(lo=bed_start - 2 - FLANKING_SEQ_LEN, hi=bed_end + 1 + FLANKING_SEQ_LEN,
+    kw = dict(lo=bed_start - 2 - FLANK_LEN, hi=bed_end + 1 + FLANK_LEN,
               ref_orientation=ref_orientation, min_base_q=20)
     up, dn = _alignment_flanking(seg, **kw)
     assert (side_to_map(up), side_to_map(dn)) == reference_side(seg, **kw)
@@ -224,8 +224,8 @@ def test_alignment_flanking_matches_contract_on_random_cigars(header, seed):
             seq="".join(rng.choice("ACGTNacgtn") for _ in range(query_len)),
             quality_str="".join(chr(33 + rng.randint(0, 41)) for _ in range(query_len)),
         )
-        lo = 300 - rng.randint(0, 5) - FLANKING_SEQ_LEN
-        kw = dict(lo=lo, hi=300 + rng.randint(1, 20) + rng.randint(0, 5) + FLANKING_SEQ_LEN,
+        lo = 300 - rng.randint(0, 5) - FLANK_LEN
+        kw = dict(lo=lo, hi=300 + rng.randint(1, 20) + rng.randint(0, 5) + FLANK_LEN,
                   ref_orientation=rng.choice(["+", "-"]),
                   min_base_q=rng.choice([0, 20, 40]))
         up, dn = _alignment_flanking(seg, **kw)

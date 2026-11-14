@@ -11,9 +11,9 @@ over, the gapless form with mismatches, and soft-clipped forms. `to_record`
 writes one placement as a `pysam` record with a correct MD tag, on a
 synthetic chromosome that holds the locus in "+" or "-" orientation.
 
-Each case sets the flank of each side: the run-side base sits `k` bases
-further out than the edge base (the first non-G base next to the repeat),
-and a masked offset marks a flank position where the donor has a G.
+Each case sets the flank of each side: 10 reference bases whose run-side
+base sits `k` bases further out than the edge base (the first non-G base
+next to the repeat).
 """
 
 from __future__ import annotations
@@ -91,24 +91,23 @@ class FlankSpec:
     bases: str
     start: int
     run_side_offset: int
-    masked_offsets: tuple[int, ...] = ()
 
     @property
     def run_side(self) -> int:
         return self.start + self.run_side_offset
 
 
-def upstream_flank(locus: LocusSequence, k: int, masked: tuple[int, ...] = ()) -> FlankSpec:
+def upstream_flank(locus: LocusSequence, k: int) -> FlankSpec:
     """Upstream flank whose run-side base is `k` bases out from the edge base."""
     end = len(locus.upstream) - k
     start = end - FLANK_LEN
-    return FlankSpec(locus.reference[start:end], start, FLANK_LEN - 1, masked)
+    return FlankSpec(locus.reference[start:end], start, FLANK_LEN - 1)
 
 
-def downstream_flank(locus: LocusSequence, k: int, masked: tuple[int, ...] = ()) -> FlankSpec:
+def downstream_flank(locus: LocusSequence, k: int) -> FlankSpec:
     """Downstream flank whose run-side base is `k` bases out from the edge base."""
     start = len(locus.upstream) + len(locus.tract) + k
-    return FlankSpec(locus.reference[start:start + FLANK_LEN], start, 0, masked)
+    return FlankSpec(locus.reference[start:start + FLANK_LEN], start, 0)
 
 
 _NON_G = re.compile(r"[^G]+")
@@ -128,7 +127,9 @@ class ReadCase:
     `read` and `ref_start` are in polyG orientation: the read's first base
     sits at `ref_start` of `locus.reference` in the intended alignment.
     `true_tract` is the molecule's tract; `true_tuple` follows from it.
-    `drop_reason` is set when the read must be dropped instead.
+    `drop_reason` is set when the read must be dropped instead: one of
+    "upstream_flank_not_placed", "downstream_flank_not_placed",
+    "no_placement" and "negative_value".
     `ambiguous` marks a read whose string equals the read of another
     molecule with a different tuple; `true_tuple` then names the molecule
     the read was built from, and the test pins the tuple the convention
@@ -165,7 +166,7 @@ def _del(s: str, i: int, n: int = 1) -> str:
     return s[:i] + s[i + n:]
 
 
-def _case(case_id, description, name, *, k_up=0, k_dn=0, up_masked=(), up_ctx=None,
+def _case(case_id, description, name, *, k_up=0, k_dn=0, up_ctx=None,
           tract, dn_ctx=None, start=5, dn_len=25, drop_reason=None, ambiguous=False,
           true_tract="tract") -> ReadCase:
     """Assemble a read as upstream context + tract + downstream context.
@@ -176,7 +177,7 @@ def _case(case_id, description, name, *, k_up=0, k_dn=0, up_masked=(), up_ctx=No
     bases past the downstream run-side base.
     """
     locus = LOCI[name]
-    up = upstream_flank(locus, k_up, up_masked)
+    up = upstream_flank(locus, k_up)
     dn = downstream_flank(locus, k_dn)
     ref = locus.reference
     if up_ctx is None:
@@ -223,7 +224,7 @@ def build_cases() -> list[ReadCase]:
     # the read is dropped, not lengthened.
     c.append(_case("false_g_invariant", "PolyG151: G at the edge T", "PolyG151",
                    up_ctx=_up("PolyG151")[:-1] + "G",
-                   tract=G * 12, drop_reason="g_at_run_side", true_tract=None))
+                   tract=G * 12, drop_reason="upstream_flank_not_placed", true_tract=None))
     # Edge interrupter: TTTGC A G9.
     c.append(_case("edge_interrupter", "PolyG8882: TTTGC A G9", "PolyG8882",
                    tract="A" + G * 9))
@@ -262,24 +263,17 @@ def build_cases() -> list[ReadCase]:
     # G at the run-side base of a moved flank (PolyG7357 outer T).
     up7357 = _up("PolyG7357", 1)
     c.append(_case("false_g_moved", "PolyG7357: G at the outer T", "PolyG7357",
-                   k_up=1, up_ctx=up7357[:-1] + "G", tract="T" + G * 10,
-                   drop_reason="g_at_run_side", true_tract=None))
+                   k_up=1, up_ctx=up7357[:-1] + "G", tract="T" + G * 10))
     # An invariant side; two G candidates in a row; a flank that moves 4 bases.
     c.append(_case("invariant_side", "PolyG151: reference read", "PolyG151", tract=G * 12))
     c.append(_case("two_candidates_moved", "PolyG4732: C G G G G10", "PolyG4732",
                    k_up=3, tract=G * 13))
     c.append(_case("flank_moves_four", "PolyG2831: G10 ATGG", "PolyG2831",
                    k_dn=4, tract=G * 10 + "ATGG"))
-    # Masked flank position: the donor has a G 7 out; the read has that G and
-    # one more mismatch. The mask is hypothetical at this locus.
-    c.append(_case("masked_plus_mismatch", "PolyG151: G at masked offset 2 and one mismatch",
-                   "PolyG151", up_masked=(2,),
-                   up_ctx=_sub(_sub(up151, len(up151) - 8, "G"), len(up151) - 4, "C"),
-                   tract=G * 12))
     # Two edits in the flank: dropped.
     c.append(_case("two_edits", "PolyG151: two mismatches in the upstream flank", "PolyG151",
                    up_ctx=_sub(_sub(up151, len(up151) - 7, "C"), len(up151) - 4, "C"),
-                   tract=G * 12, drop_reason="flank_not_placed", true_tract=None))
+                   tract=G * 12, drop_reason="upstream_flank_not_placed", true_tract=None))
     # Near a read end, the read's tract is longer than the reference's: the
     # read ends 2 bases past the downstream flank, or starts 2 bases before
     # the upstream flank.
@@ -301,22 +295,20 @@ def build_cases() -> list[ReadCase]:
                    "PolyG3550: both copies, one mismatch in the near copy",
                    "PolyG3550", start=0,
                    up_ctx=_sub(_up("PolyG3550", 0, 0), 23, "C"), tract=G * 13))
-    # The read ends inside the tract, 4 bases before the downstream flank, so
-    # the projected flank is not inside the read.
+    # The read ends inside the tract, 4 bases before the downstream flank.
     ends_in_tract = _case("read_ends_in_tract", "PolyG151: read ends after 8 of 12 Gs",
                           "PolyG151", tract=G * 8, dn_ctx="",
-                          drop_reason="flank_not_covered", true_tract=None)
+                          drop_reason="downstream_flank_not_placed", true_tract=None)
     c.append(dataclasses.replace(ends_in_tract,
                                  ref_end=ends_in_tract.up.run_side + 1 + 8))
-    # The molecule lost the upstream edge T and all 12 Gs. The upstream flank
-    # and the downstream flank then place their run-side bases on one T.
+    # The molecule lost the upstream edge T and all 12 Gs. No G follows the
+    # upstream flank or precedes the downstream one.
     c.append(_case("tract_and_edge_deleted", "PolyG151: edge T and G12 deleted",
                    "PolyG151", up_ctx=up151[:-1], tract="",
-                   drop_reason="flanks_crossed", true_tract=None))
-    # A 2-base deletion (AG of TTTAGAT) inside the upstream flank: two edits.
+                   drop_reason="downstream_flank_not_placed", true_tract=None))
+    # A 2-base deletion (AG of TTTAGAT) inside the upstream flank: one 2-base gap.
     c.append(_case("two_base_deletion_in_flank", "PolyG151: AG deleted from TTTAGAT",
-                   "PolyG151", up_ctx=_del(up151, len(up151) - 4, 2), tract=G * 12,
-                   drop_reason="flank_not_placed", true_tract=None))
+                   "PolyG151", up_ctx=_del(up151, len(up151) - 4, 2), tract=G * 12))
     return c
 
 
@@ -324,8 +316,9 @@ def run_stutter_with_flank_error_cases() -> list[ReadCase]:
     """Reads from donor A's normal at PolyG8057 where one mate's tract gains a base.
 
     Each read carries a run length the mate confirms, and one read error in
-    a flank next to a repeated flank base. Today's anchors and the mate give
-    the true tuple.
+    a flank next to a repeated flank base. The mate gives the true tuple.
+    Three of the read strings are also the read of a molecule with one more
+    G and one flank T deleted.
     """
     c: list[ReadCase] = []
     up = _up("PolyG8057")
@@ -578,78 +571,3 @@ def all_records(
     header = header_for(case.locus, orientation)
     for i, p in enumerate(placements(case)):
         yield p, to_record(header, case, p, orientation, f"{case.case_id}_{i}")
-
-
-# ---------------------------------------------------------------------------
-# Plain dynamic-programming reference for the flank match
-# ---------------------------------------------------------------------------
-
-
-def flank_edit_distance(flank: str, read: str, run_side_index: int, *, upstream: bool,
-                        masked: tuple[int, ...] = ()) -> int:
-    """Fewest edits that place `flank` with its run-side base on `read[run_side_index]`.
-
-    The run-side base is matched against that read base and costs nothing:
-    the caller checks it is a non-G base. The other nine flank bases align
-    to the read bases on the far side of it, by unit-cost edit distance,
-    with the outer end free in the read. A masked flank offset matches any
-    read base. Plain quadratic DP; the reference for the kernel's band-1
-    search.
-    """
-    if upstream:
-        pattern = flank[:-1][::-1]
-        text = read[:run_side_index][::-1]
-        mask = {len(flank) - 2 - m for m in masked if m != len(flank) - 1}
-    else:
-        pattern = flank[1:]
-        text = read[run_side_index + 1:]
-        mask = {m - 1 for m in masked if m != 0}
-    # Row i: pattern prefix of length i. Column j: text prefix of length j.
-    # Pattern starts at the run side, so it is anchored at text position 0;
-    # its outer end may stop at any text position.
-    n, m = len(pattern), len(text)
-    prev = list(range(m + 1))
-    for i in range(1, n + 1):
-        cur = [i] + [0] * m
-        for j in range(1, m + 1):
-            sub = 0 if (i - 1 in mask or pattern[i - 1] == text[j - 1]) else 1
-            cur[j] = min(prev[j - 1] + sub, prev[j] + 1, cur[j - 1] + 1)
-        prev = cur
-    return min(prev)
-
-
-def flank_mismatches(flank: str, read: str, run_side_index: int, *, upstream: bool,
-                     masked: tuple[int, ...] = ()) -> int:
-    """Mismatches of the gapless placement; a flank base past the read end is one."""
-    k = len(flank)
-    n = 0
-    for offset in range(k):
-        if offset == (k - 1 if upstream else 0) or offset in masked:
-            continue
-        i = run_side_index - (k - 1 - offset) if upstream else run_side_index + offset
-        if not 0 <= i < len(read) or read[i] != flank[offset]:
-            n += 1
-    return n
-
-
-# Costs of the weighted flank match: one mismatch, one 1-base indel, and two
-# or more edits.
-MISMATCH_COST, INDEL_COST, TWO_OR_MORE_EDITS = 1, 2, 3
-
-
-def flank_edit_cost(flank: str, read: str, run_side_index: int, *, upstream: bool,
-                    masked: tuple[int, ...] = ()) -> int:
-    """Weighted cost of the flank placement, from the plain DP edit distance.
-
-    No edit costs 0, one mismatch 1, one 1-base indel 2, and two or more
-    edits 3. The reference for the kernel's band-1 search.
-    """
-    distance = flank_edit_distance(flank, read, run_side_index, upstream=upstream,
-                                   masked=masked)
-    if distance == 0:
-        return 0
-    if distance > 1:
-        return TWO_OR_MORE_EDITS
-    if flank_mismatches(flank, read, run_side_index, upstream=upstream, masked=masked) == 1:
-        return MISMATCH_COST
-    return INDEL_COST

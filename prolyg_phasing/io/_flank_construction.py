@@ -1,104 +1,108 @@
-"""Per-donor flank construction from the matched normal's reads.
+"""Per-donor flank construction: the pair of flanks that maximizes one objective.
 
-At each locus side, a donor can carry a G where the reference has the edge
-base, or a non-G base further out. That G belongs to the repeat in this
-donor, so the flank must start past it. This module reads the matched
-normal once and builds one :class:`FlankRecord` per locus side:
+For each locus, the flanks are the pair of 10-base strings ``(u, v)`` that
+maximizes, over the matched normal's reads,
 
-1. **Candidates.** In polyG orientation, walk outward from the repeat over
-   the reference. Each non-G base within `_CANDIDATE_SPAN` bases is a
-   candidate. The first candidate is the edge base. ``d`` is the distance
-   from the edge base, outward (the edge base has ``d = 0``).
-2. **Count.** In each read, place the outer marker (the `FLANKING_SEQ_LEN`
-   reference bases just past the candidate span) by the read's alignment
-   and a Hamming search around that projection. Read each candidate from
-   the read sequence by its position from the placed marker, not from
-   the aligner's pileup: next to a G run, the aligner can put an indel on
-   a different base than the read shows. Only reads that place the
-   marker count. At each candidate, ``n`` is the number of those reads
-   that cover it and ``x`` the number with a G there.
-3. **Error rate e.** The pooled G share over candidates far from the
-   repeat, with enough reads, not next to a reference GGG, and with a G
-   share too low for a donor G.
-4. **Call.** Each candidate is "read error" (a read shows a G with
-   probability e) or "G in the donor" (probability 0.5 or 1 - e, the
-   better of the two). The higher binomial log-likelihood wins; a tie and
-   a candidate with no reads are read error.
-5. **Flank.** The flank's run-side base is the first candidate, from the
-   repeat outward, that is called read error. The flank is the
-   `FLANKING_SEQ_LEN` reference bases that end (upstream) or start
-   (downstream) there. Other flank positions that are candidates called G
-   in the donor are masked. If no candidate is called read error, the
-   flank stays at the edge base and the side is flagged.
+    F(u, v) = sum over reads of max(0, the value of the read's best placement),
 
-The unit of every count is the read. The PCR copies of one MI family count
-as separate reads. This does not move a call, because ``x`` and ``n``
-scale together, but the log-likelihood gap between the two explanations
-is larger than the evidence of the independent molecules.
+where the match, the placement and the value are those of
+:mod:`prolyg_phasing.io._flank_placement`. A read with no placement, or
+whose best value is negative, adds 0. The constraints:
+
+- The last base of ``u`` and the first base of ``v`` are not G.
+- ``u`` does not end with three G and then its last base; ``v`` does not
+  start with its first base and then three G. Joining such a piece to the
+  tract raises each read's value, so the tract must not stop in front of it.
+- Each of ``u`` and ``v`` is a candidate: it occurs exactly at a tract edge
+  in at least one read. A ``u`` candidate is the 10 bases that end at a
+  non-G base followed by a G; a ``v`` candidate is the 10 bases that start
+  at a non-G base preceded by a G.
+
+**The search is exact over the candidates.** All values are integers in
+half units. The downstream side runs the upstream code on per-read
+reversed reads with reversed strings: ``v`` matches read ``r`` at start
+``b`` exactly when ``reverse(v)`` matches ``reverse(r)`` at end
+``len(r) - 1 - b``.
+
+1. **Index.** Per side, the 12-base window that ends at each tract edge is
+   stored once per distinct window, with the read positions that show it.
+   Every candidate's matches to the distinct windows, with their lowest
+   cost, come from listing each window's neighbors under the match rule.
+2. **Bounds.** ``M[r, a]`` is the best tract score that starts after edge
+   ``a`` of read ``r``. A candidate's position bound sums ``max(0, M -
+   cost)`` over its matched positions, weighted by read count. Its
+   per-read bound takes the largest such term per read. A pair's joint
+   bound sums, per read, the smaller of its two per-read bounds. Each
+   bound is at least F of every pair it covers.
+3. **Search.** A first best value comes from the 40 candidates per side
+   with the highest position bound. Then every pair whose bounds reach the
+   current best is evaluated exactly. All pairs that reach the optimum are
+   kept.
+
+The optimal pair is then placed in every read by
+:func:`~prolyg_phasing.io._flank_placement.place_polyg_reads`, the
+function extraction uses, and the summed value must equal the optimum.
+
+Each flank is then found in the locus reference window by the same match
+rule (:func:`~prolyg_phasing.io._flank_placement.locate_flank`). The
+phasing window starts past it.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import json
 import os
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Iterator, Sequence
 from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pysam
-from scipy.special import xlogy
 
-from prolyg_phasing.io._anchors import (
-    build_anchors,
-    get_reference_window,
-    hamming_search,
-    revcomp,
-)
+from prolyg_phasing.io._anchors import build_anchors, get_reference_window, revcomp
 from prolyg_phasing.io._flank_placement import (
+    FLANK_LEN,
+    FLANK_PLACE_VALUES,
+    MAX_MATCH_LEN,
+    MIN_MATCH_LEN,
+    PAD,
+    SHAPES,
+    SUBSTITUTION_COST,
+    WINDOW_PLACE_VALUES,
     WINDOW_RECOVERED,
     WINDOW_UNRECOVERABLE,
     FlankRecord,
-    _pack,
-    _project,
-    polyg_alignments,
-    window_reference_position,
+    G,
+    N,
+    code_matrix,
+    decode,
+    edge_windows,
+    place_polyg_reads,
+    polyg_reads,
+    reference_flank,
+    tract_edges,
+    tract_scores,
 )
 from prolyg_phasing.io.bam import (
-    FLANKING_SEQ_LEN,
     REF_WINDOW_PAD,
     _load_bed,
     filtered_alignments,
     new_locus_qc,
 )
 
-# Candidates are the non-G reference bases within this many bases of the
-# repeat, the edge base included.
-_CANDIDATE_SPAN = 20
+# Candidates per side whose pairs give the first best value.
+_SEED_CANDIDATES = 40
 
-# The error rate pools only candidates at least this many bases from the
-# repeat, where a donor G next to the run is rare.
-_ERROR_MIN_DISTANCE = 10
+# Candidates per batch when match lists are expanded.
+_LIST_BATCH = 64
 
-# The error rate pools only candidates with at least this many reads.
-_ERROR_MIN_READS = 20
+# Stands in for the bound when every match of a window is listed.
+_LIST_ALL = 1 << 20
 
-# The error rate pools only candidates whose G share is below this; a higher
-# share can come from a G in the donor.
-_ERROR_MAX_G_SHARE = 0.05
-
-# Read offsets on each side of the projected outer marker that the Hamming
-# search scores.
-_MARKER_SEARCH = 3
-
-# Highest Hamming distance at which the outer marker counts as placed. It
-# allows one read error in the marker.
-_MARKER_HAMMING_MAX = 1
-
-# A candidate is "next to a reference GGG" when this G run touches it.
-_GGG = "GGG"
+# Largest cell count of one 0/1 matrix block in the joint bound.
+_JOINT_BOUND_CELLS = 20_000_000
 
 # Memory one worker process can use at a deep locus, with headroom.
 _WORKER_MEMORY_BYTES = 1 << 30
@@ -113,314 +117,480 @@ _FREE_CORE_SHARE = 0.125
 _FILTERS = {"min_mapq": 40, "drop_chimeric": True, "max_tlen": 1000}
 
 SIDES = ("upstream", "downstream")
-CALLS = ("read_error", "g_in_donor")
+
+# Sentinel tract score: below every real one.
+_NEG = -(1 << 30)
 
 
 # ---------------------------------------------------------------------------
-# Candidates
+# The candidate index of one side
 # ---------------------------------------------------------------------------
 
 
-@dataclasses.dataclass(frozen=True)
-class SideCandidates:
-    """The candidates of one locus side, in polyG-orientation window indices.
+def window_neighbors(windows: np.ndarray, bound: np.ndarray
+                     ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Every 10-base string that matches the end of a window at a cost below its bound.
+
+    Yields ``(string code, window index, bound - cost)`` arrays; a string
+    can repeat for one window, once per shape it matches by. The match
+    rule is `SHAPES` with the costs of :mod:`._flank_placement`: the
+    gapless shape allows one substitution, a gap shape none. A flank base
+    that a deletion shape leaves out of the read takes every base. A read
+    N matches no flank base, so a window with an N matches only by a
+    substitution there.
+    """
+    ids = np.arange(len(windows))
+    for shape in SHAPES:
+        live = bound > shape.cost
+        if not live.any():
+            continue
+        sub = windows[:, MAX_MATCH_LEN - shape.length:]
+        inside = (sub != PAD).all(axis=1) & live
+        core = sub[:, list(shape.read_slots)]
+        flank_slots = list(shape.flank_slots)
+        is_n = core == N
+        n_count = is_n.sum(axis=1)
+        core0 = np.where(is_n, 0, core).astype(np.int64)
+        base_code = core0 @ FLANK_PLACE_VALUES[flank_slots]
+        missing = list(range(shape.at, shape.at + shape.gap)) if shape.kind == "deletion" else []
+        fills = [sum(int(c) * int(FLANK_PLACE_VALUES[p]) for c, p in zip(f, missing, strict=True))
+                 for f in np.ndindex(*([4] * len(missing)))] if missing else [0]
+        exact = inside & (n_count == 0)
+        if exact.any():
+            for fill in fills:
+                yield base_code[exact] + fill, ids[exact], bound[exact] - shape.cost
+        if shape.kind != "none":
+            continue
+        for j, p in enumerate(flank_slots):
+            ok = inside & (bound > SUBSTITUTION_COST) & ((n_count == 0)
+                                                        | ((n_count == 1) & is_n[:, j]))
+            if not ok.any():
+                continue
+            for c in range(4):
+                other = core[ok, j] != c
+                code = base_code[ok] + (c - core0[ok, j]) * FLANK_PLACE_VALUES[p]
+                yield code[other], ids[ok][other], (bound[ok] - SUBSTITUTION_COST)[other]
+
+
+def _split_lists(n: int, k: np.ndarray, r: np.ndarray, p: np.ndarray, c: np.ndarray
+                 ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Per-list (reads, positions, costs) arrays from rows sorted by list index `k`."""
+    bounds = np.searchsorted(k, np.arange(n + 1))
+    r, p, c = r.astype(np.int32), p.astype(np.uint8), c.astype(np.uint8)
+    return [(r[bounds[i]:bounds[i + 1]], p[bounds[i]:bounds[i + 1]], c[bounds[i]:bounds[i + 1]])
+            for i in range(n)]
+
+
+class _ReadSide:
+    """The reads of one side: forward for ``u``, reversed per read for ``v``.
 
     Attributes
     ----------
-    upstream : bool
-        True for the upstream side.
-    edge_index : int
-        Window index of the edge base.
-    d : tuple of int
-        Distance of each candidate from the edge base, outward.
-    window_indices : tuple of int
-        Window index of each candidate.
-    ref_bases : str
-        Reference base of each candidate.
-    near_ggg : tuple of bool
-        Whether a reference GGG touches the candidate on either side.
-    marker_start : int
-        Window index of the outer marker's first base, in read order.
-    marker : str
-        The outer marker bases, in polyG orientation.
+    mat : ndarray of uint8, shape (n_reads, width)
+        Base codes, PAD past each read.
+    lengths : ndarray of int64
+    weights : ndarray of int64
+        The count of each distinct read.
+    scores : ndarray of int64
+        :func:`tract_scores` of `mat`.
+    best_tract : ndarray of int64
+        ``M[r, a]``: the best tract score from edge ``a`` to a closing edge
+        with room for a downstream match, at least 0; 0 where ``a`` is not
+        an edge.
+    windows : ndarray
+        The distinct 12-base edge windows.
+    candidates : ndarray of int64
+        Sorted candidate codes, in side orientation.
+    position_bound : ndarray of int64
+        Each candidate's position-summed bound.
     """
 
-    upstream: bool
-    edge_index: int
-    d: tuple[int, ...]
-    window_indices: tuple[int, ...]
-    ref_bases: str
-    near_ggg: tuple[bool, ...]
-    marker_start: int
-    marker: str
+    def __init__(self, strings: Sequence[str], weights: np.ndarray, *, reverse: bool):
+        self.mat, self.lengths = code_matrix(strings, reverse=reverse)
+        self.n_reads, self.width = self.mat.shape
+        if self.n_reads >= 1 << 24 or self.width >= 256:
+            raise ValueError("a locus holds fewer than 2^24 distinct reads of at most "
+                             "255 bases")
+        self.weights = np.asarray(weights, dtype=np.int64)
+        self.scores = tract_scores(self.mat)
+        self._bound_tracts()
+        self._index()
+
+    def _bound_tracts(self) -> None:
+        mat, lengths, width = self.mat, self.lengths, self.width
+        is_g = mat == G
+        prev_g = np.zeros_like(is_g)
+        prev_g[:, 1:] = is_g[:, :-1]
+        next_g = np.zeros_like(is_g)
+        next_g[:, :-1] = is_g[:, 1:]
+        col = np.arange(width)[None, :]
+        closing = (~is_g) & (mat != PAD) & prev_g & (col <= lengths[:, None] - MIN_MATCH_LEN)
+        best_close = np.maximum.accumulate(
+            np.where(closing, self.scores[:, :width], _NEG)[:, ::-1], axis=1)[:, ::-1]
+        bound = np.zeros((self.n_reads, width), dtype=np.int64)
+        bound[:, :-1] = best_close[:, 1:] - self.scores[:, 1:width]
+        bound = np.maximum(bound, 0)
+        opening = (~is_g) & next_g & (col >= MIN_MATCH_LEN - 1) & (col < lengths[:, None])
+        self.best_tract = np.where(opening, bound, 0)
+
+    def _index(self) -> None:
+        r, a = tract_edges(self.mat)
+        windows = edge_windows(self.mat, r, a)
+        _, first, inverse = np.unique(windows.astype(np.int64) @ WINDOW_PLACE_VALUES,
+                                      return_index=True, return_inverse=True)
+        inverse = inverse.ravel()
+        n_windows = len(first)
+        self.windows = windows[first]
+        order = np.argsort(inverse, kind="stable")
+        self.position_read = r[order].astype(np.int32)
+        self.position_edge = a[order].astype(np.int16)
+        self.window_start = np.r_[0, np.cumsum(np.bincount(inverse, minlength=n_windows))]
+
+        # Candidates: the last 10 window bases, all A/C/G/T, and not three G
+        # before the edge base.
+        last = self.windows[:, MAX_MATCH_LEN - FLANK_LEN:]
+        ok = (last < N).all(axis=1) & ~(last[:, -4:-1] == G).all(axis=1)
+        self.candidates = np.unique(last[ok].astype(np.int64) @ FLANK_PLACE_VALUES)
+        n_cand = len(self.candidates)
+
+        # Every (candidate, window) match with its lowest cost.
+        xs, ws, costs = [], [], []
+        if n_cand:
+            for code, window, rest in window_neighbors(
+                    self.windows, np.full(n_windows, _LIST_ALL, dtype=np.int64)):
+                j = np.minimum(np.searchsorted(self.candidates, code), n_cand - 1)
+                hit = self.candidates[j] == code
+                if hit.any():
+                    xs.append(j[hit])
+                    ws.append(window[hit])
+                    costs.append(_LIST_ALL - rest[hit])
+        if xs:
+            key = np.sort((np.concatenate(xs).astype(np.int64) * n_windows
+                           + np.concatenate(ws)) * 16 + np.concatenate(costs))
+            pair = key >> 4
+            key = key[np.r_[True, pair[1:] != pair[:-1]]]
+            self.match_candidate = (key >> 4) // n_windows
+            self.match_window = (key >> 4) % n_windows
+        else:
+            key = np.zeros(0, dtype=np.int64)
+            self.match_candidate = self.match_window = key
+        self.match_cost = key & 15
+        self.candidate_start = np.searchsorted(self.match_candidate, np.arange(n_cand + 1))
+
+        # Position-summed bound: sum over matched positions of w_r * max(0, M - cost).
+        best = self.best_tract[self.position_read, self.position_edge].astype(np.int64)
+        weight = self.weights[self.position_read]
+        window_of_position = np.repeat(np.arange(n_windows), np.diff(self.window_start))
+        bound = np.zeros(n_cand, dtype=np.int64)
+        for c in np.unique(self.match_cost):
+            per_window = np.bincount(window_of_position,
+                                     weights=weight * np.maximum(best - c, 0),
+                                     minlength=n_windows)
+            m = self.match_cost == c
+            bound += np.bincount(self.match_candidate[m], weights=per_window[self.match_window[m]],
+                                 minlength=n_cand).astype(np.int64)
+        self.position_bound = bound
+
+    def match_rows(self, cidx: np.ndarray
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """(list index, read, edge, cost) for the candidates `cidx`, sorted by the first three."""
+        cidx = np.asarray(cidx, dtype=np.int64)
+        lo, hi = self.candidate_start[cidx], self.candidate_start[cidx + 1]
+        n_rows = hi - lo
+        if not n_rows.sum():
+            z = np.zeros(0, dtype=np.int64)
+            return z, z, z, z
+        k = np.repeat(np.arange(len(cidx)), n_rows)
+        rows = np.repeat(lo - np.cumsum(n_rows) + n_rows, n_rows) + np.arange(n_rows.sum())
+        window, cost = self.match_window[rows], self.match_cost[rows]
+        n_pos = self.window_start[window + 1] - self.window_start[window]
+        p = (np.repeat(self.window_start[window] - np.cumsum(n_pos) + n_pos, n_pos)
+             + np.arange(int(n_pos.sum())))
+        k, cost = np.repeat(k, n_pos), np.repeat(cost, n_pos)
+        # One packed key, sorted once: list (27 bits) | read (24) | edge (8) | cost (4).
+        key = ((((k << 24) | self.position_read[p].astype(np.int64)) << 8
+                | self.position_edge[p].astype(np.int64)) << 4) | cost
+        key.sort()
+        return key >> 36, (key >> 12) & 0xFFFFFF, (key >> 4) & 0xFF, key & 0xF
 
 
-def list_candidates(polyg_window: str, edge_index: int, *, upstream: bool) -> SideCandidates:
-    """The candidates and the outer marker of one locus side.
+# ---------------------------------------------------------------------------
+# The pair search over one locus
+# ---------------------------------------------------------------------------
 
-    The candidates are the non-G bases at distance ``d`` in
-    ``[0, _CANDIDATE_SPAN)`` from the edge base, outward. Where the window
-    is too short for the marker past that span, the span shrinks so that
-    the marker stays inside the window.
 
-    Parameters
-    ----------
-    polyg_window : str
-        The reference window in polyG orientation.
-    edge_index : int
-        Window index of the edge base of this side.
-    upstream : bool
-        True for the upstream side (outward is toward index 0).
+class _LocusSearch:
+    """The two sides of one locus, and F over pairs of their match lists."""
+
+    def __init__(self, strings: Sequence[str], weights: Sequence[int]):
+        self.strings = list(strings)
+        self.weights = np.asarray(weights, dtype=np.int64)
+        self.u = _ReadSide(self.strings, self.weights, reverse=False)
+        self.v = _ReadSide(self.strings, self.weights, reverse=True)
+        self.n_reads = self.u.n_reads
+        self.lengths = self.u.lengths
+        self.scores = self.u.scores
+        self.width = self.u.width
+
+    def u_lists(self, cidx: np.ndarray) -> list:
+        k, r, a, c = self.u.match_rows(cidx)
+        return _split_lists(len(cidx), k, r, a, c)
+
+    def v_lists(self, cidx: np.ndarray) -> list:
+        """Match lists of `v` candidates; positions are forward starts ``b``."""
+        k, r, a, c = self.v.match_rows(cidx)
+        return _split_lists(len(cidx), k, r, self.lengths[r] - 1 - a, c)
+
+    def per_read_bound(self, lst, side: str) -> int:
+        """``sum_r w_r max(0, max over the list's positions in r of M - cost)``."""
+        r, p, c = (np.asarray(t, np.int64) for t in lst)
+        if not len(r):
+            return 0
+        if side == "u":
+            val = np.maximum(self.u.best_tract[r, p] - c, 0)
+        else:
+            val = np.maximum(self.v.best_tract[r, self.lengths[r] - 1 - p] - c, 0)
+        best = np.zeros(self.n_reads, dtype=np.int64)
+        np.maximum.at(best, r, val)
+        return int((best * self.weights).sum())
+
+    def objective_block(self, ul, vls) -> np.ndarray:
+        """F(u, v) for one ``u`` match list against several ``v`` match lists.
+
+        Per read: max(0, max over ``b`` of ``scores[b] - cost_v(b) -
+        min{scores[a + 1] + cost_u(a) : a < b}``).
+        """
+        out = np.zeros(len(vls), dtype=np.int64)
+        ru, au, cu = (np.asarray(t, np.int64) for t in ul)
+        if not len(ru) or not vls:
+            return out
+        far = 1 << 40
+        rows, loc = np.unique(ru, return_inverse=True)
+        loc = loc.ravel()
+        lut = np.full(self.n_reads, -1, dtype=np.int64)
+        lut[rows] = np.arange(len(rows))
+        arr = np.full((len(rows), self.width + 1), far, dtype=np.int64)
+        np.minimum.at(arr, (loc, au + 1), self.scores[ru, au + 1] + cu)
+        prefix_min = np.minimum.accumulate(arr, axis=1)
+        vid = np.concatenate([np.full(len(v[0]), i) for i, v in enumerate(vls)])
+        rv = np.concatenate([v[0] for v in vls]).astype(np.int64)
+        bv = np.concatenate([v[1] for v in vls]).astype(np.int64)
+        cv = np.concatenate([v[2] for v in vls]).astype(np.int64)
+        lv = lut[rv]
+        keep = lv >= 0
+        vid, rv, bv, cv, lv = vid[keep], rv[keep], bv[keep], cv[keep], lv[keep]
+        pm = prefix_min[lv, bv]
+        keep = pm < far // 2
+        vid, rv, bv, cv, pm = vid[keep], rv[keep], bv[keep], cv[keep], pm[keep]
+        if not len(vid):
+            return out
+        val = self.scores[rv, bv] - cv - pm
+        key = vid * self.n_reads + rv
+        o = np.argsort(key, kind="stable")
+        key, val = key[o], val[o]
+        st = np.nonzero(np.r_[True, key[1:] != key[:-1]])[0]
+        best = np.maximum(np.maximum.reduceat(val, st), 0)
+        k0 = key[st]
+        out += np.bincount(k0 // self.n_reads, weights=best * self.weights[k0 % self.n_reads],
+                           minlength=len(vls)).astype(np.int64)
+        return out
+
+
+def _collect(search: _LocusSearch, cidx: np.ndarray, side: str, keep: int) -> dict:
+    """Match lists of the candidates whose per-read bound reaches `keep`, by index in `cidx`."""
+    kept = {}
+    for b0 in range(0, len(cidx), _LIST_BATCH):
+        part = cidx[b0:b0 + _LIST_BATCH]
+        lists = search.u_lists(part) if side == "u" else search.v_lists(part)
+        for j, lst in enumerate(lists):
+            if search.per_read_bound(lst, side) >= keep:
+                kept[b0 + j] = lst
+    return kept
+
+
+def _dedupe(lists: list) -> tuple[list, np.ndarray]:
+    """Group candidates with identical match lists; F depends only on the list."""
+    signature: dict[bytes, int] = {}
+    distinct, inverse = [], []
+    for lst in lists:
+        key = lst[0].tobytes() + lst[1].tobytes() + lst[2].tobytes()
+        if key not in signature:
+            signature[key] = len(distinct)
+            distinct.append(lst)
+        inverse.append(signature[key])
+    return distinct, np.array(inverse, dtype=np.int64)
+
+
+def _read_bounds(search: _LocusSearch, lists: list, side: str) -> np.ndarray:
+    """Per-read bound of each list, ``max(0, max over its positions of M - cost)``,
+    as a dense (n_lists, n_reads) int16 matrix."""
+    out = np.zeros((len(lists), search.n_reads), dtype=np.int16)
+    best_tract = search.u.best_tract if side == "u" else search.v.best_tract
+    for i, (r, p, c) in enumerate(lists):
+        if not len(r):
+            continue
+        r = r.astype(np.int64)
+        a = p.astype(np.int64) if side == "u" else search.lengths[r] - 1 - p.astype(np.int64)
+        np.maximum.at(out[i], r,
+                      np.maximum(best_tract[r, a] - c.astype(np.int64), 0).astype(np.int16))
+    return out
+
+
+def _merge_columns(bounds: np.ndarray, w: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Merge identical columns of bounds, summing their weights.
+
+    Columns are grouped by a random linear hash; the grouping is checked
+    column by column, so a hash collision raises instead of merging two
+    different columns.
     """
-    k = FLANKING_SEQ_LEN
-    if upstream:
-        span = max(0, min(_CANDIDATE_SPAN, edge_index - k + 1))
-        step = -1
-        marker_start = edge_index - span - k + 1
-    else:
-        span = max(0, min(_CANDIDATE_SPAN, len(polyg_window) - k - edge_index))
-        step = 1
-        marker_start = edge_index + span
-    d = []
-    indices = []
-    for dist in range(span):
-        i = edge_index + step * dist
-        if polyg_window[i] != "G":
-            d.append(dist)
-            indices.append(i)
-    near_ggg = tuple(
-        polyg_window[max(0, i - len(_GGG)):i] == _GGG
-        or polyg_window[i + 1:i + 1 + len(_GGG)] == _GGG
-        for i in indices
-    )
-    return SideCandidates(
-        upstream=upstream,
-        edge_index=edge_index,
-        d=tuple(d),
-        window_indices=tuple(indices),
-        ref_bases="".join(polyg_window[i] for i in indices),
-        near_ggg=near_ggg,
-        marker_start=marker_start,
-        marker=polyg_window[marker_start:marker_start + k],
-    )
+    rng = np.random.default_rng(0)
+    h = (rng.integers(1, 1 << 62, size=bounds.shape[0], dtype=np.int64)[:, None]
+         * bounds.astype(np.int64)).sum(0)
+    _, first, inv = np.unique(h, return_index=True, return_inverse=True)
+    inv = inv.ravel()
+    if not (bounds[:, first[inv]] == bounds).all():
+        raise RuntimeError("hash collision while merging read columns")
+    return bounds[:, first], np.bincount(inv, weights=w)
 
 
-# ---------------------------------------------------------------------------
-# Count
-# ---------------------------------------------------------------------------
+def _joint_bound(search: _LocusSearch, ul: list, vl: list) -> np.ndarray:
+    """``joint[i, j] = sum_r w_r min(bu_i[r], bv_j[r]) >= F(u_i, v_j)``.
 
-
-def read_candidate_bases(
-    reads: Sequence[str],
-    cigars: Sequence[Sequence[Sequence[int]]],
-    starts: np.ndarray,
-    side: SideCandidates,
-) -> tuple[np.ndarray, np.ndarray]:
-    """The base each read shows at each candidate of one side.
-
-    Parameters
-    ----------
-    reads, cigars, starts
-        Reads in polyG orientation, as :func:`polyg_alignments` returns
-        them.
-    side : SideCandidates
-        The side's candidates and outer marker.
-
-    Returns
-    -------
-    bases : ndarray of uint8, shape (n_reads, n_candidates)
-        The read base (ASCII) at each candidate, or 0 where the read does
-        not place the marker or does not cover the candidate.
-    placed : ndarray of bool, shape (n_reads,)
-        Whether the read places the outer marker.
-
-    Notes
-    -----
-    The marker's projection is the read index of its first base that the
-    alignment covers with an M operation, minus that base's offset in the
-    marker. A read with no such base does not place the marker. The
-    Hamming search scores every read offset within `_MARKER_SEARCH` of the
-    projection where the whole marker lies inside the read. The lowest
-    distance wins; on a tie the offset nearest the projection wins, then
-    the lower offset. A distance above `_MARKER_HAMMING_MAX` does not
-    place the marker. A candidate is read at the read index that keeps
-    its reference distance to the placed marker.
+    u_hits read's value is at most its ``u``-side bound and at most its
+    ``v``-side bound. Per read column, ``min(a, b)`` is the sum over the
+    column's distinct positive values ``t_1 < t_2 < ...`` of ``[a >= t_k]
+    [b >= t_k] (t_k - t_{k-1})``. So the bound is one product of 0/1 matrices,
+    done in blocks of thresholds. Every term is an integer and the sums
+    stay far below 2^53, so the float product is exact.
     """
-    n_reads = len(reads)
-    k = len(side.marker)
-    n_cand = len(side.d)
-    bases = np.zeros((n_reads, n_cand), dtype=np.uint8)
-    placed = np.zeros(n_reads, dtype=bool)
-    if n_reads == 0 or k == 0:
-        return bases, placed
-    lengths = np.fromiter((len(s) for s in reads), dtype=np.int64, count=n_reads)
-
-    projection = np.full(n_reads, np.iinfo(np.int64).min, dtype=np.int64)
-    for i in range(n_reads):
-        for j in range(k):
-            index, on_m = _project(cigars[i], int(starts[i]), side.marker_start + j,
-                                   int(lengths[i]))
-            if on_m:
-                projection[i] = index - j
-                break
-    projected = np.flatnonzero(projection != np.iinfo(np.int64).min)
-
-    # Hamming distance at each offset: one exact-length slice per (read,
-    # offset), so `hamming_search` scores that one offset.
-    shifts = np.arange(-_MARKER_SEARCH, _MARKER_SEARCH + 1)
-    offsets = projection[projected][:, None] + shifts[None, :]
-    inside = (offsets >= 0) & (offsets + k <= lengths[projected][:, None])
-    rows, cols = np.nonzero(inside)
-    slices = [reads[projected[r]][offsets[r, c]:offsets[r, c] + k]
-              for r, c in zip(rows.tolist(), cols.tolist(), strict=True)]
-    distance = np.full(offsets.shape, k + 1, dtype=np.int64)
-    distance[rows, cols] = hamming_search(slices, side.marker)[0]
-    # Order: distance, then nearness to the projection, then the lower offset.
-    key = distance * (4 * _MARKER_SEARCH + 4) + 2 * np.abs(shifts) + (shifts > 0)
-    best = key.argmin(axis=1)
-    best_distance = distance[np.arange(len(projected)), best]
-    ok = best_distance <= _MARKER_HAMMING_MAX
-    placed_rows = projected[ok]
-    marker_offset = offsets[np.arange(len(projected)), best][ok]
-    placed[placed_rows] = True
-    if placed_rows.size == 0 or n_cand == 0:
-        return bases, placed
-
-    matrix, _ = _pack([reads[i] for i in placed_rows.tolist()])
-    read_index = marker_offset[:, None] + (np.asarray(side.window_indices)[None, :]
-                                           - side.marker_start)
-    covered = (read_index >= 0) & (read_index < lengths[placed_rows][:, None])
-    clipped = np.clip(read_index, 0, matrix.shape[1] - 1)
-    values = matrix[np.arange(len(placed_rows))[:, None], clipped]
-    bases[placed_rows] = np.where(covered, values, 0)
-    return bases, placed
+    nu = len(ul)
+    u_bounds, v_bounds = _read_bounds(search, ul, "u"), _read_bounds(search, vl, "v")
+    live = (u_bounds.max(0) > 0) & (v_bounds.max(0) > 0)
+    joint = np.zeros((nu, len(vl)), dtype=np.float64)
+    if not live.any():
+        return joint.astype(np.int64)
+    bounds, w = _merge_columns(np.vstack([u_bounds[:, live], v_bounds[:, live]]),
+                               search.weights[live].astype(np.float64))
+    ordered = np.sort(bounds, axis=0)
+    new = np.vstack([ordered[:1] > 0, (ordered[1:] != ordered[:-1]) & (ordered[1:] > 0)])
+    col, row = np.nonzero(new.T)
+    t = ordered[row, col].astype(np.int64)
+    prev = np.r_[0, t[:-1]]
+    prev[np.r_[True, col[1:] != col[:-1]]] = 0
+    d = (t - prev) * w[col]
+    step = max(1, _JOINT_BOUND_CELLS // bounds.shape[0])
+    for k0 in range(0, len(t), step):
+        c_, t_ = col[k0:k0 + step], t[k0:k0 + step]
+        u_hits = (bounds[:nu, c_] >= t_) * d[k0:k0 + step]
+        v_hits = (bounds[nu:, c_] >= t_).astype(np.float64)
+        joint += u_hits @ v_hits.T
+    return np.rint(joint).astype(np.int64)
 
 
-def count_candidates(bases: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Per candidate, the reads that cover it (n) and those with a G there (x)."""
-    n = (bases != 0).sum(axis=0).astype(np.int64)
-    x = (bases == ord("G")).sum(axis=0).astype(np.int64)
-    return n, x
+def _best_pairs(search: _LocusSearch, ul: list, vl: list, floor: int
+                ) -> tuple[int, list[tuple[int, int]]]:
+    """All list pairs with F >= best, where best starts at `floor`.
+
+    A pair is evaluated only if its joint bound reaches the current best.
+    """
+    if not ul or not vl:
+        return floor, []
+    joint = _joint_bound(search, ul, vl)
+    best, ties = floor, []
+    for iu in np.argsort(-joint.max(1), kind="stable"):
+        if joint[iu].max() < best:
+            break
+        vi = np.nonzero(joint[iu] >= best)[0]
+        vi = vi[np.argsort(-joint[iu, vi], kind="stable")]
+        f = search.objective_block(ul[iu], [vl[j] for j in vi])
+        m = int(f.max())
+        if m > best:
+            best, ties = m, []
+        if m >= best:
+            ties += [(int(iu), int(vi[j])) for j in np.nonzero(f == best)[0]]
+    return best, ties
 
 
-# ---------------------------------------------------------------------------
-# Error rate and call
-# ---------------------------------------------------------------------------
+def _search_pairs(search: _LocusSearch, ui: np.ndarray, vi: np.ndarray, floor: int
+                  ) -> tuple[int, list[tuple[int, int]]]:
+    """Best F over the candidate pairs ``ui x vi`` with F >= `floor`, and every tied
+    pair as candidate indices. A candidate whose per-read bound is below `floor`
+    cannot reach it and takes no part."""
+    ku = _collect(search, ui, "u", floor)
+    kv = _collect(search, vi, "v", floor)
+    a, b = sorted(ku), sorted(kv)
+    ul, iu = _dedupe([ku[i] for i in a])
+    vl, iv = _dedupe([kv[i] for i in b])
+    best, ties = _best_pairs(search, ul, vl, floor)
+    pairs = set()
+    for ru, rv in ties:
+        for i in np.nonzero(iu == ru)[0]:
+            for j in np.nonzero(iv == rv)[0]:
+                pairs.add((int(ui[a[i]]), int(vi[b[j]])))
+    return best, sorted(pairs)
 
 
 @dataclasses.dataclass(frozen=True)
-class ErrorRate:
-    """The pooled error rate e and the positions it pools.
+class FlankPair:
+    """The optimal flank pair of one locus.
 
     Attributes
     ----------
-    e : float
-        Pooled ``x / n``.
-    x, n : int
-        Pooled G reads and covering reads.
-    position_g_shares : ndarray of float
-        The G share of each pooled position.
+    upstream, downstream : str
+        The pair, in polyG orientation. Of several optimal pairs, the first
+        in lexicographic order of ``(upstream, downstream)``.
+    objective_half_units : int
+        F of the pair, in half units.
+    optimal_pairs : tuple of (str, str)
+        Every optimal pair, in lexicographic order.
+    n_reads : int
+        The reads, with repeats.
+    n_reads_placed : int
+        The reads with at least one placement under the pair, of any value.
     """
 
-    e: float
-    x: int
-    n: int
-    position_g_shares: np.ndarray
-
-    @property
-    def n_positions(self) -> int:
-        return len(self.position_g_shares)
+    upstream: str
+    downstream: str
+    objective_half_units: int
+    optimal_pairs: tuple[tuple[str, str], ...]
+    n_reads: int
+    n_reads_placed: int
 
 
-def estimate_error_rate(d: np.ndarray, near_ggg: np.ndarray, n: np.ndarray,
-                        x: np.ndarray) -> ErrorRate:
-    """Pooled G share over the candidates that cannot carry a donor G.
+def solve_flank_pair(reads: Sequence[str]) -> FlankPair | None:
+    """The pair of flanks that maximizes F over `reads` (polyG orientation, upper-case).
 
-    A candidate is pooled when its distance is at least
-    `_ERROR_MIN_DISTANCE`, no reference GGG touches it, it has at least
-    `_ERROR_MIN_READS` reads, and its G share is below
-    `_ERROR_MAX_G_SHARE`. The arguments run over every candidate of every
-    locus side.
+    Returns None when no pair reaches F > 0. Raises RuntimeError when the
+    extraction's placement of the optimal pair does not give the optimum:
+    the search and the placement would then disagree on a read's tract.
     """
-    d, near_ggg, n, x = (np.asarray(a) for a in (d, near_ggg, n, x))
-    keep = (d >= _ERROR_MIN_DISTANCE) & ~near_ggg.astype(bool) & (n >= _ERROR_MIN_READS)
-    keep[keep] = x[keep] / n[keep] < _ERROR_MAX_G_SHARE
-    x_pool = int(x[keep].sum())
-    n_pool = int(n[keep].sum())
-    if n_pool == 0:
-        raise ValueError("no candidate qualifies for the error-rate estimate")
-    return ErrorRate(e=x_pool / n_pool, x=x_pool, n=n_pool,
-                     position_g_shares=x[keep] / n[keep])
-
-
-def call_candidates(n: np.ndarray, x: np.ndarray, e: float
-                    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Binomial log-likelihoods of the two explanations, and the call.
-
-    Returns ``(loglik_read_error, loglik_g_in_donor, g_in_donor)``. "Read
-    error" uses ``p = e``. "G in the donor" uses the better of ``p = 0.5``
-    and ``p = 1 - e``. A candidate is G in the donor only when its value
-    is strictly higher, so a candidate with no reads is read error.
-    """
-    n = np.asarray(n, dtype=float)
-    x = np.asarray(x, dtype=float)
-
-    def loglik(p: float) -> np.ndarray:
-        return xlogy(x, p) + xlogy(n - x, 1 - p)
-
-    ll_error = loglik(e)
-    ll_g = np.maximum(loglik(0.5), loglik(1 - e))
-    return ll_error, ll_g, ll_g > ll_error
-
-
-# ---------------------------------------------------------------------------
-# Flank
-# ---------------------------------------------------------------------------
-
-
-def choose_flank(
-    side: SideCandidates,
-    g_in_donor: np.ndarray,
-    polyg_window: str,
-    *,
-    ref_orientation: str,
-    window_start: int,
-) -> tuple[FlankRecord, int, bool]:
-    """The flank of one side, the distance of its run-side base, and the flag.
-
-    The run-side base is the first candidate called read error. When no
-    candidate is called read error, it is the edge base and the flag is
-    set. Other flank positions that are candidates called G in the donor
-    are masked.
-    """
-    g_in_donor = np.asarray(g_in_donor, dtype=bool)
-    read_error = np.flatnonzero(~g_in_donor)
-    no_read_error = read_error.size == 0
-    run_side_d = 0 if no_read_error else side.d[int(read_error[0])]
-    k = FLANKING_SEQ_LEN
-    if side.upstream:
-        run_side = side.edge_index - run_side_d
-        first = run_side - k + 1
-    else:
-        run_side = side.edge_index + run_side_d
-        first = run_side
-    masked = []
-    for dist, is_g in zip(side.d, g_in_donor.tolist(), strict=True):
-        step = dist - run_side_d
-        if is_g and 0 < step < k:
-            masked.append(k - 1 - step if side.upstream else step)
-    ref_positions = tuple(
-        window_reference_position(i, ref_orientation=ref_orientation,
-                                  window_start=window_start, window_len=len(polyg_window))
-        for i in range(first, first + k)
-    )
-    record = FlankRecord(
-        bases=polyg_window[first:first + k],
-        ref_positions=ref_positions,
-        run_side_offset=k - 1 if side.upstream else 0,
-        masked_offsets=tuple(sorted(masked)),
-    )
-    return record, run_side_d, no_read_error
+    counts = Counter(reads)
+    if not counts:
+        return None
+    strings = sorted(counts)
+    weights = np.array([counts[s] for s in strings], dtype=np.int64)
+    search = _LocusSearch(strings, weights)
+    if not len(search.u.candidates) or not len(search.v.candidates):
+        return None
+    ub_u, ub_v = search.u.position_bound, search.v.position_bound
+    seed_u = np.argsort(-ub_u, kind="stable")[:_SEED_CANDIDATES]
+    seed_v = np.argsort(-ub_v, kind="stable")[:_SEED_CANDIDATES]
+    first_best, _ = _search_pairs(search, seed_u, seed_v, 1)
+    floor = max(first_best, 1)
+    best, pairs = _search_pairs(search, np.nonzero(ub_u >= floor)[0],
+                                np.nonzero(ub_v >= floor)[0], floor)
+    if not pairs:
+        return None
+    optimal = sorted((decode(int(search.u.candidates[i])),
+                      decode(int(search.v.candidates[j]))[::-1]) for i, j in pairs)
+    upstream, downstream = optimal[0]
+    placement = place_polyg_reads(strings, upstream, downstream)
+    total = int((weights * np.maximum(placement.value, 0)).sum())
+    if total != best:
+        raise RuntimeError(f"the placement of the optimal pair ({upstream}, {downstream}) "
+                           f"gives F = {total} half units, the search {best}")
+    return FlankPair(upstream, downstream, best, tuple(optimal), int(weights.sum()),
+                     int(weights[placement.placed].sum()))
 
 
 # ---------------------------------------------------------------------------
@@ -430,27 +600,25 @@ def choose_flank(
 
 @dataclasses.dataclass
 class LocusReads:
-    """One locus's reference geometry and its filtered reads in polyG orientation.
+    """One locus's reference window and its filtered reads in polyG orientation.
 
-    `records` are the pysam alignments that overlap the BED interval and
-    pass the extraction's read filters; `reads`, `cigars` and `starts`
-    are the same reads in polyG orientation.
+    `reads` are the alignments that overlap the BED interval and pass the
+    extraction's read filters. `repeat_start` and `repeat_end` are the BED
+    interval's window indices in polyG orientation.
     """
 
     name: str
     ref_orientation: str
     window_start: int
     polyg_window: str
-    sides: dict[str, SideCandidates]
-    records: list[pysam.AlignedSegment]
+    repeat_start: int
+    repeat_end: int
     reads: list[str]
-    cigars: list[list[list[int]]]
-    starts: np.ndarray
 
 
 def locus_reads(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
                 bed_end: int) -> LocusReads | None:
-    """Geometry and filtered reads at one locus.
+    """Reference window and filtered reads at one locus.
 
     Returns None when no read rebuilds the reference window. Raises
     ValueError, naming the locus, when the window holds no edge base on a
@@ -461,55 +629,51 @@ def locus_reads(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
                                   min_mapq=_FILTERS["min_mapq"])
     if window is None:
         return None
-    anchors = build_anchors(window, REF_WINDOW_PAD, bed_end - bed_start, k=FLANKING_SEQ_LEN)
+    anchors = build_anchors(window, REF_WINDOW_PAD, bed_end - bed_start, k=FLANK_LEN)
     if anchors.status != "anchorable":
         raise ValueError(f"{name}: the reference window holds no edge base and flank on "
                          f"each side ({anchors.status})")
     polyg_window = revcomp(window) if anchors.ref_orientation == "-" else window
-    edges = {
-        "upstream": REF_WINDOW_PAD - anchors.g_walk_up - 1,
-        "downstream": REF_WINDOW_PAD + (bed_end - bed_start) + anchors.g_walk_dn,
-    }
-    sides = {s: list_candidates(polyg_window, edges[s], upstream=s == "upstream")
-             for s in SIDES}
     records = [r for r, _ in filtered_alignments(bam, chrom, bed_start, bed_end, bed_start,
                                                  bed_end, qc=new_locus_qc(), **_FILTERS)]
-    reads, cigars, starts = polyg_alignments(
-        [r.query_sequence for r in records], [r.cigartuples for r in records],
-        [r.reference_start for r in records], ref_orientation=anchors.ref_orientation,
-        window_start=window_start, window_len=len(window))
-    return LocusReads(name, anchors.ref_orientation, window_start, polyg_window, sides,
-                      records, reads, cigars, starts)
+    reads = polyg_reads([r.query_sequence for r in records], anchors.ref_orientation)
+    return LocusReads(name, anchors.ref_orientation, window_start, polyg_window,
+                      REF_WINDOW_PAD, REF_WINDOW_PAD + bed_end - bed_start, reads)
 
 
 @dataclasses.dataclass
-class LocusCounts:
-    """One locus's per-side candidates and counts (the count pass output)."""
+class LocusFlanks:
+    """One locus's flank pair, and where each flank lies in the reference.
+
+    `records` holds the upstream and downstream record; an entry is None
+    when that flank does not match the reference window.
+    """
 
     name: str
     ref_orientation: str
-    window_start: int
-    polyg_window: str
-    sides: dict[str, SideCandidates]
-    n: dict[str, np.ndarray]
-    x: dict[str, np.ndarray]
-    n_reads: int
-    n_marker_placed: dict[str, int]
+    pair: FlankPair | None
+    records: tuple[FlankRecord | None, FlankRecord | None]
 
 
-def count_locus(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
-                bed_end: int) -> LocusCounts | None:
-    """Count pass at one locus; None when no read rebuilds the reference window."""
+def solve_locus(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
+                bed_end: int) -> LocusFlanks | None:
+    """The flank pair at one locus; None when no read rebuilds the reference window.
+
+    Each flank is found in the reference window on its side of the BED
+    interval's middle.
+    """
     loc = locus_reads(bam, name, chrom, bed_start, bed_end)
     if loc is None:
         return None
-    n, x, n_placed = {}, {}, {}
-    for s in SIDES:
-        bases, placed = read_candidate_bases(loc.reads, loc.cigars, loc.starts, loc.sides[s])
-        n[s], x[s] = count_candidates(bases)
-        n_placed[s] = int(placed.sum())
-    return LocusCounts(name, loc.ref_orientation, loc.window_start, loc.polyg_window,
-                       loc.sides, n, x, len(loc.reads), n_placed)
+    pair = solve_flank_pair(loc.reads)
+    if pair is None:
+        return LocusFlanks(name, loc.ref_orientation, None, (None, None))
+    split = (loc.repeat_start + loc.repeat_end) // 2
+    records = tuple(
+        reference_flank(loc.polyg_window, bases, upstream=side == "upstream", split=split,
+                        ref_orientation=loc.ref_orientation, window_start=loc.window_start)
+        for side, bases in zip(SIDES, (pair.upstream, pair.downstream), strict=True))
+    return LocusFlanks(name, loc.ref_orientation, pair, records)
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +683,7 @@ def count_locus(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
 
 @dataclasses.dataclass
 class FlankConstruction:
-    """Flanks of one matched normal, with their QC tables.
+    """Flanks of one matched normal, with the per-side table.
 
     Attributes
     ----------
@@ -527,97 +691,73 @@ class FlankConstruction:
         The matched normal whose reads built the flanks.
     records : dict of str to (FlankRecord, FlankRecord)
         Upstream and downstream flank per locus with a reference window.
-    candidates : pandas.DataFrame
-        One row per candidate.
     sides : pandas.DataFrame
         One row per side of every BED locus.
-    error_rate : ErrorRate
     """
 
     sample: str
     records: dict[str, tuple[FlankRecord, FlankRecord]]
-    candidates: pd.DataFrame
     sides: pd.DataFrame
-    error_rate: ErrorRate
 
 
-_SIDE_COLUMNS = ("locus", "side", "reference_window_status", "ref_orientation", "flank_d",
-                 "flank_bases", "flank_ref_positions", "masked_offsets",
-                 "no_read_error_candidate", "n_candidates", "n_reads", "n_marker_placed")
+SIDE_COLUMNS = ("locus", "side", "reference_window_status", "ref_orientation",
+                "flank_bases", "flank_ref_positions", "objective", "n_reads",
+                "n_reads_placed", "n_tied_pairs")
 
 # Integer columns of the side table that a side with no reference window
 # leaves empty.
-_SIDE_INT_COLUMNS = ("flank_d", "no_read_error_candidate", "n_reads", "n_marker_placed")
+_SIDE_INT_COLUMNS = ("n_reads", "n_reads_placed", "n_tied_pairs")
 
 
-def construct_flanks(loci: Sequence[tuple[str, LocusCounts | None]], *, sample: str
+def construct_flanks(loci: Sequence[tuple[str, LocusFlanks | None]], *, sample: str
                      ) -> FlankConstruction:
-    """Error rate, calls and flanks from the count pass of every BED locus of `sample`.
+    """The side table and flank records from the solved loci, in BED order.
 
-    `loci` lists each BED locus in BED order with its counts, or None when
-    no read rebuilt its reference window. Such a locus gets a side row on
-    each side with the status `WINDOW_UNRECOVERABLE` and empty flank fields,
-    no candidate rows and no flank record; it adds nothing to the error
-    rate.
+    A locus with None has no reference window: it gets a row on each side
+    with the status `WINDOW_UNRECOVERABLE`, empty flank fields and no
+    record. The locus columns (`objective`, the read counts, the tied
+    pairs) repeat on both side rows. `objective` is in the units of the
+    decision record, half the half-unit value.
+
+    Raises ValueError when a locus with a reference window has no pair with
+    F > 0, or when a flank does not match the reference window; the message
+    names every such locus or side.
     """
-    counts = [c for _, c in loci if c is not None]
-    rows = []
-    for loc in counts:
-        for s in SIDES:
-            side = loc.sides[s]
-            for i, dist in enumerate(side.d):
-                rows.append((loc.name, s, dist, side.ref_bases[i], side.near_ggg[i],
-                             int(loc.n[s][i]), int(loc.x[s][i])))
-    cand = pd.DataFrame(rows, columns=["locus", "side", "d", "ref_base", "near_ggg", "n", "x"])
-    error_rate = estimate_error_rate(cand["d"].to_numpy(), cand["near_ggg"].to_numpy(),
-                                     cand["n"].to_numpy(), cand["x"].to_numpy())
-    n = cand["n"].to_numpy()
-    with np.errstate(divide="ignore", invalid="ignore"):
-        cand["g_share"] = np.where(n > 0, cand["x"] / np.maximum(n, 1), np.nan)
-    ll_error, ll_g, is_g = call_candidates(n, cand["x"].to_numpy(), error_rate.e)
-    cand["loglik_read_error"] = ll_error
-    cand["loglik_g_in_donor"] = ll_g
-    cand["call"] = np.where(is_g, "g_in_donor", "read_error")
-    cand["near_ggg"] = cand["near_ggg"].astype(int)
-
+    no_pair = [name for name, loc in loci if loc is not None and loc.pair is None]
+    if no_pair:
+        raise ValueError(f"{sample}: no flank pair reaches F > 0 at {len(no_pair)} loci: "
+                         f"{no_pair}")
+    unlocated = [f"{name} {side}" for name, loc in loci if loc is not None
+                 for side, record in zip(SIDES, loc.records, strict=True) if record is None]
+    if unlocated:
+        raise ValueError(f"{sample}: {len(unlocated)} flanks do not match the reference "
+                         f"window: {unlocated}")
     records: dict[str, tuple[FlankRecord, FlankRecord]] = {}
-    side_rows = []
-    start = 0
+    rows = []
     for name, loc in loci:
         if loc is None:
-            for s in SIDES:
-                side_rows.append({
-                    "locus": name, "side": s, "reference_window_status": WINDOW_UNRECOVERABLE,
-                    "ref_orientation": "", "flank_d": None, "flank_bases": "",
-                    "flank_ref_positions": "", "masked_offsets": "",
-                    "no_read_error_candidate": None, "n_candidates": 0, "n_reads": None,
-                    "n_marker_placed": None,
-                })
+            for side in SIDES:
+                rows.append({"locus": name, "side": side,
+                             "reference_window_status": WINDOW_UNRECOVERABLE,
+                             "ref_orientation": "", "flank_bases": "",
+                             "flank_ref_positions": "", "objective": None, "n_reads": None,
+                             "n_reads_placed": None, "n_tied_pairs": None})
             continue
-        pair = []
-        for s in SIDES:
-            side = loc.sides[s]
-            stop = start + len(side.d)
-            record, run_side_d, flag = choose_flank(
-                side, is_g[start:stop], loc.polyg_window,
-                ref_orientation=loc.ref_orientation, window_start=loc.window_start)
-            start = stop
-            pair.append(record)
-            side_rows.append({
-                "locus": loc.name, "side": s, "reference_window_status": WINDOW_RECOVERED,
-                "ref_orientation": loc.ref_orientation,
-                "flank_d": run_side_d, "flank_bases": record.bases,
+        records[name] = loc.records
+        for side, record in zip(SIDES, loc.records, strict=True):
+            rows.append({
+                "locus": name, "side": side, "reference_window_status": WINDOW_RECOVERED,
+                "ref_orientation": loc.ref_orientation, "flank_bases": record.bases,
                 "flank_ref_positions": ",".join(map(str, record.ref_positions)),
-                "masked_offsets": ",".join(map(str, record.masked_offsets)),
-                "no_read_error_candidate": int(flag),
-                "n_candidates": len(side.d), "n_reads": loc.n_reads,
-                "n_marker_placed": loc.n_marker_placed[s],
+                "objective": loc.pair.objective_half_units / 2,
+                "n_reads": loc.pair.n_reads, "n_reads_placed": loc.pair.n_reads_placed,
+                "n_tied_pairs": len(loc.pair.optimal_pairs),
             })
-        records[loc.name] = (pair[0], pair[1])
-    sides = pd.DataFrame(side_rows, columns=_SIDE_COLUMNS)
+    sides = pd.DataFrame(rows, columns=list(SIDE_COLUMNS))
+    sides["objective"] = sides["objective"].astype(float)
     for column in _SIDE_INT_COLUMNS:
         sides[column] = sides[column].astype("Int64")
-    return FlankConstruction(sample, records, cand, sides, error_rate)
+    return FlankConstruction(sample, records, sides)
 
 
 _WORKER_BAM: dict[str, pysam.AlignmentFile] = {}
@@ -627,13 +767,13 @@ def _open_worker_bam(bam_path: str) -> None:
     _WORKER_BAM["bam"] = pysam.AlignmentFile(bam_path, "rb")
 
 
-def _count_bed_row(row: tuple[str, str, int, int]) -> tuple[str, LocusCounts | None]:
+def _solve_bed_row(row: tuple[str, str, int, int]) -> tuple[str, LocusFlanks | None]:
     name, chrom, bed_start, bed_end = row
-    return name, count_locus(_WORKER_BAM["bam"], name, chrom, bed_start, bed_end)
+    return name, solve_locus(_WORKER_BAM["bam"], name, chrom, bed_start, bed_end)
 
 
 def worker_count() -> int:
-    """Worker processes for the count pass, from the live box.
+    """Worker processes for the flank search, from the live box.
 
     The usable cores (``os.sched_getaffinity``) less `_FREE_CORE_SHARE` of
     them, and no more than `_WORKER_MEMORY_SHARE` of ``MemAvailable`` in
@@ -675,7 +815,7 @@ def sample_name(bam_path: str | Path, sample: str | None = None) -> str:
 
 def build_flanks(bam_path: str | Path, bed_path: str | Path, *, n_workers: int,
                  sample: str | None = None) -> FlankConstruction:
-    """Count pass over every BED locus of one matched normal, then the flanks.
+    """The flank pair of every BED locus of one matched normal.
 
     Loci run in parallel over `n_workers` processes. A locus whose reference
     window no read rebuilds gets no flank and a side row with the status
@@ -685,7 +825,7 @@ def build_flanks(bam_path: str | Path, bed_path: str | Path, *, n_workers: int,
     rows = _load_bed(Path(bed_path))
     n_workers = max(1, min(n_workers, len(rows)))
     with Pool(n_workers, initializer=_open_worker_bam, initargs=(str(bam_path),)) as pool:
-        results = pool.map(_count_bed_row, rows, chunksize=2)
+        results = pool.map(_solve_bed_row, rows, chunksize=1)
     return construct_flanks(results, sample=sample)
 
 
@@ -694,28 +834,14 @@ def build_flanks(bam_path: str | Path, bed_path: str | Path, *, n_workers: int,
 # ---------------------------------------------------------------------------
 
 
-def write_flank_tables(result: FlankConstruction, out_prefix: str | Path) -> list[Path]:
-    """Write the candidate TSV, the side TSV and the error-rate JSON.
+def write_flank_table(result: FlankConstruction, out_prefix: str | Path) -> Path:
+    """Write the side TSV, ``{out_prefix}_flank_sides.tsv``, and return its path.
 
-    The files are ``{out_prefix}_flank_candidates.tsv``,
-    ``{out_prefix}_flank_sides.tsv`` and ``{out_prefix}_error_rate.json``.
-    Each names the sample in a first ``sample`` column or key. Extraction
-    reads the side TSV with :func:`read_flank_table`.
+    The first column names the sample. Extraction reads the table with
+    :func:`~prolyg_phasing.io._flank_placement.read_flank_table`.
     """
-    prefix = str(out_prefix)
-    paths = [Path(f"{prefix}_flank_candidates.tsv"), Path(f"{prefix}_flank_sides.tsv"),
-             Path(f"{prefix}_error_rate.json")]
-    for table, path in ((result.candidates, paths[0]), (result.sides, paths[1])):
-        out = table.copy()
-        out.insert(0, "sample", result.sample)
-        out.to_csv(path, sep="\t", index=False)
-    er = result.error_rate
-    quantiles = [0.1, 0.5, 0.9, 0.99]
-    paths[2].write_text(json.dumps({
-        "sample": result.sample,
-        "e": er.e, "x": er.x, "n": er.n, "n_positions": er.n_positions,
-        "position_g_share_quantiles": dict(zip(
-            [f"q{int(q * 100):02d}" for q in quantiles],
-            np.quantile(er.position_g_shares, quantiles).tolist(), strict=True)),
-    }, indent=1))
-    return paths
+    path = Path(f"{out_prefix}_flank_sides.tsv")
+    out = result.sides.copy()
+    out.insert(0, "sample", result.sample)
+    out.to_csv(path, sep="\t", index=False)
+    return path

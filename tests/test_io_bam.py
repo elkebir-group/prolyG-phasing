@@ -51,11 +51,8 @@ REFERENCE = (
 )
 assert len(REFERENCE) == 200
 # Expected flanks from the fixture's matched normal, which carries the
-# reference at every read:
-# - upstream: pos 59 ('C') is the edge base and is called read error, so
-#   the flank is positions 50..60 = "ACGTACGTAC".
-# - downstream: pos 74 ('T') is the edge base, so the flank is positions
-#   74..84 = "TGCATGCATG".
+# reference at every read: the 10 bases on each side of the polyG region,
+# "ACGTACGTAC" at 50..60 and "TGCATGCATG" at 74..84.
 
 CHROM = "synth"
 BED_START = 60
@@ -157,8 +154,7 @@ def _make_test_bam(tmp_path: Path, reads: list[dict], name: str = "test") -> Pat
     return bam_path
 
 
-# Read pairs of the reference molecule in the fixture's matched normal: at
-# least the 20 reads the error rate needs at each pooled candidate.
+# Read pairs of the reference molecule in the fixture's matched normal.
 _NORMAL_PAIRS = 15
 
 _FLANK_TABLES: dict[str, Path] = {}
@@ -189,7 +185,7 @@ def _flank_table() -> Path:
         bam = _make_test_bam(out, reads, name="normal")
         bed = _make_bed(out, [(CHROM, BED_START, BED_END, "Locus1")])
         result = fc.build_flanks(bam, bed, n_workers=1, sample="NORMAL")
-        _FLANK_TABLES[key] = fc.write_flank_tables(result, out / "normal")[1]
+        _FLANK_TABLES[key] = fc.write_flank_table(result, out / "normal")
     return _FLANK_TABLES[key]
 
 
@@ -426,17 +422,18 @@ def _extract_one_locus(tmp_path, reads):
 
 def test_pair_merge_higher_quality_base_wins(tmp_path):
     """One differing base: the Q40 call beats the Q12 call; the pair counts once."""
-    # Tract index 0 is read index BED_START + 0 on a "+" locus.
+    # Tract index 1 is read index BED_START + 1 on a "+" locus. A tract
+    # starts with G, so the differing base is not the first one.
     reads = _pair_reads(
-        _tract_with({0: "G"}), _tract_with({0: "T"}),
-        _quality_at({}), _quality_at({BED_START: _LOW_Q}),
+        _tract_with({1: "G"}), _tract_with({1: "T"}),
+        _quality_at({}), _quality_at({BED_START + 1: _LOW_Q}),
     )
     loc = _extract_one_locus(tmp_path, reads)
     assert loc.n_read_pairs == 1
     assert loc.n_read_pairs_merged == 1
     assert loc.n_read_pairs_drop_disagree == 0
     assert int(loc.count.sum()) == 1
-    assert list(loc.seq) == [_tract_with({0: "G"})]
+    assert list(loc.seq) == [_tract_with({1: "G"})]
 
 
 def test_pair_merge_winner_differs_by_position(tmp_path):
@@ -458,7 +455,7 @@ def test_pair_merge_winner_differs_by_position(tmp_path):
 def test_pair_merge_equal_quality_drops(tmp_path):
     """Equal qualities at the differing base: the pair is dropped."""
     reads = _pair_reads(
-        _tract_with({0: "G"}), _tract_with({0: "T"}),
+        _tract_with({1: "G"}), _tract_with({1: "T"}),
         _quality_at({}), _quality_at({}),
     )
     loc = _extract_one_locus(tmp_path, reads)
@@ -504,17 +501,17 @@ def test_pair_merge_on_minus_locus_reverses_qualities(tmp_path, monkeypatch):
         plus_ref[:50] + revcomp(plus_ref[50:84]) + plus_ref[84:]
     )
     monkeypatch.setattr(sys.modules[__name__], "REFERENCE", minus_ref)
-    # Tract index 0 (polyG orientation) is read index BED_END - 1.
+    # Tract index 1 (polyG orientation) is read index BED_END - 2.
     reads = _pair_reads(
-        _tract_with({0: "G"}), _tract_with({0: "T"}),
-        _quality_at({}), _quality_at({BED_END - 1: _LOW_Q}),
+        _tract_with({1: "G"}), _tract_with({1: "T"}),
+        _quality_at({}), _quality_at({BED_END - 2: _LOW_Q}),
         orientation="-",
     )
     loc = _extract_one_locus(tmp_path, reads)
     assert loc.ref_orientation == "-"
     assert loc.n_read_pairs_merged == 1
     assert int(loc.count.sum()) == 1
-    assert list(loc.seq) == [_tract_with({0: "G"})]
+    assert list(loc.seq) == [_tract_with({1: "G"})]
 
 
 def test_pair_merge_low_quality_n_loses_to_called_base(tmp_path):
@@ -531,7 +528,7 @@ def test_pair_merge_low_quality_n_loses_to_called_base(tmp_path):
 def test_pair_merge_without_qualities_drops(tmp_path):
     """A mate with no stored qualities cannot be merged; the pair is dropped."""
     reads = _pair_reads(
-        _tract_with({0: "G"}), _tract_with({0: "T"}),
+        _tract_with({1: "G"}), _tract_with({1: "T"}),
         _quality_at({}), None, no_qualities_b=True,
     )
     loc = _extract_one_locus(tmp_path, reads)

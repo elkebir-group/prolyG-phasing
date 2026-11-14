@@ -1,18 +1,18 @@
-"""Tests for flank construction from the matched normal.
+"""Tests for flank construction: the pair of flanks that maximizes the objective.
 
-The candidate list, the call, the error rate and the flank choice are tested
-on hand-set counts. The count is tested on hand-built reads with every
-alignment an aligner can choose (`tests/_hand_built_reads.py`), in both
-locus orientations. One end-to-end test writes a small BAM, runs the
-parallel count pass, and checks the flank records against the flanks that
-the hand-built cases set by hand, through the side TSV.
+The solver is checked three ways. Hand-built read sets with a known optimum
+(one or two donor haplotypes) must give that pair and its tracts. On small
+random read sets, a brute-force search with the plain reference of
+`tests/_slow_flank_eval.py` over every candidate pair must give the same
+optimum and the same tied pairs. The candidate index must list exactly the
+matches that the library's match rule gives. One end-to-end test writes a
+small BAM, runs `build_flanks` and reads the side TSV back.
 """
 
 from __future__ import annotations
 
-import json
-import math
 import os
+import random
 from pathlib import Path
 
 import numpy as np
@@ -21,11 +21,23 @@ import pysam
 import pytest
 
 import prolyg_phasing.io._flank_construction as fc
-from prolyg_phasing.io._anchors import revcomp
-from prolyg_phasing.io._flank_placement import place_flanks, polyg_alignments, read_flank_table
+from prolyg_phasing.io._flank_placement import (
+    FLANK_PLACE_VALUES,
+    MAX_MATCH_LEN,
+    NO_MATCH,
+    FlankRecord,
+    code_matrix,
+    decode,
+    edge_windows,
+    place_flanks,
+    place_polyg_reads,
+    read_flank_table,
+    tract_edges,
+    window_costs,
+)
+from tests import _slow_flank_eval as slow
 from tests._hand_built_reads import (
     CHROM_PAD,
-    FLANK_LEN,
     LOCI,
     ReadCase,
     chromosome,
@@ -39,291 +51,290 @@ from tests._hand_built_reads import (
 ORIENTATIONS = ("+", "-")
 
 
-def _polyg_chromosome(locus, orientation: str = "+") -> str:
-    """The synthetic chromosome of one orientation, read in polyG orientation."""
-    chrom = chromosome(locus, orientation)
-    return chrom if orientation == "+" else revcomp(chrom)
-
-
-def _edges(locus) -> dict[str, int]:
-    """Window index of each edge base on the synthetic chromosome, polyG orientation."""
-    up = CHROM_PAD + len(locus.upstream) - 1
-    return {"upstream": up, "downstream": up + 1 + len(locus.tract)}
-
-
 # ---------------------------------------------------------------------------
-# Candidates
+# The candidate index lists the matches of the match rule
 # ---------------------------------------------------------------------------
 
 
-def test_candidates_skip_g_and_stop_at_the_span():
-    # PolyG5177 upstream, outward from the edge T: T GGG T C A C T C G A C A T G A G G A ...
-    locus = LOCI["PolyG5177"]
-    window = _polyg_chromosome(locus)
-    side = fc.list_candidates(window, _edges(locus)["upstream"], upstream=True)
-    outward = locus.upstream[::-1]
-    expected_d = [d for d in range(20) if outward[d] != "G"]
-    assert side.d == tuple(expected_d)
-    assert side.d[:3] == (0, 4, 5)  # the GGG behind the edge T is not a candidate
-    assert max(side.d) < 20
-    assert outward[20] != "G"  # a non-G base at d = 20 exists and is not listed
-    assert side.ref_bases == "".join(outward[d] for d in expected_d)
-    # The outer marker is the 10 bases past the span.
-    assert side.marker == outward[20:30][::-1]
-
-    down = fc.list_candidates(window, _edges(locus)["downstream"], upstream=False)
-    expected_dn = [d for d in range(20) if locus.downstream[d] != "G"]
-    assert down.d == tuple(expected_dn)
-    assert down.marker == locus.downstream[20:30]
-
-
-def test_candidates_mark_a_neighboring_reference_ggg():
-    locus = LOCI["PolyG5177"]
-    window = _polyg_chromosome(locus)
-    side = fc.list_candidates(window, _edges(locus)["upstream"], upstream=True)
-    near = dict(zip(side.d, side.near_ggg, strict=True))
-    assert near[0]  # the edge T sits between the repeat and a GGG
-    assert near[4]  # the T outside the GGG
-    assert not near[5]
-
-
-def test_candidate_span_shrinks_to_keep_the_marker_in_the_window():
-    window = "ACGTACGTACTTTT" + "G" * 10 + "TTTTACGTACGTAC"
-    side = fc.list_candidates(window, 13, upstream=True)
-    assert side.d == (0, 1, 2, 3)  # 14 bases before the run leave room for 4 + 10
-    assert side.marker == window[:10]
+def test_window_neighbors_are_the_matches_of_the_match_rule():
+    """Every string the index lists for a window matches it at the listed cost,
+    and a string it does not list does not match."""
+    rng = random.Random(5)
+    reads = ["".join(rng.choices("ACGTTGGN", k=60)) for _ in range(40)]
+    matrix, _ = code_matrix(reads)
+    rows, ends = tract_edges(matrix)
+    windows = np.unique(edge_windows(matrix, rows, ends), axis=0)[:150]
+    listed: dict[tuple[int, int], int] = {}
+    for code, window, rest in fc.window_neighbors(windows, np.full(len(windows), 1 << 20)):
+        for x, w, r in zip(code.tolist(), window.tolist(), rest.tolist(), strict=True):
+            cost = (1 << 20) - r
+            listed[(x, w)] = min(cost, listed.get((x, w), cost))
+    by_window: dict[int, dict[int, int]] = {}
+    for (x, w), cost in listed.items():
+        by_window.setdefault(w, {})[x] = cost
+    for w, window in enumerate(windows):
+        found = by_window.get(w, {})
+        xs = list(found)
+        # A sample of strings near the window that the index does not list.
+        tail = window[MAX_MATCH_LEN - 10:]
+        for _ in range(30):
+            near = np.where(tail > 3, rng.randrange(4), tail).copy()
+            for _ in range(rng.choice([1, 2])):
+                near[rng.randrange(10)] = rng.randrange(4)
+            xs.append(int(near.astype(np.int64) @ FLANK_PLACE_VALUES))
+        for x in xs:
+            flank = np.array([(x >> (2 * (9 - j))) & 3 for j in range(10)], dtype=np.uint8)
+            cost = window_costs(window[None, :], flank)[0][0]
+            assert cost == found.get(x, NO_MATCH), (decode(x), window)
 
 
 # ---------------------------------------------------------------------------
-# Call and error rate
+# Hand-built read sets with a known optimum
 # ---------------------------------------------------------------------------
 
-
-def _g_share_limit(e: float) -> float:
-    """G share at which p = e and p = 0.5 explain the reads equally well."""
-    return math.log(2 * (1 - e)) / math.log((1 - e) / e)
+_RNG = random.Random(7)
 
 
-def test_call_flips_at_the_limit_that_e_sets():
-    e = 3.6e-3
-    limit = _g_share_limit(e)
-    assert 0.12 < limit < 0.125  # e = 3.6e-3 puts the limit near a G share of 0.12
-    n = np.array([2000, 2000])
-    x = np.array([math.floor(limit * 2000) - 1, math.ceil(limit * 2000) + 1])
-    _, _, g = fc.call_candidates(n, x, e)
-    assert g.tolist() == [False, True]
+def _background(n: int) -> str:
+    """A, C, T and isolated G: no G run outside the tract."""
+    out: list[str] = []
+    for _ in range(n):
+        c = _RNG.choice("ACTACTACG")
+        if c == "G" and out and out[-1] == "G":
+            c = "A"
+        out.append(c)
+    return "".join(out)
 
 
-def test_call_takes_the_better_donor_explanation():
-    e = 3.6e-3
-    ll_error, ll_g, g = fc.call_candidates(np.array([100, 100]), np.array([50, 100]), e)
-    assert g.all()
-    assert ll_g[0] == pytest.approx(100 * math.log(0.5))
-    assert ll_g[1] == pytest.approx(100 * math.log(1 - e))
+LEFT, RIGHT = _background(60), _background(60)
+UP, DN = "ACTTCAGCAT", "CAAATTTTAT"
 
 
-def test_call_without_reads_is_read_error():
-    ll_error, ll_g, g = fc.call_candidates(np.array([0]), np.array([0]), 3.6e-3)
-    assert ll_error[0] == 0 and ll_g[0] == 0
-    assert not g[0]
-
-
-def _pool(*rows):
-    d, near, n, x = (np.array(c) for c in zip(*rows, strict=True))
-    return fc.estimate_error_rate(d, near, n, x)
-
-
-# (d, near_ggg, n, x). The first row is always pooled; the second row breaks
-# one condition, then meets it at the boundary.
-_POOLED = (12, False, 1000, 2)
-
-
-@pytest.mark.parametrize(
-    ("excluded", "pooled"),
-    [
-        ((9, False, 100, 1), (10, False, 100, 1)),       # distance from the repeat
-        ((15, True, 100, 1), (15, False, 100, 1)),       # next to a reference GGG
-        ((15, False, 19, 0), (15, False, 20, 0)),        # read count
-        ((15, False, 100, 5), (15, False, 100, 4)),      # G share 0.05 against 0.04
-    ],
-)
-def test_error_rate_exclusions(excluded, pooled):
-    out = _pool(_POOLED, excluded)
-    assert (out.x, out.n, out.n_positions) == (2, 1000, 1)
-    kept = _pool(_POOLED, pooled)
-    assert (kept.x, kept.n, kept.n_positions) == (2 + pooled[3], 1000 + pooled[2], 2)
-    assert kept.e == kept.x / kept.n
-
-
-# ---------------------------------------------------------------------------
-# Flank choice
-# ---------------------------------------------------------------------------
-
-
-def _choose(name: str, side_name: str, g_in_donor_d: set[int], orientation: str = "+"):
-    locus = LOCI[name]
-    window = _polyg_chromosome(locus, orientation)
-    side = fc.list_candidates(window, _edges(locus)[side_name], upstream=side_name == "upstream")
-    calls = np.array([d in g_in_donor_d for d in side.d])
-    record, d, flag = fc.choose_flank(side, calls, window, ref_orientation=orientation,
-                                      window_start=0)
-    return locus, record, d, flag
-
-
-def test_flank_stays_at_an_invariant_edge():
-    locus, record, d, flag = _choose("PolyG151", "upstream", set())
-    assert (d, flag) == (0, False)
-    assert record.bases == upstream_flank(locus, 0).bases
-    assert record.run_side_offset == FLANK_LEN - 1
-    assert record.masked_offsets == ()
-
-
-@pytest.mark.parametrize("orientation", ORIENTATIONS)
-def test_flank_moves_past_g_candidates(orientation):
-    # PolyG5177: the edge T (d = 0) upstream and the edge A downstream are G in the donor.
-    locus, up, d_up, _ = _choose("PolyG5177", "upstream", {0}, orientation)
-    _, dn, d_dn, _ = _choose("PolyG5177", "downstream", {0}, orientation)
-    assert (d_up, d_dn) == (4, 1)
-    assert up.bases == upstream_flank(locus, 4).bases
-    assert dn.bases == downstream_flank(locus, 1).bases
-    # Reference positions point at the flank bases on the chromosome in the
-    # BAM's orientation: the same bases at "+", their complements at "-".
-    chrom = chromosome(locus, orientation)
-    for record in (up, dn):
-        stored = "".join(chrom[p] for p in record.ref_positions)
-        assert stored == (record.bases if orientation == "+" else revcomp(record.bases)[::-1])
-
-
-def test_flank_masks_a_g_candidate_inside_it():
-    # PolyG4732 upstream, outward: A(d=0) G A(d=2) C(d=3) A(d=4). With G in the
-    # donor at d = 0 and d = 4, the run-side base is the A at d = 2, and d = 4
-    # falls inside the flank.
-    locus = LOCI["PolyG4732"]
-    window = _polyg_chromosome(locus)
-    side = fc.list_candidates(window, _edges(locus)["upstream"], upstream=True)
-    assert side.d[:4] == (0, 2, 3, 4)
-    calls = np.array([d in {0, 4} for d in side.d])
-    record, d, flag = fc.choose_flank(side, calls, window, ref_orientation="+",
-                                      window_start=0)
-    assert (d, flag) == (2, False)
-    # d = 4 is two bases out from the run-side base: offset 9 - 2 = 7.
-    assert record.masked_offsets == (7,)
-    assert record.bases == upstream_flank(locus, 2).bases
-
-
-def test_flank_flags_a_side_with_no_read_error_candidate():
-    locus = LOCI["PolyG151"]
-    window = _polyg_chromosome(locus)
-    side = fc.list_candidates(window, _edges(locus)["downstream"], upstream=False)
-    record, d, flag = fc.choose_flank(side, np.ones(len(side.d), dtype=bool), window,
-                                      ref_orientation="+", window_start=0)
-    assert (d, flag) == (0, True)
-    assert record.bases == downstream_flank(locus, 0).bases
-    # Every other candidate inside the flank is masked.
-    assert record.masked_offsets == tuple(d for d in side.d if 0 < d < FLANK_LEN)
-
-
-# ---------------------------------------------------------------------------
-# Count
-# ---------------------------------------------------------------------------
-
-
-def _molecule_case(name: str, read: str, *, ref_start: int = 0, ref_end: int | None = None
-                   ) -> ReadCase:
-    locus = LOCI[name]
-    return ReadCase(
-        f"{name}_molecule", "", locus, upstream_flank(locus, 0), downstream_flank(locus, 0),
-        read, ref_start, None, ref_end=len(locus.reference) if ref_end is None else ref_end,
-    )
-
-
-def _count_records(records, locus, orientation: str, side_name: str):
-    chrom = chromosome(locus, orientation)
-    reads, cigars, starts = polyg_alignments(
-        [r.query_sequence for r in records], [r.cigartuples for r in records],
-        [r.reference_start for r in records], ref_orientation=orientation,
-        window_start=0, window_len=len(chrom))
-    side = fc.list_candidates(_polyg_chromosome(locus, orientation), _edges(locus)[side_name],
-                              upstream=side_name == "upstream")
-    bases, placed = fc.read_candidate_bases(reads, cigars, starts, side)
-    return side, bases, placed
-
-
-def _records(case: ReadCase, orientation: str, forms=None):
-    header = pysam.AlignmentHeader.from_dict({
-        "HD": {"VN": "1.6"},
-        "SQ": [{"SN": "synth", "LN": len(chromosome(case.locus, orientation))}],
-    })
+def _reads_from(hap: str, n: int, rl: int = 100, jitter: int = 15) -> list[str]:
     out = []
-    for i, p in enumerate(placements(case)):
-        if forms is None or p.form in forms:
-            out.append((p, to_record(header, case, p, orientation, f"r{i}")))
+    mid = len(hap) // 2
+    for _ in range(n):
+        s = max(0, min(len(hap) - rl, mid - rl // 2 + _RNG.randint(-jitter, jitter)))
+        out.append(hap[s:s + rl])
     return out
 
 
-@pytest.mark.parametrize("orientation", ORIENTATIONS)
-def test_count_reads_the_read_not_the_pileup(orientation):
-    # PolyG454: reference CC G10, the molecule carries C G6. A one-gap alignment
-    # deletes CGGGG; the left-aligned gap starts at the edge C, so the pileup
-    # shows that C as deleted. Read by position from the outer marker, the edge
-    # base shows a G and the outer C is unchanged.
-    locus = LOCI["PolyG454"]
-    read = locus.upstream[:-1] + "G" * 6 + locus.downstream
-    case = _molecule_case("PolyG454", read)
-    found = _records(case, orientation, forms={"gap_shift"})
-    assert found
-    left = min(found, key=lambda pr: pr[0].cigar[0][1])
-    edge_ref = (CHROM_PAD + len(locus.upstream) - 1 if orientation == "+"
-                else len(chromosome(locus, orientation)) - 1
-                - (CHROM_PAD + len(locus.upstream) - 1))
-    aligned = dict((ref, q) for q, ref in left[1].get_aligned_pairs() if ref is not None)
-    assert aligned[edge_ref] is None  # the pileup has no base at the edge C
-
-    side, bases, placed = _count_records([r for _, r in found], locus, orientation, "upstream")
-    assert placed.all()
-    by_d = dict(zip(side.d, bases.T, strict=True))
-    assert (by_d[0] == ord("G")).all()
-    assert (by_d[1] == ord("C")).all()
-    n, x = fc.count_candidates(bases)
-    assert (n[0], x[0], n[1], x[1]) == (len(found), len(found), len(found), 0)
+def _check(reads: list[str], u: str, v: str, tracts: set[str]) -> fc.FlankPair:
+    """The expected pair is optimal, F equals the slow reference, and every
+    optimal pair gives the expected tracts."""
+    pair = fc.solve_flank_pair(reads)
+    counted = sorted({s: reads.count(s) for s in reads}.items())
+    assert (u, v) in pair.optimal_pairs
+    assert pair.objective_half_units == slow.objective(counted, u, v)[0]
+    for pu, pv in pair.optimal_pairs:
+        got = place_polyg_reads(reads, pu, pv)
+        assert set(got.tracts[got.kept]) == tracts, (pu, pv)
+    return pair
 
 
-@pytest.mark.parametrize("orientation", ORIENTATIONS)
-def test_count_drops_a_read_that_does_not_reach_the_outer_marker(orientation):
-    locus = LOCI["PolyG5177"]
-    full = _molecule_case("PolyG5177", locus.reference)
-    # Starts 3 bases into the upstream marker: 7 of its 10 bases are in the read.
-    short = _molecule_case("PolyG5177", locus.reference[3:], ref_start=3)
-    records = [r for _, r in _records(full, orientation)] + \
-        [r for _, r in _records(short, orientation)]
-    side, bases, placed = _count_records(records, locus, orientation, "upstream")
-    assert placed.tolist() == [True, False]
-    n, x = fc.count_candidates(bases)
-    assert (n == 1).all() and (x == 0).all()
-    # The downstream marker is in both reads.
-    _, _, placed_dn = _count_records(records, locus, orientation, "downstream")
-    assert placed_dn.tolist() == [True, True]
+def test_a_ggg_t_piece_next_to_the_run_joins_the_tract():
+    hap = LEFT + UP + "GGGTGGGGGG" + DN + RIGHT
+    _check(_reads_from(hap, 60), UP, DN, {"GGGTGGGGGG"})
 
 
-@pytest.mark.parametrize("orientation", ORIENTATIONS)
-def test_count_covers_only_candidates_inside_the_read(orientation):
-    # The read places the downstream marker but starts 2 bases before the
-    # downstream edge base, so only the downstream candidates count.
-    locus = LOCI["PolyG5177"]
-    start = len(locus.upstream) + len(locus.tract) - 2
-    case = _molecule_case("PolyG5177", locus.reference[start:], ref_start=start)
-    records = [r for _, r in _records(case, orientation)]
-    side, bases, placed = _count_records(records, locus, orientation, "downstream")
-    assert placed.all()
-    n, x = fc.count_candidates(bases)
-    assert (n == 1).all()
-    _, _, placed_up = _count_records(records, locus, orientation, "upstream")
-    assert not placed_up.any()
+def test_a_copy_of_the_flank_past_the_tract_is_ignored():
+    hap = LEFT + UP + "G" * 10 + DN + RIGHT[:15] + UP + RIGHT[15:]
+    reads = _reads_from(hap, 50, rl=130, jitter=3)
+    pair = _check(reads, UP, DN, {"G" * 10})
+    assert pair.n_reads_placed == len(reads)
+
+
+def test_of_two_copies_of_the_flank_the_nearer_one_places():
+    hap = LEFT[:30] + UP + LEFT[30:45] + UP + "G" * 10 + DN + RIGHT
+    reads = _reads_from(hap, 50, rl=130, jitter=3)
+    assert any(r.count(UP) == 2 for r in reads)
+    pair = _check(reads, UP, DN, {"G" * 10})
+    assert pair.n_reads_placed == len(reads)
+
+
+def test_the_g_run_beats_an_empty_tract():
+    hap = LEFT + UP + "G" * 12 + DN + RIGHT
+    reads = _reads_from(hap, 50)
+    pair = _check(reads, UP, DN, {"G" * 12})
+    counted = sorted({s: reads.count(s) for s in reads}.items())
+    far_u, far_v = LEFT[30:40], LEFT[40:50]
+    if far_u[-1] != "G" and far_v[0] != "G":
+        assert slow.objective(counted, far_u, far_v)[0] < pair.objective_half_units
+
+
+def test_one_read_error_in_the_flank_still_places():
+    hap = LEFT + UP + "G" * 10 + DN + RIGHT
+    i0 = len(LEFT) + 4
+    variants = [hap[:i0] + "G" + hap[i0 + 1:], hap[:i0] + "A" + hap[i0:],
+                hap[:i0] + hap[i0 + 1:], hap[:i0] + hap[i0 + 2:]]
+    errors = [r for h in variants for r in _reads_from(h, 3, jitter=3)]
+    reads = _reads_from(hap, 30, jitter=3) + errors
+    pair = _check(reads, UP, DN, {"G" * 10})
+    assert pair.n_reads_placed == len(reads)
+
+
+def test_a_run_ending_in_a_non_g_error_is_not_placed_at_the_old_edge():
+    """Half the reads end the run in a T. A gap and a substitution never go
+    together, so those reads have no placement under (UP, DN)."""
+    clean = _reads_from(LEFT + UP + "G" * 10 + DN + RIGHT, 30, jitter=3)
+    error = _reads_from(LEFT + UP + "G" * 9 + "T" + DN + RIGHT, 30, jitter=3)
+    reads = clean + error
+    counted = sorted({s: reads.count(s) for s in reads}.items())
+    assert slow.objective(counted, UP, DN) == (30 * 20, 30)
+    pair = fc.solve_flank_pair(reads)
+    for pu, pv in pair.optimal_pairs:
+        assert slow.objective(counted, pu, pv)[0] == pair.objective_half_units
+
+
+def test_a_homopolymer_length_change_in_the_flank_is_a_gap():
+    """Allele A5 (60 reads) and A3 (40 reads) of the upstream flank: the A5
+    string matches the A3 reads with a 2-base gap, cost 5 half units."""
+    u5 = "TCAAAAACAT"
+    r5 = _reads_from(LEFT + u5 + "G" * 10 + DN + RIGHT, 60, jitter=3)
+    r3 = _reads_from(LEFT + "TCAAACAT" + "G" * 10 + DN + RIGHT, 40, jitter=3)
+    pair = _check(r5 + r3, u5, DN, {"G" * 10})
+    assert pair.objective_half_units == 60 * 20 + 40 * (20 - 5)
+    assert pair.n_reads_placed == 100
+
+
+def test_reads_with_a_negative_value_add_zero():
+    """40 decoy reads hold near-copies of both flanks around G + 20 bases + G:
+    value -80 half units. They do not move the pair."""
+    hap = LEFT + UP + "G" * 10 + DN + RIGHT
+    decoy = (_background(30) + "ACTTCAGCTT" + "G" + "ACTTACATCATTACCATACA" + "G"
+             + "CAAATTTAAT" + _background(40))
+    reads = _reads_from(hap, 60, jitter=3) + [decoy] * 40
+    assert slow.best_placement(decoy, UP, DN)[0] == -80
+    pair = _check(reads, UP, DN, {"G" * 10})
+    assert pair.objective_half_units == 1200
+    assert pair.n_reads_placed == 100
+
+
+def test_a_non_g_base_and_three_g_next_to_the_run_join_the_tract():
+    """No candidate flank stops in front of a non-G base and three G."""
+    for hap, tract in ((LEFT + UP + "G" * 10 + "CGGG" + DN + RIGHT, "G" * 10 + "CGGG"),
+                       (LEFT + UP + "GGGA" + "G" * 10 + DN + RIGHT, "GGGA" + "G" * 10)):
+        reads = _reads_from(hap, 60)
+        pair = _check(reads, UP, DN, {tract})
+        search = fc._LocusSearch(sorted(set(reads)), [1] * len(set(reads)))
+        us = [decode(int(c)) for c in search.u.candidates]
+        vs = [decode(int(c))[::-1] for c in search.v.candidates]
+        assert not any(u[-4:-1] == "GGG" for u in us)
+        assert not any(v[1:4] == "GGG" for v in vs)
+        assert pair.n_reads_placed == len(reads)
 
 
 # ---------------------------------------------------------------------------
-# End to end: BAM -> count pass -> flanks -> side TSV -> FlankRecord
+# The search against a brute-force search with the slow reference
 # ---------------------------------------------------------------------------
+
+
+def _random_read_set(rng: random.Random) -> list[str]:
+    """Reads of one or two haplotypes around a G run, with read errors."""
+    haps = []
+    for _ in range(rng.choice([1, 2])):
+        run = "".join(rng.choices("GGGGGGT", k=rng.randint(4, 9)))
+        haps.append(_background(12) + UP + run + rng.choice([DN, "CAAATTAT", "TAAATTTTAT"])
+                    + _background(12))
+    reads = []
+    for _ in range(rng.randint(3, 6)):
+        s = list(rng.choice(haps))
+        for _ in range(rng.randint(0, 2)):
+            i = rng.randrange(len(s))
+            op = rng.random()
+            if op < 0.5:
+                s[i] = rng.choice("ACGT")
+            elif op < 0.75:
+                s.insert(i, rng.choice("ACGT"))
+            else:
+                del s[i]
+        start = rng.randint(0, 6)
+        reads.append("".join(s)[start:start + rng.randint(36, 50)])
+    return reads
+
+
+def test_search_matches_a_brute_force_search_on_random_read_sets():
+    rng = random.Random(13)
+    n_checked = 0
+    for _ in range(25):
+        reads = _random_read_set(rng)
+        counted = sorted({s: reads.count(s) for s in reads}.items())
+        us, vs = slow.candidates(counted)
+        values = {(u, v): slow.objective(counted, u, v)[0] for u in us for v in vs}
+        best = max(values.values(), default=0)
+        pair = fc.solve_flank_pair(reads)
+        if best <= 0:
+            assert pair is None
+            continue
+        n_checked += 1
+        assert pair.objective_half_units == best
+        assert set(pair.optimal_pairs) == {p for p, f in values.items() if f == best}
+        assert pair.n_reads_placed == slow.objective(counted, pair.upstream,
+                                                     pair.downstream)[1]
+    assert n_checked >= 20
+
+
+def test_no_pair_reaches_a_positive_objective():
+    assert fc.solve_flank_pair(["ACTACTACTACTACTACTACT"] * 5) is None
+    assert fc.solve_flank_pair([]) is None
+
+
+# ---------------------------------------------------------------------------
+# The side table
+# ---------------------------------------------------------------------------
+
+
+def _locus_flanks(records, name="L") -> fc.LocusFlanks:
+    pair = fc.FlankPair("ACTTCAGCAT", "CAAATTTTAT", 41, (("ACTTCAGCAT", "CAAATTTTAT"),),
+                        30, 25)
+    return fc.LocusFlanks(name, "+", pair, records)
+
+
+def test_side_table_round_trips_flanks_of_any_reference_length(tmp_path):
+    up = FlankRecord("ACTTCAGCAT", tuple(range(100, 109)), 8)
+    dn = FlankRecord("CAAATTTTAT", tuple(range(130, 141)), 0)
+    result = fc.construct_flanks([("L", _locus_flanks((up, dn))), ("NoWindow", None)],
+                                 sample="S1")
+    path = fc.write_flank_table(result, tmp_path / "x")
+    table = read_flank_table(path)
+    assert table.records == {"L": (up, dn)}
+    assert table.no_reference_window == {"NoWindow"}
+    sides = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    assert list(sides.columns) == ["sample", *fc.SIDE_COLUMNS]
+    row = sides.iloc[0]
+    assert (row.objective, row.n_reads, row.n_reads_placed, row.n_tied_pairs) == \
+        ("20.5", "30", "25", "1")
+
+
+def test_a_flank_that_does_not_match_the_reference_stops_construction():
+    up = FlankRecord("ACTTCAGCAT", tuple(range(100, 110)), 9)
+    with pytest.raises(ValueError, match=r"1 flanks do not match the reference window: "
+                                         r"\['L downstream'\]"):
+        fc.construct_flanks([("L", _locus_flanks((up, None)))], sample="S1")
+
+
+def test_a_locus_with_no_positive_pair_stops_construction():
+    with pytest.raises(ValueError, match=r"no flank pair reaches F > 0 at 1 loci: \['L'\]"):
+        fc.construct_flanks([("L", fc.LocusFlanks("L", "+", None, (None, None)))],
+                            sample="S1")
+
+
+@pytest.mark.skipif(not hasattr(os, "sched_getaffinity"), reason="Linux only")
+def test_worker_count_leaves_free_cores():
+    n = fc.worker_count()
+    assert 1 <= n < max(2, len(os.sched_getaffinity(0)))
+
+
+# ---------------------------------------------------------------------------
+# End to end: BAM -> flank pair -> side TSV -> FlankRecord
+# ---------------------------------------------------------------------------
+
+
+def _molecule_case(name: str, read: str) -> ReadCase:
+    locus = LOCI[name]
+    return ReadCase(f"{name}_molecule", "", locus, upstream_flank(locus, 0),
+                    downstream_flank(locus, 0), read, 0, None,
+                    ref_end=len(locus.reference))
 
 
 def _write_bam(tmp_path: Path, name: str, molecules: list[tuple[str, int]]) -> tuple[Path, Path]:
@@ -374,6 +385,8 @@ def _write_bam(tmp_path: Path, name: str, molecules: list[tuple[str, int]]) -> t
     return bam_path, bed
 
 
+
+
 def test_build_flanks_end_to_end(tmp_path):
     # PolyG5177 homozygous edge variant: CTCACT G13 TAGAG in 40 reads, the
     # reference molecule in 2 reads.
@@ -386,75 +399,34 @@ def test_build_flanks_end_to_end(tmp_path):
     assert set(result.records) == {"PolyG5177+", "PolyG5177-"}
     sides = result.sides.set_index(["locus", "side"])
     for o in ORIENTATIONS:
-        up_row = sides.loc[(f"PolyG5177{o}", "upstream")]
-        dn_row = sides.loc[(f"PolyG5177{o}", "downstream")]
-        assert (up_row.flank_d, dn_row.flank_d) == (4, 1)
-        assert up_row.no_read_error_candidate == 0
-        # The reference read and the 42 molecules; the low-MAPQ read is filtered.
-        assert up_row.n_reads == 43
+        row = sides.loc[(f"PolyG5177{o}", "upstream")]
+        # The reference read and the 42 molecules; the low-MAPQ read is
+        # filtered. The 40 variant reads place; the reference reads have no
+        # G after the downstream flank's run-side T.
+        assert (row.n_reads, row.n_reads_placed, row.n_tied_pairs) == (43, 40, 1)
+        assert row.objective == 40 * 13
         up, dn = result.records[f"PolyG5177{o}"]
-        assert up.bases == upstream_flank(locus, 4).bases
-        assert dn.bases == downstream_flank(locus, 1).bases
+        want_up, want_dn = upstream_flank(locus, 4), downstream_flank(locus, 1)
+        assert (up.bases, dn.bases) == (want_up.bases, want_dn.bases)
+        n = len(locus.reference)
+        for got, want in ((up, want_up), (dn, want_dn)):
+            if o == "+":
+                positions = tuple(CHROM_PAD + want.start + i for i in range(10))
+            else:
+                positions = tuple(CHROM_PAD + n - 1 - (want.start + i) for i in range(10))
+            assert got.ref_positions == positions
 
         # The flanks place the variant reads with their true tuple.
         records = [r for r in pysam.AlignmentFile(str(bam_path)).fetch(
             f"PolyG5177_{'plus' if o == '+' else 'minus'}") if r.query_name.startswith("m0_")]
-        chrom = chromosome(locus, o)
-        out = place_flanks(
-            [r.query_sequence for r in records], [r.cigartuples for r in records],
-            np.array([r.reference_start for r in records]),
-            upstream=up, downstream=dn, ref_orientation=o, reference_window=chrom,
-            reference_window_start=0)
+        out = place_flanks([r.query_sequence for r in records], upstream=up, downstream=dn,
+                           ref_orientation=o)
         assert {run_tuple(t) for t in out.tracts} == {(13,)}
 
-    cand = result.candidates
-    edge = cand[(cand.locus == "PolyG5177+") & (cand.side == "upstream") & (cand.d == 0)].iloc[0]
-    assert (edge.n, edge.x, edge.call) == (43, 40, "g_in_donor")
-    # Both orientations give the same counts.
-    plus = cand[cand.locus == "PolyG5177+"].drop(columns="locus").reset_index(drop=True)
-    minus = cand[cand.locus == "PolyG5177-"].drop(columns="locus").reset_index(drop=True)
-    assert plus.equals(minus)
-
-    paths = fc.write_flank_tables(result, tmp_path / "normal")
-    assert all(p.exists() for p in paths)
-    table = read_flank_table(paths[1])
+    path = fc.write_flank_table(result, tmp_path / "normal")
+    table = read_flank_table(path)
     assert table.records == result.records
     assert table.sample == "normal"
-    assert set(pd.read_csv(paths[0], sep="\t")["sample"]) == {"normal"}
-    assert json.loads(paths[2].read_text())["sample"] == "normal"
-
-
-def test_side_table_round_trips_masked_offsets(tmp_path):
-    locus = LOCI["PolyG4732"]
-    window = _polyg_chromosome(locus)
-    records = []
-    rows = []
-    for side_name, g_d in (("upstream", {0, 4}), ("downstream", set())):
-        side = fc.list_candidates(window, _edges(locus)[side_name],
-                                  upstream=side_name == "upstream")
-        calls = np.array([d in g_d for d in side.d])
-        record, d, flag = fc.choose_flank(side, calls, window, ref_orientation="-",
-                                          window_start=7)
-        records.append(record)
-        rows.append({"locus": "L", "side": side_name, "reference_window_status": "recovered",
-                     "ref_orientation": "-", "flank_d": d,
-                     "flank_bases": record.bases,
-                     "flank_ref_positions": ",".join(map(str, record.ref_positions)),
-                     "masked_offsets": ",".join(map(str, record.masked_offsets)),
-                     "no_read_error_candidate": int(flag), "n_candidates": len(side.d),
-                     "n_reads": 0, "n_marker_placed": 0})
-    assert records[0].masked_offsets == (7,)
-    result = fc.FlankConstruction("S1", {"L": tuple(records)}, pd.DataFrame(),
-                                  pd.DataFrame(rows),
-                                  fc.ErrorRate(0.01, 1, 100, np.array([0.01])))
-    paths = fc.write_flank_tables(result, tmp_path / "x")
-    assert read_flank_table(paths[1]).records == {"L": tuple(records)}
-
-
-@pytest.mark.skipif(not hasattr(os, "sched_getaffinity"), reason="Linux only")
-def test_worker_count_leaves_free_cores():
-    n = fc.worker_count()
-    assert 1 <= n < max(2, len(os.sched_getaffinity(0)))
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +468,7 @@ def test_sample_name_rejects_two_samples(tmp_path):
 
 def test_flank_table_without_a_sample_is_rejected(tmp_path):
     path = tmp_path / "old_sides.tsv"
-    path.write_text("locus\tside\tflank_bases\tflank_ref_positions\tmasked_offsets\n")
+    path.write_text("locus\tside\tflank_bases\tflank_ref_positions\n")
     with pytest.raises(ValueError, match="no sample column"):
         read_flank_table(path)
 
@@ -556,26 +528,25 @@ def test_locus_without_a_reference_window_gets_a_status_row(tmp_path):
     bam_path, bed = _two_locus_bam(tmp_path)
     result = fc.build_flanks(bam_path, bed, n_workers=1, sample="NORMAL")
     assert set(result.records) == {"PolyG5177"}
-    assert set(result.candidates["locus"]) == {"PolyG5177"}
-    paths = fc.write_flank_tables(result, tmp_path / "normal")
+    path = fc.write_flank_table(result, tmp_path / "normal")
 
-    sides = pd.read_csv(paths[1], sep="\t", dtype=str, keep_default_na=False)
+    sides = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
     no_window = sides[sides.locus == "PolyG151"]
     assert list(no_window.side) == ["upstream", "downstream"]
     assert set(no_window.reference_window_status) == {"ref_window_unrecoverable"}
-    for column in ("ref_orientation", "flank_d", "flank_bases", "flank_ref_positions",
-                   "masked_offsets", "no_read_error_candidate", "n_reads", "n_marker_placed"):
+    for column in ("ref_orientation", "flank_bases", "flank_ref_positions", "objective",
+                   "n_reads", "n_reads_placed", "n_tied_pairs"):
         assert set(no_window[column]) == {""}, column
     window = sides[sides.locus == "PolyG5177"]
     assert set(window.reference_window_status) == {"recovered"}
-    assert all(d.isdigit() for d in window.flank_d)  # integers, not floats with a NA
+    assert all(d.isdigit() for d in window.n_reads)  # integers, not floats with a NA
 
-    table = read_flank_table(paths[1])
+    table = read_flank_table(path)
     assert table.no_reference_window == {"PolyG151"}
     assert set(table.records) == {"PolyG5177"}
     assert table.records == result.records
 
-    panel = extract_panel(bam_path, bed, paths[1])
+    panel = extract_panel(bam_path, bed, path)
     locus = panel.loci["PolyG151"]
     assert locus.reference_window_status == "ref_window_unrecoverable"
     assert locus.n_reads == 0 and len(locus.seq) == 0
@@ -594,8 +565,8 @@ def test_a_status_row_still_counts_against_the_bed(tmp_path):
     from prolyg_phasing.io.bam import extract_panel
 
     bam_path, bed = _two_locus_bam(tmp_path)
-    flanks = fc.write_flank_tables(fc.build_flanks(bam_path, bed, n_workers=1, sample="N"),
-                                   tmp_path / "normal")[1]
+    flanks = fc.write_flank_table(fc.build_flanks(bam_path, bed, n_workers=1, sample="N"),
+                                  tmp_path / "normal")
     rows = bed.read_text().splitlines(keepends=True)
     only_window = tmp_path / "window.bed"
     only_window.write_text(rows[0])
@@ -616,7 +587,7 @@ def _side_table(tmp_path: Path, rows: list[dict]) -> Path:
 
 def _side_row(side: str, status: str, bases: str = "", positions: str = "") -> dict:
     return {"sample": "N", "locus": "L", "side": side, "reference_window_status": status,
-            "flank_bases": bases, "flank_ref_positions": positions, "masked_offsets": ""}
+            "flank_bases": bases, "flank_ref_positions": positions}
 
 
 def test_flank_table_rejects_sides_with_different_statuses(tmp_path):

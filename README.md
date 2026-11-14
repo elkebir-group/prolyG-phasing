@@ -46,7 +46,7 @@ two loci.
 
 `extract` reads every sample of a donor with the flanks that `build-flanks`
 builds from the donor's matched normal; here `example.bam` plays the normal.
-The sample name in the flank tables is the BAM's read-group `SM`.
+The sample name in the flank table is the BAM's read-group `SM`.
 
 ```bash
 prolyg-phasing build-flanks \

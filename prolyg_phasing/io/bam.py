@@ -7,12 +7,13 @@ Every locus needs its two flanks from the matched normal's flank table
 (`prolyg-phasing build-flanks`). Two steps per locus:
 
 1. **Reference window** — reconstruct the reference on BED ± `pad` bp
-   from MD tags, and check that both flanks lie in it with their bases.
+   from MD tags, and check that each flank matches it where the flank
+   table says.
 2. **Extraction** — fetch overlapping alignments, apply the read filters
-   (MAPQ, SA, TLEN, MI), place both flanks in each read
-   (`_flank_placement.place_flanks`), group by `query_name` for pair
-   collapse, merge or drop pair disagreements, and emit per-(MI, strand,
-   seq) read counts.
+   (MAPQ, SA, TLEN, MI), cut each read's tract between its best placement
+   of the two flanks (`_flank_placement.place_flanks`), group by
+   `query_name` for pair collapse, merge or drop pair disagreements, and
+   emit per-(MI, strand, seq) read counts.
 
 Per-locus ``n_runs`` is set from the **data** (max parsed tuple length
 across accepted reads), not from the reference tract.
@@ -49,13 +50,14 @@ from prolyg_phasing.io._anchors import (
     revcomp,
 )
 from prolyg_phasing.io._flank_placement import (
-    SIDE_DROP_REASONS,
+    FLANK_LEN,
     WINDOW_RECOVERED,
     WINDOW_UNRECOVERABLE,
     FlankPlacement,
     FlankRecord,
     place_flanks,
     read_flank_table,
+    reference_flank,
     window_index,
 )
 from prolyg_phasing.io.panel import (
@@ -66,7 +68,6 @@ from prolyg_phasing.io.panel import (
     parse_run_lengths,
 )
 
-FLANKING_SEQ_LEN = 10
 REF_WINDOW_PAD = 50
 
 PAIR_DISAGREEMENT_POLICY = "merge_by_quality"
@@ -166,16 +167,19 @@ def locus_geometry(
 ) -> LocusGeometry | None:
     """The reference window of one locus from MD tags, checked against its flanks.
 
+    Each flank is found again in this BAM's window by the read match rule
+    (:func:`~prolyg_phasing.io._flank_placement.reference_flank`), and it
+    must land on the reference positions that the flank table records.
     Returns None when no read rebuilds the reference window. Raises
-    ValueError, naming the locus, when a flank does not lie in the window
-    with its own bases, or when the flanks do not enclose the repeat.
+    ValueError, naming the locus, when a flank does not land there, or
+    when the flanks do not enclose the repeat.
     """
     window_start = bed_start - REF_WINDOW_PAD
     window = get_reference_window(bam, chrom, window_start, bed_end + REF_WINDOW_PAD,
                                   min_mapq=min_mapq)
     if window is None:
         return None
-    walk = build_anchors(window, REF_WINDOW_PAD, bed_end - bed_start, k=FLANKING_SEQ_LEN)
+    walk = build_anchors(window, REF_WINDOW_PAD, bed_end - bed_start, k=FLANK_LEN)
     geometry = LocusGeometry(
         ref_orientation=walk.ref_orientation,
         reference_window=window,
@@ -186,11 +190,12 @@ def locus_geometry(
         g_walk_dn=walk.g_walk_dn,
     )
     polyg_window = revcomp(window) if walk.ref_orientation == "-" else window
+    split = REF_WINDOW_PAD + (bed_end - bed_start) // 2
     for side, flank in zip(("upstream", "downstream"), flanks, strict=True):
-        indices = [geometry.polyg_index(p) for p in flank.ref_positions]
-        inside = all(0 <= i < len(window) for i in indices)
-        steps = all(b - a == 1 for a, b in zip(indices, indices[1:], strict=False))
-        if not (inside and steps) or "".join(polyg_window[i] for i in indices) != flank.bases:
+        found = reference_flank(polyg_window, flank.bases, upstream=side == "upstream",
+                                split=split, ref_orientation=walk.ref_orientation,
+                                window_start=window_start)
+        if found != flank:
             raise ValueError(
                 f"{name}: the {side} flank {flank.bases} at reference positions "
                 f"{flank.ref_positions[0]}..{flank.ref_positions[-1]} does not match the "
@@ -203,21 +208,17 @@ def locus_geometry(
 
 def place_locus_flanks(alignments: Sequence[pysam.AlignedSegment],
                        geometry: LocusGeometry) -> FlankPlacement:
-    """Place both flanks of one locus in each alignment; one entry per alignment.
+    """Each alignment's tract under the locus's two flanks; one entry per alignment.
 
-    This is the per-read decision of the extraction: the path and the drop
-    reason on each side, and the tract (see :func:`place_flanks`).
+    This is the per-read decision of the extraction: the tract and the
+    drop reasons (see :func:`place_flanks`). It reads only the read
+    sequence.
     """
     return place_flanks(
         [r.query_sequence for r in alignments],
-        [r.cigartuples for r in alignments],
-        np.fromiter((r.reference_start for r in alignments), dtype=np.int64,
-                    count=len(alignments)),
         upstream=geometry.upstream,
         downstream=geometry.downstream,
         ref_orientation=geometry.ref_orientation,
-        reference_window=geometry.reference_window,
-        reference_window_start=geometry.reference_window_start,
     )
 
 
@@ -586,13 +587,6 @@ def filtered_alignments(
 
 
 
-# The per-side counters of reads that a flank drops, one per side and reason.
-FLANK_DROP_COUNTERS = tuple(
-    f"n_alignments_drop_{side}_{reason}"
-    for side in ("upstream", "downstream") for reason in SIDE_DROP_REASONS
-)
-
-
 def new_locus_qc() -> dict[str, int]:
     """Zeroed per-locus QC counters of one extraction."""
     return {
@@ -600,9 +594,12 @@ def new_locus_qc() -> dict[str, int]:
         "n_alignments_drop_mapq": 0,
         "n_alignments_drop_sa": 0,
         "n_alignments_drop_tlen": 0,
+        "n_alignments_placed": 0,
         "n_alignments_drop_flank": 0,
-        **{name: 0 for name in FLANK_DROP_COUNTERS},
-        "n_alignments_drop_flanks_crossed": 0,
+        "n_alignments_drop_upstream_flank_not_placed": 0,
+        "n_alignments_drop_downstream_flank_not_placed": 0,
+        "n_alignments_drop_no_placement": 0,
+        "n_alignments_drop_negative_value": 0,
         "n_read_pairs": 0,
         "n_read_pairs_drop_disagree": 0,
         "n_read_pairs_merged": 0,
@@ -610,17 +607,23 @@ def new_locus_qc() -> dict[str, int]:
 
 
 def _count_flank_drops(placement: FlankPlacement, qc: dict) -> None:
-    """Add the flank drops of one locus to `qc`.
+    """Add the placed reads and the flank drops of one locus to `qc`.
 
-    A read that fails on both sides adds to one counter on each side.
-    ``n_alignments_drop_flank`` counts each dropped read once.
+    ``n_alignments_placed`` counts the reads with at least one placement,
+    of any value. A read with no match of a flank adds to that side's
+    ``flank_not_placed`` counter; a read with no match on both sides adds
+    to both. A read with both matches adds to ``no_placement`` when it has
+    no placement, and to ``negative_value`` when its best value is
+    negative. ``n_alignments_drop_flank`` counts each dropped read once.
     """
+    qc["n_alignments_placed"] += int(placement.placed.sum())
     qc["n_alignments_drop_flank"] += int((~placement.kept).sum())
-    for side, drops in (("upstream", placement.upstream_drop),
-                        ("downstream", placement.downstream_drop)):
-        for reason in SIDE_DROP_REASONS:
-            qc[f"n_alignments_drop_{side}_{reason}"] += int((drops == reason).sum())
-    qc["n_alignments_drop_flanks_crossed"] += int(placement.flanks_crossed.sum())
+    qc["n_alignments_drop_upstream_flank_not_placed"] += int(
+        (~placement.upstream_matched).sum())
+    qc["n_alignments_drop_downstream_flank_not_placed"] += int(
+        (~placement.downstream_matched).sum())
+    qc["n_alignments_drop_no_placement"] += int(placement.no_placement.sum())
+    qc["n_alignments_drop_negative_value"] += int(placement.negative_value.sum())
 
 
 def _extract_locus(
