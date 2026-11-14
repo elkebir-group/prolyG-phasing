@@ -71,12 +71,6 @@ OUTCOME: dict[str, tuple[int, ...] | str] = {
     # it is a non-G base between the flank and the G run, so the read has no
     # match of the flank at a tract edge.
     "edge_interrupter": "upstream_flank_not_placed",
-    # The flank TGGTGGTGGT is periodic: it matches at the end of every TGG
-    # copy, and each GGT adds 2 + 2 - 4 = 0. All these placements have the
-    # top value, and the smallest `a` wins, so the tract takes every copy
-    # past the third.
-    "tgg_flank_extra_copy": (2, 2, 2, 12),
-    "tgg_flank_missing_copy": (2, 12),
     # The G at the outer T is read as an extra G of the flank's GG, a 1-base
     # gap. The tract is G10, the tract that T G10 has under the objective.
     "false_g_moved": (10,),
@@ -341,19 +335,58 @@ def test_placement_matches_the_slow_reference_on_random_reads():
     assert n_placed > 400
 
 
-def test_equal_value_placements_keep_the_smallest_a_then_the_largest_b():
-    """The rule for equal values is open; this pins the one the code applies.
-
-    `TGGTGGTGGT` matches at each TGG copy, and each GGT adds 0. Upstream,
-    the farthest copy wins; downstream, the farthest copy wins too.
-    """
+def test_equal_value_placements_keep_the_shortest_tract():
+    """`TGGTGGTGGT` matches at each TGG copy, and each GGT adds 0. Of the
+    placements with the top value, the largest `a` and then the smallest `b`
+    win, so no copy joins the tract."""
     periodic = "TGGTGGTGGT"
     downstream = UP + "GGGGG" + "TGGTGGTGGTGGT" + "AAAAAAAA"
     upstream = "CCCC" + "TGGTGGTGGTGGT" + "GGGGG" + DN
     result = place_polyg_reads([downstream], UP, periodic)
-    assert result.tracts[0] == "GGGGGTGG"
+    assert result.tracts[0] == "GGGGG"
     result = place_polyg_reads([upstream], periodic, DN)
-    assert result.tracts[0] == "GGTGGGGG"
+    assert result.tracts[0] == "GGGGG"
+
+
+def _repeat_unit_read(rng: random.Random, unit: str) -> str:
+    """A read whose flanks are copies of a repeated unit, with read errors."""
+    hap = (unit * rng.randint(3, 6) + "G" * rng.randint(3, 12)
+           + "T" + unit * rng.randint(3, 6) + "".join(rng.choices("ACT", k=6)))
+    s = list(hap)
+    for _ in range(rng.randint(0, 2)):
+        i = rng.randrange(len(s))
+        op = rng.random()
+        if op < 0.5:
+            s[i] = rng.choice("ACGT")
+        elif op < 0.75:
+            s.insert(i, rng.choice("ACGT"))
+        else:
+            del s[i]
+    return "".join(s)
+
+
+def test_tracts_match_the_slow_reference_where_placements_tie():
+    """At flanks of a repeated unit many placements share the top value; the
+    chosen (a, b), not only the value, must agree with the reference."""
+    rng = random.Random(17)
+    n_ties = 0
+    for unit, up, dn in (("TGG", "TGGTGGTGGT", "TTGGTGGTGG"),
+                         ("AGG", "AGGAGGAGGA", "TAGGAGGAGG"),
+                         ("TGGG", "GGTGGGTGGT", "TTGGGTGGGT")):
+        reads = [_repeat_unit_read(rng, unit) for _ in range(300)]
+        result = place_polyg_reads(reads, up, dn)
+        for i, read in enumerate(reads):
+            want = slow.best_placement(read, up, dn)
+            if want is None:
+                assert not result.placed[i]
+                continue
+            assert (result.value[i], result.upstream_run_side[i],
+                    result.downstream_run_side[i]) == want
+            ups, downs = slow.u_positions(read, up), slow.v_positions(read, dn)
+            tops = [(a, b) for a in ups for b in downs if b > a and
+                    slow.score(read[a + 1:b]) - ups[a] - downs[b] == want[0]]
+            n_ties += len(tops) > 1
+    assert n_ties > 50
 
 
 def test_negative_value_and_no_placement_are_counted_not_kept():

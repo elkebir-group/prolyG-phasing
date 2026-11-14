@@ -28,11 +28,12 @@ score minus the two match costs. In the units of the decision record this
 is #G - 2 #nonG minus match costs of 1, 2 or 2.5.
 
 **A read's tract** is the tract of its highest-value placement. When
-several placements have the top value, the read keeps the one with the
-smallest ``a`` and, among those, the largest ``b``. This is the placement
-the flank-pair search found first; the rule for equal values is an open
-decision. A read with no placement, or whose best value is negative, is
-dropped and counted.
+several placements have the top value, the read keeps the shortest tract:
+the largest ``a`` and, among those, the smallest ``b``. A piece that does
+not raise the value does not join the tract. At a flank of a repeated
+unit such as TGG, each extra GGT adds 0, so this rule keeps those copies
+in the flank. A read with no placement, or whose best value is negative,
+is dropped and counted.
 """
 
 from __future__ import annotations
@@ -302,8 +303,8 @@ def best_placements(scores: np.ndarray, upstream: Sequence[np.ndarray],
     ``close_value[b] = scores[b] - cost_v(b)``, the value of ``(a, b)`` is
     ``close_value[b] - open_cost[a]``. The best value is the largest
     ``close_value[b]`` minus the smallest ``open_cost[a]`` with ``a < b``.
-    Among the placements with that value, the smallest ``a`` wins, and
-    then the largest ``b``.
+    Among the placements with that value, the largest ``a`` wins, and then
+    the smallest ``b``: the shortest tract.
     """
     n_reads, width = scores.shape[0], scores.shape[1] - 1
     placed = np.zeros(n_reads, dtype=bool)
@@ -333,12 +334,12 @@ def best_placements(scores: np.ndarray, upstream: Sequence[np.ndarray],
             continue
         best = np.where(ok_b, close_value - before, -4 * _FAR).max(axis=1)
         ok_a = (open_cost < _FAR) & (after > -_FAR) & (after - open_cost == best[:, None])
-        a = ok_a.argmax(axis=1)
+        a = width - 1 - ok_a[:, ::-1].argmax(axis=1)
         open_at_a = open_cost[np.arange(hi - lo), a]
         cols = np.arange(width)[None, :]
         ok_ab = ((cols > a[:, None]) & (close_value > -_FAR)
                  & (close_value - open_at_a[:, None] == best[:, None]))
-        b = width - 1 - ok_ab[:, ::-1].argmax(axis=1)
+        b = ok_ab.argmax(axis=1)
         rows = np.arange(lo, hi)[has]
         placed[rows] = True
         value[rows] = best[has]

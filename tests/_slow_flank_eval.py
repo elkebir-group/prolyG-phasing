@@ -80,13 +80,13 @@ def score(tract: str) -> int:
 def best_placement(read: str, u: str, v: str) -> tuple[int, int, int] | None:
     """(value, a, b) of the read's best placement, or None.
 
-    Of placements with the top value, the smallest a wins, then the
-    largest b.
+    Of placements with the top value, the largest a wins, then the
+    smallest b: the shortest tract.
     """
     best = None
     ups, downs = u_positions(read, u), v_positions(read, v)
-    for a in sorted(ups):
-        for b in sorted(downs, reverse=True):
+    for a in sorted(ups, reverse=True):
+        for b in sorted(downs):
             if b <= a:
                 continue
             val = score(read[a + 1:b]) - ups[a] - downs[b]
