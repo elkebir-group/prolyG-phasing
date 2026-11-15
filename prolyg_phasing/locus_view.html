@@ -17,15 +17,15 @@
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
   --bg:#12161c; --panel:#1a2029; --fg:#e4e9f0; --muted:#97a3b3; --line:#2c3440; --accent:#4fb3d4;
   --chip:#242c37; --warn:#f0b35a; --warnbg:#3a2c16; --bad:#f08a8a; --badbg:#3c1f22; --ok:#8fd49a; --okbg:#1d3323;
-  --bG:#4a525e; --bA:#3fa45c; --bC:#6a9cf0; --bT:#f59486; --bN:#ddd;
+  --bG:#4a525e; --bA:#2a8442; --bC:#6a9cf0; --bT:#ffb0a4; --bN:#ddd;
   --flank:#a7b0bb; --tract:#5f6873; --anchor:#aab4c2; --ins:#e070e0;
-  --hmajor:#e08fc0; --hminor:#f0b030; --snvband:var(--fg); color-scheme:dark}}
+  --hmajor:#e07fb0; --hminor:#f0b030; --snvband:var(--fg); color-scheme:dark}}
 :root[data-theme="dark"]{
   --bg:#12161c; --panel:#1a2029; --fg:#e4e9f0; --muted:#97a3b3; --line:#2c3440; --accent:#4fb3d4;
   --chip:#242c37; --warn:#f0b35a; --warnbg:#3a2c16; --bad:#f08a8a; --badbg:#3c1f22; --ok:#8fd49a; --okbg:#1d3323;
-  --bG:#4a525e; --bA:#3fa45c; --bC:#6a9cf0; --bT:#f59486; --bN:#ddd;
+  --bG:#4a525e; --bA:#2a8442; --bC:#6a9cf0; --bT:#ffb0a4; --bN:#ddd;
   --flank:#a7b0bb; --tract:#5f6873; --anchor:#aab4c2; --ins:#e070e0;
-  --hmajor:#e08fc0; --hminor:#f0b030; --snvband:var(--fg); color-scheme:dark}
+  --hmajor:#e07fb0; --hminor:#f0b030; --snvband:var(--fg); color-scheme:dark}
 *{box-sizing:border-box}
 body{background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.45;
   padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:14px}
@@ -238,7 +238,7 @@ function tractCard(r){
   const head=L?lab.map(l=>`<th class="num" style="color:var(${LABEL_COLOR[l]})"><span class="legend" style="display:inline;margin:0">${labelSwatch(l)}</span>${LABEL_NAME[l]}</th>`).join(""):"";
   c.innerHTML=`<h2>Tracts${helpMark("Molecules: distinct read families (MI)."+(L?" Major, minor, unk: reads by phase label.":""))}</h2><div class="note">${fmt(total)} reads, ${fmt(r.n_tracts)} tracts${r.tract_reads_not_shown?` (${fmt(r.n_tracts-r.tracts.length)} tracts, ${fmt(r.tract_reads_not_shown)} reads not listed)`:""}.</div>
    <div class="scroll" style="max-height:420px;overflow:auto"><table><thead><tr><th class="num">Reads</th>${head}<th class="num">Molecules</th><th class="num">Share</th><th></th><th>Tract</th></tr></thead><tbody>${r.tracts.map(([s,n,m],i)=>`<tr><td class="num">${fmt(n)}</td>${L?L[i].map((v,k)=>`<td class="num" style="color:var(${LABEL_COLOR[lab[k]]})">${fmt(v)}</td>`).join(""):""}<td class="num">${fmt(m)}</td><td class="num">${pct(n/total)}</td>
-   <td><span style="display:inline-block;height:8px;width:${Math.round(60*n/max)}px;background:var(--accent);border-radius:2px"></span></td>
+   <td><span style="display:inline-block;height:8px;width:${Math.round(60*n/max)}px;background:var(--muted);border-radius:2px"></span></td>
    <td class="mono">${tractSeq(s)}</td></tr>`).join("")}</tbody></table></div>`;
   return c;
 }
@@ -260,7 +260,7 @@ function histCard(r){
     return s+axis(H-2)+`</svg>`};
   if(!SH){const tot=r.largest_run.reduce((a,x)=>a+x[1],0)||1;const rows=r.largest_run.map(([k,n])=>[k,n/tot,n]);
     const ymax=Math.max(...rows.map(x=>x[1]),0.01);
-    c.innerHTML+=panel(rows,ymax,190,"var(--accent)",(k,v,n)=>`largest G run ${k}: ${fmt(n)} reads (${pct(v)})`)+`<div class="note" style="text-align:center">largest G run</div>`;return c}
+    c.innerHTML+=panel(rows,ymax,190,"var(--muted)",(k,v,n)=>`largest G run ${k}: ${fmt(n)} reads (${pct(v)})`)+`<div class="note" style="text-align:center">largest G run</div>`;return c}
   const lab=["hap_major","hap_minor","unk"];
   const counts=Object.fromEntries(r.largest_run_labels);
   const totals=lab.map((_,i)=>r.largest_run_labels.reduce((a,[,v])=>a+v[i],0));
