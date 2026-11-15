@@ -355,8 +355,8 @@ def test_no_pair_reaches_a_positive_objective():
 def _locus_flanks(records, name="L") -> fc.LocusFlanks:
     pair = fc.FlankPair("ACTTCAGCAT", "CAAATTTTAT", 41, (("ACTTCAGCAT", "CAAATTTTAT"),),
                         30, 25)
-    positions = tuple(fc.FlankPosition(r, 0 if r is None else 20, 0 if r is None else 18)
-                      for r in records)
+    positions = tuple(fc.FlankPosition(r, 20, 18) if r.has_position
+                      else fc.FlankPosition(r, 0, 0) for r in records)
     return fc.LocusFlanks(name, "+", pair, positions)
 
 
@@ -377,17 +377,40 @@ def test_side_table_round_trips_flanks_of_any_reference_length(tmp_path):
     assert (row.n_reads_positioned, row.n_reads_at_position) == ("20", "18")
 
 
-def test_a_flank_with_no_reference_position_stops_construction():
+def test_a_side_with_no_reference_position_round_trips(tmp_path):
     up = FlankRecord("ACTTCAGCAT", tuple(range(100, 110)), 9)
-    with pytest.raises(ValueError, match=r"no kept read gives both reference positions for 1 "
-                                         r"flanks: \['L downstream'\]"):
-        fc.construct_flanks([("L", _locus_flanks((up, None)))], sample="S1")
+    dn = FlankRecord("CAAATTTTAT", (), 0)
+    result = fc.construct_flanks([("L", _locus_flanks((up, dn)))], sample="S1")
+    path = fc.write_flank_table(result, tmp_path / "x")
+    sides = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False).set_index("side")
+    assert sides.loc["upstream", "reference_window_status"] == "recovered"
+    row = sides.loc["downstream"]
+    assert (row.reference_window_status, row.flank_bases, row.flank_ref_positions) == \
+        ("no_reference_position", "CAAATTTTAT", "")
+    assert (row.objective, row.n_reads_placed, row.n_reads_positioned,
+            row.n_reads_at_position) == ("20.5", "25", "0", "0")
+    assert read_flank_table(path).records == {"L": (up, dn)}
+    # An upstream side with no position reads back as an upstream record.
+    empty_up = FlankRecord("ACTTCAGCAT", (), -1)
+    result = fc.construct_flanks([("L", _locus_flanks((empty_up, dn)))], sample="S1")
+    back = read_flank_table(fc.write_flank_table(result, tmp_path / "y")).records["L"]
+    assert back == (empty_up, dn) and back[0].is_upstream and not back[1].is_upstream
+
+
+def test_a_flank_table_status_must_match_its_positions(tmp_path):
+    rows = [_side_row("upstream", "no_reference_position", "ACTTCAGCAT", "100,101"),
+            _side_row("downstream", "recovered", "CAAATTTTAT", "130,131")]
+    with pytest.raises(ValueError, match="has the status 'no_reference_position' but "
+                                         "reference positions"):
+        read_flank_table(_side_table(tmp_path, rows))
+    rows[0] = _side_row("upstream", "recovered", "ACTTCAGCAT", "")
+    with pytest.raises(ValueError, match="has the status 'recovered' but no reference"):
+        read_flank_table(_side_table(tmp_path, rows))
 
 
 def test_a_locus_with_no_positive_pair_stops_construction():
     with pytest.raises(ValueError, match=r"no flank pair reaches F > 0 at 1 loci: \['L'\]"):
-        none = fc.FlankPosition(None, 0, 0)
-        fc.construct_flanks([("L", fc.LocusFlanks("L", "+", None, (none, none)))],
+        fc.construct_flanks([("L", fc.LocusFlanks("L", "+", None, None))],
                             sample="S1")
 
 
@@ -625,14 +648,14 @@ def test_a_flank_range_against_the_polyg_direction_is_an_invariant_error():
         fc.flank_records_from_alignments(loc, pair)
 
 
-def test_a_flank_base_without_a_coordinate_leaves_no_record():
+def test_a_flank_base_without_a_coordinate_leaves_no_position():
     pair = fc.solve_flank_pair([_READ], slow.marks_matrix([_READ]))
     coords = list(range(100, 100 + len(_READ)))
     coords[41] = -1  # the downstream outer base is soft-clipped
     up, dn = fc.flank_records_from_alignments(_locus_reads([_READ], [coords]), pair)
     assert up.record.ref_positions == tuple(range(110, 120))
     assert (up.n_reads_positioned, up.n_reads_at_position) == (1, 1)
-    assert dn == fc.FlankPosition(None, 0, 0)
+    assert dn == fc.FlankPosition(FlankRecord("CAAATTTTAT", (), 0), 0, 0)
 
 
 def test_the_pair_vote_differs_from_two_separate_votes():

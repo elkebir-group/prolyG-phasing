@@ -82,6 +82,7 @@ from prolyg_phasing.io._flank_placement import (
     FLANK_PLACE_VALUES,
     MAX_MATCH_LEN,
     MIN_MATCH_LEN,
+    NO_REFERENCE_POSITION,
     PAD,
     SHAPES,
     SUBSTITUTION_COST,
@@ -718,8 +719,9 @@ class FlankPosition:
 
     Attributes
     ----------
-    record : FlankRecord or None
-        None when no kept read gives both of the side's coordinates.
+    record : FlankRecord
+        The flank. Its `ref_positions` is empty when no kept read gives
+        both of the side's coordinates.
     n_reads_positioned : int
         Kept reads whose alignment gives both the outer and the run-side
         base a coordinate.
@@ -727,7 +729,7 @@ class FlankPosition:
         Those of them that give the chosen pair.
     """
 
-    record: FlankRecord | None
+    record: FlankRecord
     n_reads_positioned: int
     n_reads_at_position: int
 
@@ -749,8 +751,9 @@ def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
     `ref_positions` is the contiguous range between the two coordinates,
     in polyG read order.
 
-    The record is None when no kept read gives both coordinates. An
-    alignment keeps the read bases in reference order, so a pair from one
+    When no kept read gives both coordinates, the record has no reference
+    position (empty `ref_positions`) and both counts are 0. An alignment
+    keeps the read bases in reference order, so a pair from one
     read always runs toward the G run and spans at least two bases. Raises
     RuntimeError if the chosen pair does not.
     """
@@ -766,6 +769,7 @@ def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
     }
     out = []
     for side, bases in zip(SIDES, (pair.upstream, pair.downstream), strict=True):
+        offset = -1 if side == "upstream" else 0
         outer_index, run_index, toward_run = read_bases[side]
         outer_coords = coords[kept, outer_index]
         run_coords = coords[kept, run_index]
@@ -773,7 +777,7 @@ def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
         n_positioned = int(both.sum())
         voted = modal_pair(outer_coords[both], run_coords[both], toward_run)
         if voted is None:
-            out.append(FlankPosition(None, 0, 0))
+            out.append(FlankPosition(FlankRecord(bases, (), offset), 0, 0))
             continue
         outer, run, n_at = voted
         if toward_run * (run - outer) < 1:
@@ -794,17 +798,18 @@ def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
 class LocusFlanks:
     """One locus's flank pair, and where each flank lies in the reference.
 
-    `positions` holds the upstream and downstream position; its record is
-    None when no kept read gives that flank both reference coordinates.
+    `pair` and `positions` are None when no pair reaches F > 0. A record
+    in `positions` has no reference position when no kept read gives that
+    flank both reference coordinates.
     """
 
     name: str
     ref_orientation: str
     pair: FlankPair | None
-    positions: tuple[FlankPosition, FlankPosition]
+    positions: tuple[FlankPosition, FlankPosition] | None
 
     @property
-    def records(self) -> tuple[FlankRecord | None, FlankRecord | None]:
+    def records(self) -> tuple[FlankRecord, FlankRecord]:
         """The upstream and downstream flank records."""
         return self.positions[0].record, self.positions[1].record
 
@@ -821,8 +826,7 @@ def solve_locus(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
         return None
     pair = solve_flank_pair(loc.reads, loc.marks)
     if pair is None:
-        none = FlankPosition(None, 0, 0)
-        return LocusFlanks(name, loc.ref_orientation, None, (none, none))
+        return LocusFlanks(name, loc.ref_orientation, None, None)
     return LocusFlanks(name, loc.ref_orientation, pair,
                        flank_records_from_alignments(loc, pair))
 
@@ -868,25 +872,22 @@ def construct_flanks(loci: Sequence[tuple[str, LocusFlanks | None]], *, sample: 
 
     A locus with None has no reference window: it gets a row on each side
     with the status `WINDOW_UNRECOVERABLE`, empty flank fields and no
-    record. The locus columns (`objective`, `n_reads`, `n_reads_placed`,
+    record. A side whose flank has no reference position gets the status
+    `NO_REFERENCE_POSITION`, its flank bases and empty
+    `flank_ref_positions`; its record has empty `ref_positions`. The locus
+    columns (`objective`, `n_reads`, `n_reads_placed`,
     `n_tied_pairs`) repeat on both side rows. `n_reads_positioned` and
     `n_reads_at_position` are per side (see :class:`FlankPosition`); they
     are for diagnosis. `objective` is in the units of the
     decision record, half the half-unit value.
 
     Raises ValueError when a locus with a reference window has no pair with
-    F > 0, or when no kept read gives a flank its reference coordinates; the
-    message names every such locus or side.
+    F > 0; the message names every such locus.
     """
     no_pair = [name for name, loc in loci if loc is not None and loc.pair is None]
     if no_pair:
         raise ValueError(f"{sample}: no flank pair reaches F > 0 at {len(no_pair)} loci: "
                          f"{no_pair}")
-    unlocated = [f"{name} {side}" for name, loc in loci if loc is not None
-                 for side, record in zip(SIDES, loc.records, strict=True) if record is None]
-    if unlocated:
-        raise ValueError(f"{sample}: no kept read gives both reference positions for "
-                         f"{len(unlocated)} flanks: {unlocated}")
     records: dict[str, tuple[FlankRecord, FlankRecord]] = {}
     rows = []
     for name, loc in loci:
@@ -903,7 +904,9 @@ def construct_flanks(loci: Sequence[tuple[str, LocusFlanks | None]], *, sample: 
         for side, position in zip(SIDES, loc.positions, strict=True):
             record = position.record
             rows.append({
-                "locus": name, "side": side, "reference_window_status": WINDOW_RECOVERED,
+                "locus": name, "side": side,
+                "reference_window_status": (WINDOW_RECOVERED if record.has_position
+                                            else NO_REFERENCE_POSITION),
                 "ref_orientation": loc.ref_orientation, "flank_bases": record.bases,
                 "flank_ref_positions": ",".join(map(str, record.ref_positions)),
                 "objective": loc.pair.objective_half_units / 2,

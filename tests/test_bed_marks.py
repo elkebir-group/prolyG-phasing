@@ -20,7 +20,7 @@ import pysam
 import pytest
 
 import prolyg_phasing.io._flank_construction as fc
-from prolyg_phasing.io._flank_placement import place_flanks, place_polyg_reads
+from prolyg_phasing.io._flank_placement import FlankRecord, place_flanks, place_polyg_reads
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import parse_run_lengths
 from tests import _slow_flank_eval as slow
@@ -227,3 +227,77 @@ def test_the_optimum_surrounds_the_bed_run_not_a_longer_run_outside(tmp_path):
         assert (up.bases, dn.bases) == (BED_UP, BED_DN)
         row = sides.loc[(f"TwoRuns{o}", "upstream")]
         assert (row.objective, row.n_reads_placed) == (20 * 8, 20)
+
+
+# ---------------------------------------------------------------------------
+# A flank side with no reference position
+# ---------------------------------------------------------------------------
+
+SOFT = 4
+
+
+def test_a_soft_clipped_downstream_flank_has_no_position_and_keeps_its_tracts(tmp_path):
+    """PolyG151 with every read soft-clipped from the downstream edge base on,
+    as at PolyG7425: no read aligns the downstream flank. The side keeps its
+    flank, has no reference position, and gives no flanking bases. The
+    upstream side and the tracts are as with an aligned flank."""
+    locus = LOCI["PolyG151"]
+    aligned = len(locus.upstream) + len(locus.tract)
+    clipped = (locus.reference, 0, ((M, aligned), (SOFT, len(locus.downstream))), 20)
+    bam, bed = _write_bam(tmp_path, locus, [clipped])
+    result = fc.build_flanks(bam, bed, n_workers=1, sample="NORMAL")
+    sides = result.sides.set_index(["locus", "side"])
+    for o in ORIENTATIONS:
+        up, dn = result.records[f"PolyG151{o}"]
+        assert up.has_position and not dn.has_position
+        assert dn.bases == locus.downstream[:10]
+        row = sides.loc[(f"PolyG151{o}", "downstream")]
+        assert (row.reference_window_status, row.flank_ref_positions,
+                row.n_reads_positioned) == ("no_reference_position", "", 0)
+    flanks = fc.write_flank_table(result, tmp_path / "normal")
+
+    # The same reads, aligned in full, with the same flank bases at their
+    # reference positions.
+    case = _case(locus, "", 0)
+    full_dir = tmp_path / "full"
+    full_dir.mkdir()
+    full_bam, full_bed = _write_bam(full_dir, locus, [_gapless(locus, 0, len(locus.reference),
+                                                               20)])
+    full_flanks = write_side_table(full_dir / "normal", "NORMAL", {
+        f"PolyG151{o}": (flank_record(case, case.up, o), flank_record(case, case.dn, o))
+        for o in ORIENTATIONS})
+    panel = extract_panel(bam, bed, flanks)
+    full = extract_panel(full_bam, full_bed, full_flanks)
+    for o in ORIENTATIONS:
+        got, want = panel.loci[f"PolyG151{o}"], full.loci[f"PolyG151{o}"]
+        assert sorted(map(str, got.seq)) == sorted(map(str, want.seq)) == ["G" * 12] * 20
+        assert got.n_alignments_placed == 20
+        # No downstream flanking bases, and no reference tract.
+        assert (got.flanking_dn_width, got.flanking_dn_ref_pos_start) == (0, 0)
+        assert (got.reference_tract, got.reference_run_lengths) == ("", ())
+        assert want.reference_tract == "G" * 12 and want.flanking_dn_width > 0
+        # The upstream side is intact.
+        assert (got.flanking_up_width, got.flanking_up_ref_pos_start) == \
+            (want.flanking_up_width, want.flanking_up_ref_pos_start)
+        got_up = {str(s).split("|")[0] for s in got.flanking_seq}
+        want_up = {str(s).split("|")[0] for s in want.flanking_seq}
+        assert got_up == want_up
+        assert {str(s).split("|")[1] for s in got.flanking_seq} == {""}
+
+
+def test_extraction_with_an_upstream_side_without_a_position(tmp_path):
+    """The flank table gives the upstream flank no position; the reads align
+    in full. Only the upstream flanking is lost."""
+    locus = LOCI["PolyG151"]
+    case = _case(locus, "", 0)
+    reads = [_gapless(locus, 0, len(locus.reference), 5)]
+    bam, bed = _write_bam(tmp_path, locus, reads)
+    records = {f"PolyG151{o}": (FlankRecord(case.up.bases, (), -1),
+                                flank_record(case, case.dn, o)) for o in ORIENTATIONS}
+    panel = extract_panel(bam, bed, write_side_table(tmp_path / "normal", "NORMAL", records))
+    for o in ORIENTATIONS:
+        got = panel.loci[f"PolyG151{o}"]
+        assert {str(s) for s in got.seq} == {"G" * 12}
+        assert (got.flanking_up_width, got.flanking_up_ref_pos_start) == (0, 0)
+        assert got.flanking_dn_width > 0
+        assert not got.upstream_flank.has_position

@@ -117,7 +117,9 @@ def write_side_table(prefix: Path, sample: str,
     for locus, pair in records.items():
         for side, record in zip(("upstream", "downstream"), pair, strict=True):
             rows.append({
-                "locus": locus, "side": side, "reference_window_status": "recovered",
+                "locus": locus, "side": side,
+                "reference_window_status": ("recovered" if record.has_position
+                                            else "no_reference_position"),
                 "ref_orientation": "", "flank_bases": record.bases,
                 "flank_ref_positions": ",".join(map(str, record.ref_positions)),
                 "objective": 0.0, "n_reads": 0, "n_reads_placed": 0, "n_tied_pairs": 1,

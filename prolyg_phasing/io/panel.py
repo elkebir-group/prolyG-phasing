@@ -116,7 +116,9 @@ class ExtractedLocus:
 
     # Structural meta (per-locus, constant across rows).
     n_runs: int
-    reference_tract: str        # reference strictly between the two flanks, polyG orientation
+    # The reference strictly between the two flanks, polyG orientation; empty,
+    # with empty run lengths, when a flank has no reference position.
+    reference_tract: str
     reference_run_lengths: tuple[int, ...]
 
     # Locus geometry.
@@ -125,8 +127,11 @@ class ExtractedLocus:
     bed_end: int
     bed_name: str
     ref_orientation: str        # '+' (G-dominant) / '-' (C-dominant; revcomp'd)
-    upstream_flank: FlankRecord | None      # None when the matched normal had no
-    downstream_flank: FlankRecord | None    # reference window at this locus
+    # None when the matched normal had no reference window at this locus. A
+    # flank with empty `ref_positions` has no reference position: it sets
+    # the tract, and its side has no flanking bases (width 0, start 0).
+    upstream_flank: FlankRecord | None
+    downstream_flank: FlankRecord | None
 
     # QC counters. `n_alignments_placed` counts the reads with at least one
     # placement, of any value. A read dropped by the flank placement counts

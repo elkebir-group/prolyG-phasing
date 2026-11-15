@@ -412,10 +412,14 @@ class FlankRecord:
         The 0-based reference coordinates from the flank's outer base to
         its run-side base, contiguous and in polyG read order. The matched
         normal's read alignments give the two end coordinates (see
-        :mod:`prolyg_phasing.io._flank_construction`).
+        :mod:`prolyg_phasing.io._flank_construction`). Empty when no read of
+        the matched normal aligns both end bases: the side has no reference
+        position. The flank bases still set the tract.
     run_side_offset : int
         Offset in `ref_positions` of the base next to the repeat: the last
-        offset for the upstream flank, 0 for the downstream flank.
+        offset (``len(ref_positions) - 1``) for the upstream flank, 0 for
+        the downstream flank. The rule holds with no position too: -1
+        upstream, 0 downstream.
     """
 
     bases: str
@@ -423,8 +427,8 @@ class FlankRecord:
     run_side_offset: int
 
     def __post_init__(self) -> None:
-        if len(self.ref_positions) < 2:
-            raise ValueError("a flank matches at least two reference bases")
+        if len(self.ref_positions) == 1:
+            raise ValueError("a flank with a reference position spans at least two bases")
         if self.run_side_offset not in (0, len(self.ref_positions) - 1):
             raise ValueError("the run-side base must be the first or the last matched base")
 
@@ -433,14 +437,25 @@ class FlankRecord:
         return self.run_side_offset == len(self.ref_positions) - 1
 
     @property
+    def has_position(self) -> bool:
+        """Whether the flank has reference coordinates."""
+        return bool(self.ref_positions)
+
+    @property
     def run_side_position(self) -> int:
         """Reference coordinate of the matched base next to the repeat."""
+        self._require_position()
         return self.ref_positions[self.run_side_offset]
 
     @property
     def outer_position(self) -> int:
         """Reference coordinate of the matched base farthest from the repeat."""
+        self._require_position()
         return self.ref_positions[0 if self.is_upstream else -1]
+
+    def _require_position(self) -> None:
+        if not self.ref_positions:
+            raise ValueError(f"the flank {self.bases} has no reference position")
 
 
 # The reference window status of a locus side in the flank table and of a
@@ -448,6 +463,11 @@ class FlankRecord:
 # has no flank.
 WINDOW_RECOVERED = "recovered"
 WINDOW_UNRECOVERABLE = "ref_window_unrecoverable"
+
+# The status of a flank-table side whose locus has a reference window but
+# whose flank no read of the matched normal aligns at both end bases. The
+# side keeps its flank bases and has no reference positions.
+NO_REFERENCE_POSITION = "no_reference_position"
 
 # Side-table fields that a side with no reference window leaves empty.
 _FLANK_FIELDS = ("flank_bases", "flank_ref_positions")
@@ -484,10 +504,13 @@ class FlankTable:
 def read_flank_table(path: str | Path) -> FlankTable:
     """The flank records and the sample of a side TSV that `build-flanks` writes.
 
-    Raises ValueError when the table has no ``sample`` or
-    ``reference_window_status`` column, names more than one sample, lacks
-    one side of a locus, gives the two sides of a locus different
-    statuses, or has flank fields on a side with no reference window.
+    A side with the status `NO_REFERENCE_POSITION` gives a record with
+    empty `ref_positions`. Raises ValueError when the table has no
+    ``sample`` or ``reference_window_status`` column, names more than one
+    sample, lacks one side of a locus, has a reference window on one side
+    of a locus only, has flank fields on a side with no reference window,
+    or has reference positions on a side with `NO_REFERENCE_POSITION` or
+    none on a `WINDOW_RECOVERED` side.
     """
     with open(path, newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -509,10 +532,14 @@ def read_flank_table(path: str | Path) -> FlankTable:
                                  "window but carries flank fields")
             by_locus.setdefault(row["locus"], {})[row["side"]] = None
             continue
-        if status != WINDOW_RECOVERED:
+        if status not in (WINDOW_RECOVERED, NO_REFERENCE_POSITION):
             raise ValueError(f"{path}: {row['locus']} {row['side']} has the unknown "
                              f"reference window status {status!r}")
-        positions = tuple(int(p) for p in row["flank_ref_positions"].split(","))
+        text = row["flank_ref_positions"]
+        if bool(text) != (status == WINDOW_RECOVERED):
+            raise ValueError(f"{path}: {row['locus']} {row['side']} has the status "
+                             f"{status!r} but {'' if text else 'no '}reference positions")
+        positions = tuple(int(p) for p in text.split(",")) if text else ()
         record = FlankRecord(
             bases=row["flank_bases"],
             ref_positions=positions,

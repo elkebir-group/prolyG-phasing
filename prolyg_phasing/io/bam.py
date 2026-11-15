@@ -70,6 +70,10 @@ from prolyg_phasing.io.panel import (
 
 REF_WINDOW_PAD = 50
 
+# A reference coordinate past the end of every chromosome: the bound of the
+# flanked interval on a side whose flank has no reference position.
+_NO_FLANKING_BOUND = 1 << 62
+
 PAIR_DISAGREEMENT_POLICY = "merge_by_quality"
 DEFAULT_MIN_FLANKING_BASE_Q = 20
 
@@ -116,7 +120,9 @@ class LocusGeometry:
     reference_window_start : int
         Reference coordinate of ``reference_window[0]``.
     upstream, downstream : FlankRecord
-        The two flanks from the matched normal's flank table.
+        The two flanks from the matched normal's flank table. A flank with
+        no reference position still sets the tract; that side gives no
+        flanking bases.
     g_walk_up, g_walk_dn : int
         The G bases between each BED end and that side's edge base.
     """
@@ -139,14 +145,26 @@ class LocusGeometry:
     def flanked_interval(self) -> tuple[int, int]:
         """Reference interval ``[lo, hi)`` from one flank's outer base to the other's.
 
-        The flanking window for phasing lies outside it.
+        The flanking window for phasing lies outside it. A side whose flank
+        has no reference position extends the interval to that end of the
+        reference (0, or `_NO_FLANKING_BOUND`), so the side gives no
+        flanking bases.
         """
-        outer = (self.upstream.outer_position, self.downstream.outer_position)
-        return min(outer), max(outer) + 1
+        low, high = ((self.upstream, self.downstream) if self.ref_orientation == "+"
+                     else (self.downstream, self.upstream))
+        lo = low.outer_position if low.has_position else 0
+        hi = high.outer_position + 1 if high.has_position else _NO_FLANKING_BOUND
+        return lo, hi
 
     @property
     def reference_tract(self) -> str:
-        """The reference strictly between the two run-side bases, in polyG orientation."""
+        """The reference strictly between the two run-side bases, in polyG orientation.
+
+        Empty when a flank has no reference position: the tract has no
+        reference end on that side.
+        """
+        if not (self.upstream.has_position and self.downstream.has_position):
+            return ""
         window = self.reference_window
         if self.ref_orientation == "-":
             window = revcomp(window)
@@ -168,10 +186,12 @@ def locus_geometry(
     """The reference window of one locus from MD tags, checked against its flanks.
 
     The flank table gives each flank's reference positions (from the
-    matched normal's alignments). Both run-side positions must lie in this
-    BAM's reference window, and the upstream flank must be upstream of the
-    downstream flank. Returns None when no read rebuilds the reference
-    window. Raises ValueError, naming the locus, when a check fails.
+    matched normal's alignments). Each run-side position must lie in this
+    BAM's reference window, and when both flanks have a position the
+    upstream flank must be upstream of the downstream flank. A flank with
+    no reference position takes no check. Returns None when no read
+    rebuilds the reference window. Raises ValueError, naming the locus,
+    when a check fails.
     """
     window_start = bed_start - REF_WINDOW_PAD
     window = get_reference_window(bam, chrom, window_start, bed_end + REF_WINDOW_PAD,
@@ -189,12 +209,14 @@ def locus_geometry(
         g_walk_dn=walk.g_walk_dn,
     )
     for side, flank in zip(("upstream", "downstream"), flanks, strict=True):
-        if not 0 <= geometry.polyg_index(flank.run_side_position) < len(window):
+        if flank.has_position and \
+                not 0 <= geometry.polyg_index(flank.run_side_position) < len(window):
             raise ValueError(
                 f"{name}: the {side} flank's run-side base at reference position "
                 f"{flank.run_side_position} is outside the reference window "
                 f"[{window_start}, {window_start + len(window)}) of this BAM")
-    if geometry.polyg_index(flanks[0].run_side_position) \
+    if flanks[0].has_position and flanks[1].has_position and \
+            geometry.polyg_index(flanks[0].run_side_position) \
             >= geometry.polyg_index(flanks[1].run_side_position):
         raise ValueError(f"{name}: the upstream flank is not upstream of the downstream flank")
     return geometry
@@ -1055,14 +1077,17 @@ def _build_locus(
     flanking_seq_arr = np.asarray(flanking_seqs, dtype=object)
 
     if geometry is not None:
+        # With a flank that has no reference position, the reference tract
+        # and its run lengths are empty.
         reference_tract = geometry.reference_tract
-        ref_run_lengths = parse_run_lengths(reference_tract)
+        ref_run_lengths = parse_run_lengths(reference_tract) if reference_tract else ()
         ref_orientation = geometry.ref_orientation
         g_walk_up, g_walk_dn = geometry.g_walk_up, geometry.g_walk_dn
         status = WINDOW_RECOVERED
         # The flanking window starts past each flank's outer base. The
         # upstream field is written most-distant-first, so its start is
-        # its most distant base.
+        # its most distant base. A side whose flank has no reference
+        # position has width 0 and start 0, as a locus with no window.
         lo, hi = geometry.flanked_interval
         if ref_orientation == "+":
             flanking_up_ref_pos_start = lo - up_width
@@ -1070,6 +1095,10 @@ def _build_locus(
         else:
             flanking_up_ref_pos_start = hi + up_width - 1
             flanking_dn_ref_pos_start = lo - 1
+        if not geometry.upstream.has_position:
+            flanking_up_ref_pos_start = 0
+        if not geometry.downstream.has_position:
+            flanking_dn_ref_pos_start = 0
     else:
         reference_tract = ""
         ref_run_lengths = ()
