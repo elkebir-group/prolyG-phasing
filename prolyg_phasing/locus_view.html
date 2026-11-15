@@ -34,13 +34,12 @@ h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:8px}
 .seg button[aria-pressed="true"]{background:var(--accent);color:var(--panel)}
 button:focus-visible,input:focus-visible,tr:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
 input[type=search]{font:inherit;padding:5px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);width:12em}
-.main{display:grid;grid-template-columns:minmax(300px,380px) minmax(0,1fr);gap:16px;align-items:start}
-@media (max-width:900px){.main{grid-template-columns:minmax(0,1fr)}}
+.main{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;align-items:start}
 .list{background:var(--panel);border:1px solid var(--line);border-radius:8px;min-width:0}
 .filters{display:flex;flex-wrap:wrap;gap:6px;padding:10px}
 .filters button{font:inherit;font-size:12px;border:1px solid var(--line);background:var(--chip);color:var(--fg);border-radius:999px;padding:2px 10px;cursor:pointer}
 .filters button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent);font-weight:600}
-.tablewrap{max-height:72vh;overflow:auto;border-top:1px solid var(--line)}
+.tablewrap{height:220px;overflow:auto;border-top:1px solid var(--line)}
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
 th,td{padding:4px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
 th{position:sticky;top:0;background:var(--panel);font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);cursor:pointer;z-index:1}
@@ -149,6 +148,9 @@ function renderList(){
     tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.largest_run):"–"}</td><td>${pill}</td>`;
     tr.onclick=()=>select(e);tr.onkeydown=ev=>{if(ev.key==="Enter")select(e)};
     tb.appendChild(tr)}
+  // Keep the open locus in view inside the list panel, without moving the page.
+  const sel=tb.querySelector('tr[aria-selected="true"]'),wrap=$(".tablewrap");
+  if(sel&&(sel.offsetTop<wrap.scrollTop+30||sel.offsetTop>wrap.scrollTop+wrap.clientHeight-20))wrap.scrollTop=sel.offsetTop-60;
 }
 async function renderDetail(){
   const el=$("#detail");el.textContent="";
