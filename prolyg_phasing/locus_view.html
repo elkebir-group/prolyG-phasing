@@ -322,24 +322,31 @@ function drawPile(r,S,host,T){
   const U=layoutSide(P.up,true),D=layoutSide(P.dn,false);
   const slots=[...U.map(x=>({side:"up",...x})),...[...up].map((b,i)=>({flank:"up",b,i})),
     ...Array.from({length:T},(_,i)=>({tract:i})),...[...dn].map((b,i)=>({flank:"dn",b,i})),...D.map(x=>({side:"dn",...x}))];
-  const STRIPE=S.label?8:0;
-  const width=slots.length,LABW=90,avail=Math.max(300,host.clientWidth-LABW-STRIPE-4);
-  const CW=Math.max(5,Math.min(12,Math.floor(avail/width))),RH=Math.max(8,Math.min(11,CW)),HEAD=44;
-  const H=HEAD+S.rows.length*RH+6,W=width*CW+LABW+STRIPE;
+  // Header lines, top to bottom: with phasing, the major and the minor
+  // haplotype base of each SNV, then the band; then the sequence line (flank
+  // bases and reference tract only).
+  const PH=!!r.phasing,LEFT=PH?40:0,STRIPE=S.label?8:0;
+  const width=slots.length,LABW=90,avail=Math.max(300,host.clientWidth-LABW-STRIPE-LEFT-4);
+  const CW=Math.max(5,Math.min(12,Math.floor(avail/width))),RH=Math.max(8,Math.min(11,CW));
+  const Y_MAJ=11,Y_MIN=23,BAND=PH?27:4,Y_SEQ=BAND+20,HEAD=Y_SEQ+6;
+  const H=HEAD+S.rows.length*RH+6,W=width*CW+LABW+STRIPE+LEFT;
   const dpr=window.devicePixelRatio||1;const cv=document.createElement("canvas");cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+"px";cv.style.height=H+"px";
   const g=cv.getContext("2d");g.scale(dpr,dpr);const font=`${Math.min(10,CW)}px ${css("--mono")}`;g.font=font;
-  const X=j=>STRIPE+j*CW;
+  const X=j=>LEFT+STRIPE+j*CW;
+  if(PH){g.textAlign="left";g.font=`9px ${css("--sans")}`;
+    g.fillStyle=css("--hmajor");g.fillText("major",2,Y_MAJ);g.fillStyle=css("--hminor");g.fillText("minor",2,Y_MIN);g.font=font}
   slots.forEach((sl,j)=>{g.textAlign="center";const x=X(j)+CW/2;
-    if(sl.gap){g.fillStyle=css("--muted");g.fillRect(x-1,30,2,8);return}
-    if(sl.flank||sl.tract!=null){g.fillStyle=sl.tract!=null?css("--tract"):css("--flank");g.globalAlpha=.75;g.fillRect(X(j),4,CW-1,5);g.globalAlpha=1;
-      g.fillStyle=css("--fg");g.fillText(sl.flank?sl.b:(r.reference_tract[sl.tract]||""),x,38);return}
+    if(sl.gap){g.fillStyle=css("--muted");g.fillRect(x-1,Y_SEQ-8,2,8);return}
+    if(sl.flank||sl.tract!=null){g.fillStyle=sl.tract!=null?css("--tract"):css("--flank");g.globalAlpha=.75;g.fillRect(X(j),BAND,CW-1,5);g.globalAlpha=1;
+      g.fillStyle=css("--fg");g.fillText(sl.flank?sl.b:(r.reference_tract[sl.tract]||""),x,Y_SEQ);return}
     const v=sl.col.snv;
-    if(v){const phased=v.status==="phased";g.fillStyle=phased?css("--warn"):css("--muted");g.fillRect(X(j),4,CW-1,5);g.fillStyle=css("--fg");
-      g.fillText(phased?v.hap_major_base:v.allele_major,x,22);g.fillText(phased?v.hap_minor_base:v.allele_minor,x,38)}
-    else{g.fillStyle=css("--muted");g.fillRect(x-1,34,2,4)}});
+    if(v){const phased=v.status==="phased";g.fillStyle=phased?css("--warn"):css("--muted");g.fillRect(X(j),BAND,CW-1,5);
+      g.fillStyle=phased?css("--hmajor"):css("--muted");g.fillText(phased?v.hap_major_base:v.allele_major,x,Y_MAJ);
+      g.fillStyle=phased?css("--hminor"):css("--muted");g.fillText(phased?v.hap_minor_base:v.allele_minor,x,Y_MIN)}
+    else{g.fillStyle=css("--muted");g.fillRect(x-1,Y_SEQ-4,2,4)}});
   let y=HEAD;
   for(const row of S.rows){
-    if(STRIPE){g.fillStyle=css(LABEL_COLOR[row.label]);g.fillRect(0,y,STRIPE-2,RH-1)}
+    if(STRIPE){g.fillStyle=css(LABEL_COLOR[row.label]);g.fillRect(LEFT,y,STRIPE-2,RH-1)}
     const differs={up:new Set(row.differs?row.differs.up:[]),dn:new Set(row.differs?row.differs.dn:[])};
     slots.forEach((sl,j)=>{let ch="",faded=false;
       if(sl.gap)return;
@@ -357,7 +364,7 @@ function drawPile(r,S,host,T){
   const band=document.createElement("div");band.className="rowband";band.hidden=true;
   wrap.appendChild(cv);wrap.appendChild(band);host.textContent="";host.appendChild(wrap);
   const tip=$("#tip");
-  cv.onmousemove=e=>{if(HELP.open)return;const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left-STRIPE,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
+  cv.onmousemove=e=>{if(HELP.open)return;const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left-STRIPE-LEFT,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
     const kk=Math.floor((yy-HEAD)/RH),onRow=yy>=HEAD&&kk>=0&&kk<S.rows.length;
     band.hidden=!onRow;if(onRow){band.style.top=(HEAD+kk*RH-1)+"px";band.style.height=(RH+1)+"px";band.style.width=W+"px"}
     if(onRow&&(j<0||j>=width)){const row=S.rows[kk];tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";
