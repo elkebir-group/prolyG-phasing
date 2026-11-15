@@ -26,7 +26,7 @@ from prolyg_phasing.io.phasing_tables import (
     build_snv_calls,
     haplotypes_from_snv_calls_table,
 )
-from prolyg_phasing.locus_view import write_locus_view
+from prolyg_phasing.locus_view import make_server
 from prolyg_phasing.phasing import PhasingPanel
 from prolyg_phasing.ref_phasing import assign_flanking_haplotypes_ref
 
@@ -157,44 +157,40 @@ def _positive_int(text: str) -> int:
 
 
 _VIEW_LOCI_DESCRIPTION = """\
-Write a locus viewer for one or more panel.db files of a donor (its normal
-and its tumors) into a directory: index.html, loci.json, and one small JSON
-file per sample and locus. The viewer reads only the panels, not the BAMs.
-Per locus and sample it shows the flanks and the reference tract on the G
-strand, the tracts with their read and molecule counts, the largest G run
-per read, a pile-up of the tracts with 6 flanking bases outside each flank,
-the base counts over the full flanking width of each side, and every
-per-locus counter. Each panel is a sample tab, named by the file stem of
-the BAM its provenance names.
+Start a local locus viewer for one or more panel.db files of a donor (its
+normal and its tumors). It is an HTTP server bound to 127.0.0.1; it reads
+the panels on request, not the BAMs, and writes no files. Each panel is a
+sample tab, named by the file stem of the BAM its provenance names.
 
-The page reads its files with fetch(), which browsers block from file://.
-Serve the directory, for example with "python3 -m http.server" in it, and
-open http://localhost:8000/ (through an ssh tunnel on a remote machine)."""
+Per locus and sample the page shows the flanks and the reference tract on
+the G strand, the tracts with their read and molecule counts, the largest G
+run per read, a pile-up of the tracts with the bases next to each flank and
+the heterozygous flanking positions, the base counts over the full flanking
+width of each side, and every per-locus counter.
+
+On a remote machine, reach the page through an ssh tunnel from your own
+computer: ssh -N -L <port>:localhost:<port> <host>, then open
+http://localhost:<port>/. Stop the server with Ctrl-C."""
 
 
 def _add_view_loci_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--panel", required=True, type=Path, action="append",
                    help="A panel.db of the donor. Repeat for each sample.")
-    loci = p.add_mutually_exclusive_group()
-    loci.add_argument("--loci", help="Comma-separated locus names, e.g. PolyG3145,PolyG4320. "
-                                     "Without --loci or --loci-file, every locus of the panels.")
-    loci.add_argument("--loci-file", type=Path,
-                      help="A file with one locus name per line.")
-    p.add_argument("--out-dir", required=True, type=Path,
-                   help="The directory to write; it is created if needed.")
-
-
-def _requested_loci(args: argparse.Namespace) -> list[str] | None:
-    if args.loci is None and args.loci_file is None:
-        return None
-    text = args.loci if args.loci is not None else args.loci_file.read_text()
-    names = [name.strip() for name in text.replace(",", "\n").splitlines()]
-    return [name for name in names if name]
+    p.add_argument("--port", type=int, default=8765,
+                   help="The port on 127.0.0.1 to serve the page on.")
 
 
 def _run_view_loci(args: argparse.Namespace) -> None:
-    path = write_locus_view(args.panel, args.out_dir, _requested_loci(args))
-    print(f"wrote {path}; serve {args.out_dir} over HTTP to open it")
+    server = make_server(args.panel, args.port)
+    port = server.server_address[1]
+    print(f"Serving {len(args.panel)} panels at http://localhost:{port}/ "
+          f"(remote: ssh -N -L {port}:localhost:{port} <host>). Ctrl-C stops.", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 
 def _run_build_flanks(args: argparse.Namespace) -> None:
@@ -435,7 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     view_loci_p = sub.add_parser(
         "view-loci",
-        help="Write a locus viewer (a directory to serve over HTTP) for panel.db files.",
+        help="Start a local locus viewer (an HTTP server) for panel.db files.",
         description=_VIEW_LOCI_DESCRIPTION,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )

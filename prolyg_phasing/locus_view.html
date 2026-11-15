@@ -74,21 +74,23 @@ canvas{display:block}
   <h1>PolyG Locus Reads <small>from panel.db · G strand</small></h1>
   <div class="seg" role="group" aria-label="Sample" id="samples"></div>
   <input type="search" id="q" placeholder="Find locus, e.g. PolyG4320" aria-label="Find locus">
+  <label class="note">heterozygous limit <input type="number" id="het" min="0.05" max="0.5" step="0.05" style="width:5em"></label>
+  <label class="note">bases next to each flank <input type="number" id="near" min="0" max="50" step="1" style="width:4em"></label>
 </header>
 <p id="loading">Loading the locus list…</p>
 <div class="main" id="app" hidden>
   <section class="list" aria-label="Loci">
     <div class="filters" id="filters"></div>
     <div class="tablewrap"><table id="loci"><thead><tr>
-      <th data-k="locus">Locus</th><th data-k="n_reads" class="num">Reads</th><th data-k="n_tracts" class="num">Tracts</th><th data-k="status">Status</th>
+      <th data-k="locus">Locus</th><th data-k="n_reads" class="num">Reads</th><th data-k="largest_run" class="num">Largest run</th><th data-k="status">Status</th>
     </tr></thead><tbody></tbody></table></div>
   </section>
   <section class="detail" id="detail"></section>
 </div>
 <div class="tip" id="tip" hidden></div>
 <script>
-// The page reads loci.json and, for an opened locus, data/<sample>/<locus>.json.
-// It needs an HTTP server: browsers block fetch() from file://.
+// The page reads the locus list from /loci and one locus from /locus, served by
+// prolyg-phasing view-loci on the local machine.
 let LIST,sample=0,current=null,sortKey="locus",sortDir=1,filter="all";
 const $=s=>document.querySelector(s);
 const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
@@ -100,11 +102,10 @@ function baseColor(b){return css({G:"--bG",A:"--bA",C:"--bC",T:"--bT"}[b]||"--bN
 function coord(orient,start,i){return orient==="-"?start-i:start+i}
 
 async function load(){
-  if(location.protocol==="file:"){
-    $("#loading").textContent="Open this page through an HTTP server (for example python3 -m http.server in this directory): browsers block reading the locus files from file://.";
-    return}
-  LIST=await (await fetch("loci.json")).json();
+  LIST=await (await fetch("loci")).json();
   $("#loading").hidden=true; $("#app").hidden=false;
+  $("#het").value=LIST.het_limit; $("#near").value=LIST.near;
+  for(const id of ["het","near"])$("#"+id).addEventListener("change",renderDetail);
   LIST.samples.forEach((s,k)=>{const b=document.createElement("button");b.textContent=s.sample;
     b.onclick=()=>{sample=k;route()};$("#samples").appendChild(b)});
   const F=[["all","All"],["noflank","No flank"],["noposition","Side with no position"],["noreads","No reads"]];
@@ -146,7 +147,7 @@ function renderList(){
   for(const e of visible()){const s=info(e);
     const tr=document.createElement("tr");tr.tabIndex=0;tr.setAttribute("aria-selected",current===e);
     const pill=!s?`<span class="pill p-n">not in panel</span>`:s.status!=="recovered"?`<span class="pill p-bad">${esc(s.status.replaceAll("_"," "))}</span>`:s.no_position?`<span class="pill p-warn">side with no position</span>`:`<span class="pill p-ok">recovered</span>`;
-    tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.n_tracts):"–"}</td><td>${pill}</td>`;
+    tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.largest_run):"–"}</td><td>${pill}</td>`;
     tr.onclick=()=>select(e);tr.onkeydown=ev=>{if(ev.key==="Enter")select(e)};
     tb.appendChild(tr)}
 }
@@ -155,8 +156,13 @@ async function renderDetail(){
   if(!current){el.innerHTML=`<div class="card"><p class="note">Pick a locus in the list. Every sequence is on the G strand: at a "-" locus the read bases are reverse-complemented and reference coordinates fall from left to right.</p></div>`;return}
   if(!info(current)){el.innerHTML=`<div class="card"><p class="note">${esc(current.locus)} is not in the panel of ${esc(LIST.samples[sample].sample)}.</p></div>`;return}
   const want=current,ws=sample;
-  const r=await (await fetch(`data/${sample}/${current.file}.json`)).json();
+  const q=new URLSearchParams({sample,locus:current.locus,het:$("#het").value,near:$("#near").value});
+  const resp=await fetch("locus?"+q);
   if(want!==current||ws!==sample)return;
+  if(!resp.ok){el.innerHTML=`<div class="card"><p class="note">${esc(await resp.text())}</p></div>`;return}
+  const r=await resp.json();
+  if(want!==current||ws!==sample)return;
+  el.textContent="";
   el.appendChild(headCard(r));
   if(r.flanks){el.appendChild(refCard(r))}
   const two=document.createElement("div");two.className="two";
@@ -228,69 +234,80 @@ function histCard(r){
   s+=`<text x="${(W+pl)/2}" y="${H-2}" font-size="10" text-anchor="middle" fill="var(--muted)">largest G run</text></svg>`;
   c.innerHTML+=s;return c;
 }
-function majority(cnt){const B=LIST.flanking_bases;let k=-1,m=0;cnt.forEach((v,j)=>{if(v>m){m=v;k=j}});return k<0?"":B[k]}
+function cellsText(cnt){const B=LIST.flanking_bases;return cnt?B.split("").map((b,k)=>cnt[k]?`${b} ${fmt(cnt[k])}`:"").filter(Boolean).join(" · ")||"no read base":""}
 function pileCard(r){
-  const c=document.createElement("div");c.className="card";const P=r.pileup;
+  const c=document.createElement("div");c.className="card";const P=r.pileup,S=r.settings;
+  const nHet=P.up.filter(x=>x.het).length+P.dn.filter(x=>x.het).length;
   c.innerHTML=`<h2>Pile-up</h2>
-   <div class="note">G strand. Each row is one tract with the ${LIST.pileup_flanking} flanking bases outside each flank; identical rows are drawn once with their read count (right). The upstream flank sits in fixed columns; the tract is left-justified and padded (a line) to the longest tract drawn, and the downstream flank follows the padded block. The flank columns show the panel's flank, not each read's bases. A flanking cell is empty where the read has no base there: a gap, a clip, or a base below the quality limit. Above each flanking column: the majority base of the reads; its reference coordinate on hover.
-   ${fmt(P.n_rows)} distinct rows${P.reads_not_drawn?`; ${fmt(P.reads_not_drawn)} reads in rows not drawn (the ${fmt(P.rows.length)} rows with the most reads are drawn)`:""}.</div>
+   <div class="note">G strand. On each side the columns are the ${S.near} flanking bases next to the flank and every heterozygous flanking position: one where the second most common base has at least ${pct(S.het_limit)} of the covered reads (${nHet} here). A short mark stands for the positions skipped between two columns. The flank columns show the panel's flank, not each read's bases. The upstream flank sits in fixed columns; the tract is left-justified and padded (a line) to the longest tract drawn.
+   A row is a group of reads with one tract and one set of bases at the heterozygous columns. A read with no base at a heterozygous column joins the group with its tract and its other bases (the largest, if more than one); the second number on the right counts these reads. At the other columns a row shows the most common base of its reads, and an empty cell where none of them has a base (a gap, a clip, or a base below the quality limit).
+   ${fmt(P.n_rows)} rows${P.reads_not_drawn?`; ${fmt(P.reads_not_drawn)} reads in rows not drawn (the ${fmt(P.rows.length)} rows with the most reads are drawn)`:""}.</div>
    <div class="scroll" id="pilehost"></div>
-   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank</span><span><i style="background:var(--tract)"></i>tract</span><span>empty cell: no read base</span></div>`;
+   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank</span><span><i style="background:var(--tract)"></i>tract</span><span><i style="background:var(--warn)"></i>heterozygous column</span><span>empty cell: no read base</span></div>`;
   queueMicrotask(()=>drawPile(r));return c;
 }
+function layoutSide(cols,upstream){
+  // Column slots with a gap slot where flanking indices are not adjacent.
+  const out=[];cols.forEach((c,k)=>{if(k>0&&Math.abs(c.index-cols[k-1].index)>1)out.push({gap:true});out.push({col:c,k})});return out}
 function drawPile(r){
   const host=$("#pilehost");if(!host)return;
-  const P=r.pileup,n=LIST.pileup_flanking,up=r.flanks.upstream.bases,dn=r.flanks.downstream.bases;
-  const T=Math.max(1,...P.rows.map(x=>x[1].length)),width=2*n+up.length+T+dn.length;
-  const LABW=56,avail=Math.max(300,host.clientWidth-LABW-4);
-  const CW=Math.max(5,Math.min(12,Math.floor(avail/width))),RH=Math.max(8,Math.min(11,CW)),HEAD=34;
+  const P=r.pileup,up=r.flanks.upstream.bases,dn=r.flanks.downstream.bases;
+  const T=Math.max(1,...P.rows.map(x=>x.tract.length));
+  const U=layoutSide(P.up,true),D=layoutSide(P.dn,false);
+  const slots=[...U.map(x=>({side:"up",...x})),...[...up].map((b,i)=>({flank:"up",b,i})),
+    ...Array.from({length:T},(_,i)=>({tract:i})),...[...dn].map((b,i)=>({flank:"dn",b,i})),...D.map(x=>({side:"dn",...x}))];
+  const width=slots.length,LABW=90,avail=Math.max(300,host.clientWidth-LABW-4);
+  const CW=Math.max(5,Math.min(12,Math.floor(avail/width))),RH=Math.max(8,Math.min(11,CW)),HEAD=44;
   const H=HEAD+P.rows.length*RH+6,W=width*CW+LABW;
   const dpr=window.devicePixelRatio||1;const cv=document.createElement("canvas");cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+"px";cv.style.height=H+"px";
-  const g=cv.getContext("2d");g.scale(dpr,dpr);g.font=`${Math.min(10,CW)}px ${css("--mono")}`;
-  const t0=n+up.length,d0=t0+T,o0=d0+dn.length;
-  const region=j=>j<n?"upctx":j<t0?"up":j<d0?"tract":j<o0?"dn":"dnctx";
-  const F=r.flanking,orient=r.ref_orientation;
-  const upIdx=j=>F.up.width-n+j, dnIdx=j=>j-o0;
-  const colCounts=j=>{const rg=region(j);
-    if(rg==="upctx"){const i=upIdx(j);return i>=0&&F.up.counts[i]?{cnt:F.up.counts[i],at:coord(orient,F.up.start,i)}:null}
-    if(rg==="dnctx"){const i=dnIdx(j);return i<F.dn.width?{cnt:F.dn.counts[i],at:coord(orient,F.dn.start,i)}:null}
-    return null};
-  const head=j=>{const rg=region(j);if(rg==="up")return up[j-n];if(rg==="dn")return dn[j-d0];if(rg==="tract")return r.reference_tract[j-t0]||"";const cc=colCounts(j);return cc?majority(cc.cnt):""};
-  for(let j=0;j<width;j++){const rg=region(j);g.textAlign="center";
-    if(rg!=="upctx"&&rg!=="dnctx"){g.fillStyle=rg==="tract"?css("--tract"):css("--flank");g.globalAlpha=.75;g.fillRect(j*CW,4,CW-1,5);g.globalAlpha=1}
-    const ch=head(j);g.fillStyle=rg==="upctx"||rg==="dnctx"?css("--muted"):css("--fg");g.fillText(ch,j*CW+CW/2,24)}
+  const g=cv.getContext("2d");g.scale(dpr,dpr);const font=`${Math.min(10,CW)}px ${css("--mono")}`;g.font=font;
+  slots.forEach((sl,j)=>{g.textAlign="center";const x=j*CW+CW/2;
+    if(sl.gap){g.fillStyle=css("--muted");g.fillRect(j*CW+CW/2-1,30,2,8);return}
+    if(sl.flank||sl.tract!=null){g.fillStyle=sl.tract!=null?css("--tract"):css("--flank");g.globalAlpha=.75;g.fillRect(j*CW,4,CW-1,5);g.globalAlpha=1;
+      g.fillStyle=css("--fg");g.fillText(sl.flank?sl.b:(r.reference_tract[sl.tract]||""),x,38);return}
+    const c=sl.col;
+    if(c.het){g.fillStyle=css("--warn");g.fillRect(j*CW,4,CW-1,5);g.fillStyle=css("--fg");
+      g.fillText(c.bases[0][0],x,22);g.fillText(c.bases[1][0],x,38)}
+    else{g.fillStyle=css("--muted");g.fillText(c.majority,x,38)}});
   let y=HEAD;
-  for(const [u,t,d,cnt] of P.rows){
-    for(let j=0;j<width;j++){const rg=region(j);let ch="";
-      if(rg==="upctx")ch=u[j];else if(rg==="up")ch=up[j-n];else if(rg==="tract")ch=t[j-t0]||" ";else if(rg==="dn")ch=dn[j-d0];else ch=d[j-o0];
-      if(ch===".")continue;
-      if(ch===" "){g.fillStyle=css("--fg");g.fillRect(j*CW,y+RH/2-1,CW,2);continue}
-      g.globalAlpha=rg==="up"||rg==="dn"?.45:1;g.fillStyle=baseColor(ch);g.fillRect(j*CW,y,CW-1,RH-1);g.globalAlpha=1}
-    g.fillStyle=css("--muted");g.textAlign="left";g.fillText(fmt(cnt),width*CW+6,y+RH-2);y+=RH}
+  for(const row of P.rows){
+    slots.forEach((sl,j)=>{let ch="",faded=false;
+      if(sl.gap)return;
+      if(sl.flank){ch=sl.b;faded=true}
+      else if(sl.tract!=null){ch=row.tract[sl.tract]||" "}
+      else ch=row[sl.side][sl.k][0];
+      if(ch==="")return;
+      if(ch===" "){g.fillStyle=css("--fg");g.fillRect(j*CW,y+RH/2-1,CW,2);return}
+      g.globalAlpha=faded?.45:1;g.fillStyle=baseColor(ch);g.fillRect(j*CW,y,CW-1,RH-1);g.globalAlpha=1});
+    g.fillStyle=css("--muted");g.textAlign="left";g.font=font;
+    g.fillText(fmt(row.reads)+(row.joined?` (${fmt(row.joined)})`:""),width*CW+6,y+RH-2);y+=RH}
   host.textContent="";host.appendChild(cv);
   const tip=$("#tip");
   cv.onmousemove=e=>{const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
     if(j<0||j>=width){tip.hidden=true;return}
-    const rg=region(j);let html="";
-    if(rg==="upctx"||rg==="dnctx"){const cc=colCounts(j);const side=rg==="upctx"?`${n-j-1} bases outside the upstream flank`:`${j-o0} bases outside the downstream flank`;
-      html=cc?`<b>reference ${fmt(cc.at)}</b> · ${side}<div>${LIST.flanking_bases.split("").map((b,k)=>cc.cnt[k]?`${b} ${fmt(cc.cnt[k])}`:"").filter(Boolean).join(" · ")||"no reads"}</div>`:`<b>${side}</b><div>no flanking bases on this side</div>`}
-    else if(rg==="tract")html=`<b>tract, position ${j-t0+1}</b>`;
-    else html=`<b>${rg==="up"?"upstream":"downstream"} flank</b> (the panel's flank)`;
-    const row=Math.floor((yy-HEAD)/RH);if(yy>=HEAD&&row<P.rows.length){const [u,t,d,cnt]=P.rows[row];html+=`<div class="mono">${fmt(cnt)} reads · tract ${esc(t)||"(empty)"} (${t.length} bases)</div><div class="mono">flanking ${esc(u)} | ${esc(d)}</div>`}
-    tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-420))+"px";tip.style.top=(e.clientY+12)+"px";tip.innerHTML=html};
+    const sl=slots[j];let html="";
+    if(sl.gap)html="<b>skipped flanking positions</b>";
+    else if(sl.flank)html=`<b>${sl.flank==="up"?"upstream":"downstream"} flank, base ${sl.i+1}</b> (the panel's flank)`;
+    else if(sl.tract!=null)html=`<b>tract, position ${sl.tract+1}</b>`;
+    else{const c=sl.col;html=`<b>reference ${fmt(c.position)}</b> · ${sl.side==="up"?"upstream":"downstream"}, ${sl.side==="up"?r.flanking.up.width-c.index:c.index+1} from the flank${c.het?` · heterozygous: ${c.bases.map(([b,f])=>`${b} ${pct(f)}`).join(", ")}`:""}<div>all reads: ${cellsText(c.counts)}</div>`}
+    const k=Math.floor((yy-HEAD)/RH);
+    if(yy>=HEAD&&k<P.rows.length){const row=P.rows[k];
+      html+=`<div class="mono">${fmt(row.reads)} reads${row.joined?`, ${fmt(row.joined)} joined with empty cells`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;
+      if(sl.side){const cell=row[sl.side][sl.k];html+=`<div>this row: ${cell[1]?cellsText(cell[1]):(cell[0]||"no base")}</div>`}}
+    tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";tip.innerHTML=html};
   cv.onmouseleave=()=>tip.hidden=true;
 }
 function flankingCard(r){
   const c=document.createElement("div");c.className="card";
   c.innerHTML=`<h2>Flanking base counts</h2>
-   <div class="note">Every flanking position of each side, in reference columns, over the kept reads: coverage (top) and the share of each base (bottom). A position is marked where the second most common base has at least 20% of the covered reads, as at a heterozygous SNV. Reference coordinate on hover.</div>
+   <div class="note">Every flanking position of each side, in reference columns, over the kept reads: coverage (top) and the share of each base (bottom). A position is marked where the second most common base has at least ${pct(r.settings.het_limit)} of the covered reads, as at a heterozygous SNV; these positions are the heterozygous columns of the pile-up. Reference coordinate on hover.</div>
    <div id="flankhost"></div><div class="note" id="flanklist"></div>
-   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--bN)"></i>N</span><span><i style="background:var(--warn)"></i>second base ≥ 20%</span></div>`;
+   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--bN)"></i>N</span><span><i style="background:var(--warn)"></i>heterozygous position</span></div>`;
   queueMicrotask(()=>drawFlanking(r));return c;
 }
 function drawFlanking(r){
   const host=$("#flankhost");if(!host)return;const F=r.flanking,orient=r.ref_orientation,B=LIST.flanking_bases;
-  const sides=[["upstream",F.up,false],["downstream",F.dn,true]];
+  const sides=[["upstream",F.up],["downstream",F.dn]];
   const GAP=24,total=F.up.width+F.dn.width,avail=Math.max(300,host.clientWidth-4);
   const cw=Math.max(1,Math.min(8,(avail-GAP)/Math.max(1,total)));
   const CH=40,SH=40,H=CH+SH+14,W=total*cw+GAP;
@@ -304,11 +321,11 @@ function drawFlanking(r){
       const h=(CH-4)*cov/maxCov;s+=`<rect x="${x}" y="${CH-h}" width="${cw}" height="${h}" fill="var(--muted)"/>`;
       let yy=CH+4;const sorted=cnt.map((v,k)=>[v,k]).sort((a,b)=>b[0]-a[0]);
       for(const [v,k] of sorted){if(!v)continue;const hh=SH*v/cov;s+=`<rect x="${x}" y="${yy}" width="${cw}" height="${hh}" fill="${baseColor(B[k])}"/>`;yy+=hh}
-      if(sorted[1][0]>=0.2*cov){marked.push({name,at,cnt,cov});s+=`<rect x="${x}" y="${CH+SH+6}" width="${Math.max(cw,2)}" height="6" fill="var(--warn)"/>`}});
+      if(S.het[i]){marked.push({name,at,cnt,cov});s+=`<rect x="${x}" y="${CH+SH+6}" width="${Math.max(cw,2)}" height="6" fill="var(--warn)"/>`}});
     sideNotes.push(`${name}: ${fmt(S.width)} positions${S.width?`, reference ${fmt(S.start)}–${fmt(coord(orient,S.start,S.width-1))} from left to right`:", no flanking bases"}`);
     x0+=S.width*cw+GAP}
   s+=`</svg>`;host.innerHTML=`<div class="scroll">${s}</div><div class="note">${sideNotes.join(" · ")}. The gap between the two blocks stands for the flanks and the tract.</div>`;
-  $("#flanklist").innerHTML=marked.length?"Marked positions: "+marked.map(m=>`${m.name} ${fmt(m.at)}: `+B.split("").map((b,k)=>m.cnt[k]?`${b} ${pct(m.cnt[k]/m.cov)}`:"").filter(Boolean).join(" ")).join(" · "):"No position has a second base at 20% or more.";
+  $("#flanklist").innerHTML=marked.length?"Marked positions: "+marked.map(m=>`${m.name} ${fmt(m.at)}: `+B.split("").map((b,k)=>m.cnt[k]?`${b} ${pct(m.cnt[k]/m.cov)}`:"").filter(Boolean).join(" ")).join(" · "):"No heterozygous position.";
   const svg=host.querySelector("svg"),tip=$("#tip");
   svg.onmousemove=e=>{const rc=svg.getBoundingClientRect(),xx=(e.clientX-rc.left)*W/rc.width;const col=cols.find(o=>xx>=o.x&&xx<o.x+o.w);
     if(!col){tip.hidden=true;return}
