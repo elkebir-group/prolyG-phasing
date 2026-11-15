@@ -180,7 +180,7 @@ async function renderDetail(){
   if(r.flanks){el.appendChild(refCard(r))}
   const two=document.createElement("div");two.className="two";
   two.appendChild(tractCard(r));two.appendChild(histCard(r));el.appendChild(two);
-  if(r.flanks&&r.pileup.rows.length){el.appendChild(pileCard(r));el.appendChild(flankingCard(r))}
+  if(r.flanks&&r.pileup.sections.some(S=>S.rows.length)){el.appendChild(pileCard(r));el.appendChild(flankingCard(r))}
   el.appendChild(counterCard(r));
 }
 function flankText(f){
