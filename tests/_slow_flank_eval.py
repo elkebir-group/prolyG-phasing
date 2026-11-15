@@ -21,15 +21,20 @@ def every_base(read: str) -> frozenset[int]:
     return frozenset(range(len(read)))
 
 
-def marks_matrix(reads: list[str], marked: list[Collection[int]] | None = None):
-    """The library's form of the marks: one bool row per read, as wide as the
-    longest read. With `marked` None, every base is marked."""
-    import numpy as np
-
-    out = np.zeros((len(reads), max(map(len, reads), default=0)), dtype=bool)
+def marks(reads: list[str], marked: list[Collection[int]] | None = None
+          ) -> list[tuple[tuple[int, int], ...]]:
+    """The library's form of the marks: per read, the sorted runs of marked
+    positions as ``(start, end)``. With `marked` None, every base is marked."""
+    out = []
     for row, read in enumerate(reads):
-        for i in (every_base(read) if marked is None else marked[row]):
-            out[row, i] = True
+        positions = sorted(every_base(read) if marked is None else marked[row])
+        runs: list[list[int]] = []
+        for i in positions:
+            if runs and runs[-1][1] == i:
+                runs[-1][1] = i + 1
+            else:
+                runs.append([i, i + 1])
+        out.append(tuple((a, b) for a, b in runs))
     return out
 
 

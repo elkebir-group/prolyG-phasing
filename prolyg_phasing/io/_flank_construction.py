@@ -60,8 +60,14 @@ can differ from the reference by any number of edits. In each kept read the
 flank occupies known read bases at the best placement. The aligner maps the
 flank's outer base and its run-side base to reference coordinates. The
 flank's position is the most common (outer, run-side) pair over the kept
-reads that give both (see :func:`flank_records_from_alignments`). The
-phasing window starts past the outer base. The tract never uses these coordinates.
+reads that give both (see :func:`flank_records_from_alignments`). A side
+has no reference position when no read gives both coordinates, when a
+voted coordinate falls outside BED ± `REF_WINDOW_PAD`, or (both sides) when
+the upstream flank is not upstream of the downstream one. The phasing
+window starts past the outer base. The tract never uses these coordinates.
+
+A locus whose reference window no read rebuilds, or with no pair of F > 0,
+has no flank and gets its own status in the flank table.
 """
 
 from __future__ import annotations
@@ -76,12 +82,15 @@ import numpy as np
 import pandas as pd
 import pysam
 
-from prolyg_phasing.io._anchors import build_anchors, get_reference_window, revcomp
+from prolyg_phasing.io._anchors import determine_orientation, get_reference_window
 from prolyg_phasing.io._flank_placement import (
+    _FAR,
     FLANK_LEN,
     FLANK_PLACE_VALUES,
+    G_SCORE,
     MAX_MATCH_LEN,
     MIN_MATCH_LEN,
+    NO_FLANK_PAIR,
     NO_REFERENCE_POSITION,
     PAD,
     SHAPES,
@@ -89,9 +98,12 @@ from prolyg_phasing.io._flank_placement import (
     WINDOW_PLACE_VALUES,
     WINDOW_RECOVERED,
     WINDOW_UNRECOVERABLE,
+    FlankPlacement,
     FlankRecord,
     G,
+    Marks,
     N,
+    aligned_blocks,
     bed_marks,
     code_matrix,
     decode,
@@ -101,7 +113,7 @@ from prolyg_phasing.io._flank_placement import (
     mark_bounds,
     place_polyg_reads,
     polyg_reads,
-    polyg_reference_coordinates,
+    reference_coordinates,
     tract_scores,
 )
 from prolyg_phasing.io.bam import (
@@ -195,7 +207,7 @@ def _split_lists(n: int, k: np.ndarray, r: np.ndarray, p: np.ndarray, c: np.ndar
                  ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Per-list (reads, positions, costs) arrays from rows sorted by list index `k`."""
     bounds = np.searchsorted(k, np.arange(n + 1))
-    r, p, c = r.astype(np.int32), p.astype(np.uint8), c.astype(np.uint8)
+    r, p, c = r.astype(np.int64), p.astype(np.int64), c.astype(np.uint8)
     return [(r[bounds[i]:bounds[i + 1]], p[bounds[i]:bounds[i + 1]], c[bounds[i]:bounds[i + 1]])
             for i in range(n)]
 
@@ -238,9 +250,6 @@ class _ReadSide:
         self.mat, self.lengths = code_matrix(strings, reverse=reverse)
         self.marks = _reverse_rows(marks, self.lengths) if reverse else marks
         self.n_reads, self.width = self.mat.shape
-        if self.n_reads >= 1 << 24 or self.width >= 256:
-            raise ValueError("a locus holds fewer than 2^24 distinct reads of at most "
-                             "255 bases")
         self.weights = np.asarray(weights, dtype=np.int64)
         self.scores = tract_scores(self.mat)
         self._bound_tracts()
@@ -275,8 +284,8 @@ class _ReadSide:
         n_windows = len(first)
         self.windows = windows[first]
         order = np.argsort(inverse, kind="stable")
-        self.position_read = r[order].astype(np.int32)
-        self.position_edge = a[order].astype(np.int16)
+        self.position_read = r[order].astype(np.int64)
+        self.position_edge = a[order].astype(np.int64)
         self.window_start = np.r_[0, np.cumsum(np.bincount(inverse, minlength=n_windows))]
 
         # Candidates: the last 10 window bases, all A/C/G/T, and not three G
@@ -340,11 +349,9 @@ class _ReadSide:
         p = (np.repeat(self.window_start[window] - np.cumsum(n_pos) + n_pos, n_pos)
              + np.arange(int(n_pos.sum())))
         k, cost = np.repeat(k, n_pos), np.repeat(cost, n_pos)
-        # One packed key, sorted once: list (27 bits) | read (24) | edge (8) | cost (4).
-        key = ((((k << 24) | self.position_read[p].astype(np.int64)) << 8
-                | self.position_edge[p].astype(np.int64)) << 4) | cost
-        key.sort()
-        return key >> 36, (key >> 12) & 0xFFFFFF, (key >> 4) & 0xFF, key & 0xF
+        read, edge = self.position_read[p], self.position_edge[p]
+        order = np.lexsort((cost, edge, read, k))
+        return k[order], read[order], edge[order], cost[order].astype(np.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -399,12 +406,11 @@ class _LocusSearch:
         ru, au, cu = (np.asarray(t, np.int64) for t in ul)
         if not len(ru) or not vls:
             return out
-        far = 1 << 40
         rows, loc = np.unique(ru, return_inverse=True)
         loc = loc.ravel()
         lut = np.full(self.n_reads, -1, dtype=np.int64)
         lut[rows] = np.arange(len(rows))
-        arr = np.full((len(rows), self.width + 1), far, dtype=np.int64)
+        arr = np.full((len(rows), self.width + 1), _FAR, dtype=np.int64)
         np.minimum.at(arr, (loc, au + 1), self.scores[ru, au + 1] + cu)
         prefix_min = np.minimum.accumulate(arr, axis=1)
         vid = np.concatenate([np.full(len(v[0]), i) for i, v in enumerate(vls)])
@@ -415,8 +421,8 @@ class _LocusSearch:
         keep = lv >= 0
         vid, rv, bv, cv, lv = vid[keep], rv[keep], bv[keep], cv[keep], lv[keep]
         gate = self.last_mark[rv, bv]
-        pm = np.where(gate >= 0, prefix_min[lv, np.maximum(gate, 0)], far)
-        keep = pm < far // 2
+        pm = np.where(gate >= 0, prefix_min[lv, np.maximum(gate, 0)], _FAR)
+        keep = pm < _FAR // 2
         vid, rv, bv, cv, pm = vid[keep], rv[keep], bv[keep], cv[keep], pm[keep]
         if not len(vid):
             return out
@@ -459,8 +465,10 @@ def _dedupe(lists: list) -> tuple[list, np.ndarray]:
 
 def _read_bounds(search: _LocusSearch, lists: list, side: str) -> np.ndarray:
     """Per-read bound of each list, ``max(0, max over its positions of M - cost)``,
-    as a dense (n_lists, n_reads) int16 matrix."""
-    out = np.zeros((len(lists), search.n_reads), dtype=np.int16)
+    as a dense (n_lists, n_reads) matrix of the narrowest integer type that
+    holds the largest tract score."""
+    dtype = np.int16 if G_SCORE * search.width <= np.iinfo(np.int16).max else np.int32
+    out = np.zeros((len(lists), search.n_reads), dtype=dtype)
     best_tract = search.u.best_tract if side == "u" else search.v.best_tract
     for i, (r, p, c) in enumerate(lists):
         if not len(r):
@@ -468,7 +476,7 @@ def _read_bounds(search: _LocusSearch, lists: list, side: str) -> np.ndarray:
         r = r.astype(np.int64)
         a = p.astype(np.int64) if side == "u" else search.lengths[r] - 1 - p.astype(np.int64)
         np.maximum.at(out[i], r,
-                      np.maximum(best_tract[r, a] - c.astype(np.int64), 0).astype(np.int16))
+                      np.maximum(best_tract[r, a] - c.astype(np.int64), 0).astype(dtype))
     return out
 
 
@@ -583,6 +591,8 @@ class FlankPair:
         The reads, with repeats.
     n_reads_placed : int
         The reads with at least one placement under the pair, of any value.
+    placement : FlankPlacement
+        Each input read's placement under the pair, in input order.
     """
 
     upstream: str
@@ -591,22 +601,22 @@ class FlankPair:
     optimal_pairs: tuple[tuple[str, str], ...]
     n_reads: int
     n_reads_placed: int
+    placement: FlankPlacement = dataclasses.field(compare=False, repr=False)
 
 
-def solve_flank_pair(reads: Sequence[str], marks: np.ndarray) -> FlankPair | None:
+def solve_flank_pair(reads: Sequence[str], marks: Sequence[Marks]) -> FlankPair | None:
     """The pair of flanks that maximizes F over `reads` (polyG orientation, upper-case).
 
-    `marks` holds one row per read, in polyG read order, at least as wide
-    as the longest read: True at a marked base. Returns None when no pair
+    `marks` gives each read's marked bases. Returns None when no pair
     reaches F > 0. Raises RuntimeError when the extraction's placement of
     the optimal pair does not give the optimum: the search and the
     placement would then disagree on a read's tract.
     """
     if not len(reads):
         return None
-    strings, distinct_marks, inverse = distinct_reads(reads, marks)
+    strings, distinct_marks, mark_matrix, inverse = distinct_reads(reads, marks)
     weights = np.bincount(inverse, minlength=len(strings)).astype(np.int64)
-    search = _LocusSearch(strings, distinct_marks, weights)
+    search = _LocusSearch(strings, mark_matrix, weights)
     if not len(search.u.candidates) or not len(search.v.candidates):
         return None
     ub_u, ub_v = search.u.position_bound, search.v.position_bound
@@ -627,7 +637,7 @@ def solve_flank_pair(reads: Sequence[str], marks: np.ndarray) -> FlankPair | Non
         raise RuntimeError(f"the placement of the optimal pair ({upstream}, {downstream}) "
                            f"gives F = {total} half units, the search {best}")
     return FlankPair(upstream, downstream, best, tuple(optimal), int(weights.sum()),
-                     int(weights[placement.placed].sum()))
+                     int(weights[placement.placed].sum()), placement.take(inverse))
 
 
 # ---------------------------------------------------------------------------
@@ -637,59 +647,45 @@ def solve_flank_pair(reads: Sequence[str], marks: np.ndarray) -> FlankPair | Non
 
 @dataclasses.dataclass
 class LocusReads:
-    """One locus's reference window and its filtered reads in polyG orientation.
+    """One locus's filtered reads in polyG orientation, with their alignments.
 
-    `reads` are the alignments that overlap the BED interval and pass the
-    extraction's read filters. `repeat_start` and `repeat_end` are the BED
-    interval's window indices in polyG orientation. ``ref_coords[r, i]`` is
-    the reference coordinate that the alignment of read ``r`` gives to its
-    base at polyG index ``i``; -1 where that base is soft-clipped, in an
-    insertion, or past the read. `bed_start` and `bed_end` are the BED
-    interval.
+    `reads` are the alignments that overlap the BED interval ``[bed_start,
+    bed_end)`` and pass the extraction's read filters. `marks` are each
+    read's marked bases, and `blocks` each read's aligned blocks
+    (:func:`~prolyg_phasing.io._flank_placement.aligned_blocks`).
     """
 
     name: str
     ref_orientation: str
-    window_start: int
-    polyg_window: str
-    repeat_start: int
-    repeat_end: int
     reads: list[str]
-    ref_coords: np.ndarray
+    marks: list[Marks]
+    blocks: list[list[tuple[int, int, int]]]
     bed_start: int
     bed_end: int
-
-    @property
-    def marks(self) -> np.ndarray:
-        """The marked bases of each read: aligned inside the BED interval."""
-        return bed_marks(self.ref_coords, self.bed_start, self.bed_end)
 
 
 def locus_reads(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
                 bed_end: int) -> LocusReads | None:
-    """Reference window and filtered reads at one locus.
+    """The filtered reads at one locus; None when no read rebuilds the reference window.
 
-    Returns None when no read rebuilds the reference window. Raises
-    ValueError, naming the locus, when the window holds no edge base on a
-    side: the G run reaches the end of the window.
+    The reference window (BED ± `REF_WINDOW_PAD`, from the reads' MD tags)
+    gives the strand of the G run only: "+" when the BED interval holds at
+    least as many G as C. A locus whose window no read rebuilds has no
+    flanks.
     """
-    window_start = bed_start - REF_WINDOW_PAD
-    window = get_reference_window(bam, chrom, window_start, bed_end + REF_WINDOW_PAD,
-                                  min_mapq=_FILTERS["min_mapq"])
+    window = get_reference_window(bam, chrom, bed_start - REF_WINDOW_PAD,
+                                  bed_end + REF_WINDOW_PAD, min_mapq=_FILTERS["min_mapq"])
     if window is None:
         return None
-    anchors = build_anchors(window, REF_WINDOW_PAD, bed_end - bed_start, k=FLANK_LEN)
-    if anchors.status != "anchorable":
-        raise ValueError(f"{name}: the reference window holds no edge base and flank on "
-                         f"each side ({anchors.status})")
-    polyg_window = revcomp(window) if anchors.ref_orientation == "-" else window
+    ref_orientation = determine_orientation(window, REF_WINDOW_PAD, bed_end - bed_start)
     records = [r for r, _ in filtered_alignments(bam, chrom, bed_start, bed_end, bed_start,
                                                  bed_end, qc=new_locus_qc(), **_FILTERS)]
-    reads = polyg_reads([r.query_sequence for r in records], anchors.ref_orientation)
-    return LocusReads(name, anchors.ref_orientation, window_start, polyg_window,
-                      REF_WINDOW_PAD, REF_WINDOW_PAD + bed_end - bed_start, reads,
-                      polyg_reference_coordinates(records, anchors.ref_orientation),
-                      bed_start, bed_end)
+    seqs = [r.query_sequence for r in records]
+    blocks = [aligned_blocks(r.cigartuples, r.reference_start) for r in records]
+    marks = [bed_marks(b, len(seq), ref_orientation, bed_start, bed_end)
+             for b, seq in zip(blocks, seqs, strict=True)]
+    return LocusReads(name, ref_orientation, polyg_reads(seqs, ref_orientation), marks,
+                      blocks, bed_start, bed_end)
 
 
 def modal_pair(outer: np.ndarray, run: np.ndarray, toward_run: int
@@ -739,8 +735,9 @@ def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
     """The upstream and downstream flank positions of a solved pair, from the alignments.
 
     The kept reads are those whose best placement under the pair has a
-    value of at least 0. In each one, the flank occupies the read bases
-    from its outer base to its run-side base at the best placement
+    value of at least 0 (`pair.placement`). In each one, the flank
+    occupies the read bases from its outer base to its run-side base at
+    the best placement
     (:func:`~prolyg_phasing.io._flank_placement.flank_outer_bases`). The
     alignment gives each of these two bases a reference coordinate,
     unless the base is soft-clipped or in an insertion. Only a read that
@@ -751,39 +748,47 @@ def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
     `ref_positions` is the contiguous range between the two coordinates,
     in polyG read order.
 
-    When no kept read gives both coordinates, the record has no reference
-    position (empty `ref_positions`) and both counts are 0. An alignment
-    keeps the read bases in reference order, so a pair from one
-    read always runs toward the G run and spans at least two bases. Raises
-    RuntimeError if the chosen pair does not.
+    A side has no reference position (empty `ref_positions`) when no kept
+    read gives both coordinates, or when a voted coordinate lies outside
+    the reference window, BED ± `REF_WINDOW_PAD`. When both sides have a
+    position but the upstream run-side base is not upstream of the
+    downstream one, neither side has a position. The counts of a side keep
+    the vote. An alignment keeps the read bases in reference order, so a
+    pair from one read always runs toward the G run and spans at least two
+    bases; RuntimeError if the chosen pair does not.
     """
-    placement = place_polyg_reads(loc.reads, pair.upstream, pair.downstream, loc.marks)
+    placement = pair.placement
     up_outer, dn_outer = flank_outer_bases(loc.reads, placement, pair.upstream,
                                            pair.downstream)
     kept = np.flatnonzero(placement.kept)
+    coords = np.array([
+        reference_coordinates(loc.blocks[j], len(loc.reads[j]), loc.ref_orientation,
+                              (up_outer[j], placement.upstream_run_side[j],
+                               dn_outer[j], placement.downstream_run_side[j]))
+        for j in kept], dtype=np.int64).reshape(-1, 4)
     step = 1 if loc.ref_orientation == "+" else -1
-    coords = loc.ref_coords
-    read_bases = {
-        "upstream": (up_outer[kept], placement.upstream_run_side[kept], step),
-        "downstream": (dn_outer[kept], placement.downstream_run_side[kept], -step),
-    }
+    window = (loc.bed_start - REF_WINDOW_PAD, loc.bed_end + REF_WINDOW_PAD)
+    columns = {"upstream": (0, 1, step), "downstream": (2, 3, -step)}
     out = []
     for side, bases in zip(SIDES, (pair.upstream, pair.downstream), strict=True):
         offset = -1 if side == "upstream" else 0
-        outer_index, run_index, toward_run = read_bases[side]
-        outer_coords = coords[kept, outer_index]
-        run_coords = coords[kept, run_index]
+        no_position = FlankRecord(bases, (), offset)
+        outer_column, run_column, toward_run = columns[side]
+        outer_coords, run_coords = coords[:, outer_column], coords[:, run_column]
         both = (outer_coords >= 0) & (run_coords >= 0)
         n_positioned = int(both.sum())
         voted = modal_pair(outer_coords[both], run_coords[both], toward_run)
         if voted is None:
-            out.append(FlankPosition(FlankRecord(bases, (), offset), 0, 0))
+            out.append(FlankPosition(no_position, 0, 0))
             continue
         outer, run, n_at = voted
         if toward_run * (run - outer) < 1:
             raise RuntimeError(
                 f"{loc.name}: the {side} flank {bases} runs from reference position "
                 f"{outer} (outer base) to {run} (run-side base), not toward the G run")
+        if not all(window[0] <= c < window[1] for c in (outer, run)):
+            out.append(FlankPosition(no_position, n_positioned, n_at))
+            continue
         if side == "upstream":
             positions = tuple(range(outer, run + step, step))
             record = FlankRecord(bases, positions, len(positions) - 1)
@@ -791,7 +796,12 @@ def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
             positions = tuple(range(run, outer + step, step))
             record = FlankRecord(bases, positions, 0)
         out.append(FlankPosition(record, n_positioned, n_at))
-    return out[0], out[1]
+    up, dn = out
+    if up.record.has_position and dn.record.has_position and \
+            step * (dn.record.run_side_position - up.record.run_side_position) < 1:
+        up = dataclasses.replace(up, record=FlankRecord(pair.upstream, (), -1))
+        dn = dataclasses.replace(dn, record=FlankRecord(pair.downstream, (), 0))
+    return up, dn
 
 
 @dataclasses.dataclass
@@ -799,14 +809,15 @@ class LocusFlanks:
     """One locus's flank pair, and where each flank lies in the reference.
 
     `pair` and `positions` are None when no pair reaches F > 0. A record
-    in `positions` has no reference position when no kept read gives that
-    flank both reference coordinates.
+    in `positions` may have no reference position (see
+    :func:`flank_records_from_alignments`). `n_reads` counts the reads.
     """
 
     name: str
     ref_orientation: str
     pair: FlankPair | None
     positions: tuple[FlankPosition, FlankPosition] | None
+    n_reads: int
 
     @property
     def records(self) -> tuple[FlankRecord, FlankRecord]:
@@ -826,9 +837,9 @@ def solve_locus(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
         return None
     pair = solve_flank_pair(loc.reads, loc.marks)
     if pair is None:
-        return LocusFlanks(name, loc.ref_orientation, None, None)
+        return LocusFlanks(name, loc.ref_orientation, None, None, len(loc.reads))
     return LocusFlanks(name, loc.ref_orientation, pair,
-                       flank_records_from_alignments(loc, pair))
+                       flank_records_from_alignments(loc, pair), len(loc.reads))
 
 
 # ---------------------------------------------------------------------------
@@ -881,13 +892,10 @@ def construct_flanks(loci: Sequence[tuple[str, LocusFlanks | None]], *, sample: 
     are for diagnosis. `objective` is in the units of the
     decision record, half the half-unit value.
 
-    Raises ValueError when a locus with a reference window has no pair with
-    F > 0; the message names every such locus.
+    A locus with a reference window but no pair with F > 0 gets the status
+    `NO_FLANK_PAIR` on both sides, empty flank fields, no record, its
+    `n_reads`, an objective of 0 and zero read counts.
     """
-    no_pair = [name for name, loc in loci if loc is not None and loc.pair is None]
-    if no_pair:
-        raise ValueError(f"{sample}: no flank pair reaches F > 0 at {len(no_pair)} loci: "
-                         f"{no_pair}")
     records: dict[str, tuple[FlankRecord, FlankRecord]] = {}
     rows = []
     for name, loc in loci:
@@ -899,6 +907,15 @@ def construct_flanks(loci: Sequence[tuple[str, LocusFlanks | None]], *, sample: 
                              "flank_ref_positions": "", "objective": None, "n_reads": None,
                              "n_reads_placed": None, "n_tied_pairs": None,
                              "n_reads_positioned": None, "n_reads_at_position": None})
+            continue
+        if loc.pair is None:
+            for side in SIDES:
+                rows.append({"locus": name, "side": side,
+                             "reference_window_status": NO_FLANK_PAIR,
+                             "ref_orientation": loc.ref_orientation, "flank_bases": "",
+                             "flank_ref_positions": "", "objective": 0.0,
+                             "n_reads": loc.n_reads, "n_reads_placed": 0, "n_tied_pairs": 0,
+                             "n_reads_positioned": 0, "n_reads_at_position": 0})
             continue
         records[name] = loc.records
         for side, position in zip(SIDES, loc.positions, strict=True):

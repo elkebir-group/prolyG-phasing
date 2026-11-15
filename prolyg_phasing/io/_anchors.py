@@ -4,11 +4,11 @@ Two pieces:
 
 1. Reference reconstruction (`get_reference_window`) — pull a window of
    the reference genome from BAM MD tags, no external FASTA required.
-2. Reference walk (`build_anchors`) — the locus orientation, and the G
+2. Reference walk (`reference_walk`) — the locus orientation, and the G
    bases between each BED end and the first non-G reference base.
 
 All functions are pysam-coupled only where they need to read alignment
-records; the anchor-construction logic itself is pure string work.
+records; the walk itself is pure string work.
 """
 
 from __future__ import annotations
@@ -82,38 +82,21 @@ def get_reference_window(
 
 
 # ---------------------------------------------------------------------------
-# Anchor construction
+# Reference walk
 # ---------------------------------------------------------------------------
 
 
-@dataclasses.dataclass
-class AnchorResult:
-    """Output of :func:`build_anchors`.
+@dataclasses.dataclass(frozen=True)
+class ReferenceWalk:
+    """The strand of a locus's G run and the G bases past each BED end.
 
-    `status` is one of:
-
-    - `"anchorable"` — both anchors constructed.
-    - `"anchor_unstable_upstream"` — upstream anchor cannot be constructed.
-    - `"anchor_unstable_downstream"` — downstream anchor cannot be constructed.
-    - `"anchor_unstable_both"` — neither anchor.
-    - `"ref_window_unrecoverable"` — caller passed `None` for `ref_window`.
-
-    `ref_orientation` is `"+"` if the BED interval is G-dominant on the
-    reference (no revcomp needed for polyG-canonical view), `"-"` if
-    C-dominant (revcomp the read to canonicalize). Empty when status
-    is `ref_window_unrecoverable`.
-
-    `ref_inter_anchor_seq` is the canonical-orientation reference
-    sequence strictly between the upstream and downstream anchors —
-    the polyG region as the reference says it should be. Empty when
-    either anchor failed.
+    `ref_orientation` is "+" when the BED interval holds at least as many G
+    as C on the reference, else "-". `g_walk_up` and `g_walk_dn` count the
+    G bases, in polyG orientation, between each BED end and the first
+    non-G reference base outward (or the window end).
     """
 
-    status: str
     ref_orientation: str
-    upstream_anchor: str
-    downstream_anchor: str
-    ref_inter_anchor_seq: str
     g_walk_up: int
     g_walk_dn: int
 
@@ -124,123 +107,20 @@ def determine_orientation(ref_window: str, bed_offset: int, bed_len: int) -> str
     return "+" if bed.count("G") >= bed.count("C") else "-"
 
 
-def build_anchors(
-    ref_window: str | None,
-    bed_offset: int,
-    bed_len: int,
-    *,
-    k: int,
-) -> AnchorResult:
-    """Build upstream + downstream anchors from a `±pad`-bp reference window.
+def reference_walk(ref_window: str, bed_offset: int, bed_len: int) -> ReferenceWalk:
+    """The strand and the G walk past each BED end, from the reference window.
 
-    The walk: starting at the BED interval boundary on the
-    canonical-orientation reference, step outward through Gs until the
-    first non-G base. Take `k` bp further outward as the anchor; the
-    anchor ends (upstream) or starts (downstream) at the first non-G
-    base — i.e., the interrupter / linker base.
-
-    `ref_window` is the reference on `[bed_start - pad, bed_end + pad)`
-    in **reference orientation** (not yet canonicalized). The function
-    determines orientation and reverse-complements as needed.
-
-    Parameters
-    ----------
-    ref_window : str or None
-        Reference sequence over the BED interval ±pad. Pass `None`
-        when MD-tag reconstruction failed (returns status
-        `"ref_window_unrecoverable"`).
-    bed_offset : int
-        Offset of the BED interval start within `ref_window`. Equals
-        the `pad` used when fetching the window.
-    bed_len : int
-        Length of the BED interval (`bed_end - bed_start`).
-    k : int
-        Anchor length in bp (typically 10).
-
-    Returns
-    -------
-    AnchorResult
+    `ref_window` is the reference on ``[bed_start - pad, bed_end + pad)`` in
+    reference orientation, and `bed_offset` is `pad`.
     """
-    if ref_window is None:
-        return AnchorResult(
-            status="ref_window_unrecoverable",
-            ref_orientation="",
-            upstream_anchor="",
-            downstream_anchor="",
-            ref_inter_anchor_seq="",
-            g_walk_up=0,
-            g_walk_dn=0,
-        )
-
-    orientation_letter = determine_orientation(ref_window, bed_offset, bed_len)
-    if orientation_letter == "+":
-        canon = ref_window
-        bed_start_c = bed_offset
-        bed_end_c = bed_offset + bed_len
-    else:
-        canon = revcomp(ref_window)
-        win_len = len(canon)
-        bed_start_c = win_len - (bed_offset + bed_len)
-        bed_end_c = win_len - bed_offset
-
-    win_len = len(canon)
-
-    # Upstream walk: step from bed_start_c - 1 leftward through Gs.
-    i = bed_start_c - 1
-    walk_up = 0
+    orientation = determine_orientation(ref_window, bed_offset, bed_len)
+    canon = ref_window if orientation == "+" else revcomp(ref_window)
+    bed_start = bed_offset if orientation == "+" else len(canon) - (bed_offset + bed_len)
+    bed_end = bed_start + bed_len
+    i = bed_start - 1
     while i >= 0 and canon[i] == "G":
         i -= 1
-        walk_up += 1
-    if i < 0:
-        anchor_up = ""
-    else:
-        anchor_up_start = i - k + 1
-        if anchor_up_start < 0:
-            anchor_up = ""
-        else:
-            anchor_up = canon[anchor_up_start : i + 1]
-
-    # Downstream walk: step from bed_end_c rightward through Gs.
-    j = bed_end_c
-    walk_dn = 0
-    while j < win_len and canon[j] == "G":
+    j = bed_end
+    while j < len(canon) and canon[j] == "G":
         j += 1
-        walk_dn += 1
-    if j >= win_len:
-        anchor_dn = ""
-    else:
-        anchor_dn_end = j + k
-        if anchor_dn_end > win_len:
-            anchor_dn = ""
-        else:
-            anchor_dn = canon[j : anchor_dn_end]
-
-    up_ok = bool(anchor_up)
-    dn_ok = bool(anchor_dn)
-    if up_ok and dn_ok:
-        status = "anchorable"
-    elif not up_ok and not dn_ok:
-        status = "anchor_unstable_both"
-    elif not up_ok:
-        status = "anchor_unstable_upstream"
-    else:
-        status = "anchor_unstable_downstream"
-
-    # Reference inter-anchor sequence: from end of upstream anchor to start
-    # of downstream anchor. Only well-defined when both anchors built.
-    if up_ok and dn_ok:
-        # i+1 is the first base after the upstream anchor (start of the
-        # polyG region). j is the first base of the downstream anchor.
-        ref_inter_anchor_seq = canon[i + 1 : j]
-    else:
-        ref_inter_anchor_seq = ""
-
-    return AnchorResult(
-        status=status,
-        ref_orientation=orientation_letter,
-        upstream_anchor=anchor_up,
-        downstream_anchor=anchor_dn,
-        ref_inter_anchor_seq=ref_inter_anchor_seq,
-        g_walk_up=walk_up,
-        g_walk_dn=walk_dn,
-    )
+    return ReferenceWalk(orientation, bed_start - 1 - i, j - bed_end)

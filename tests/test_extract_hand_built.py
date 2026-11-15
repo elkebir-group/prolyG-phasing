@@ -318,26 +318,41 @@ def test_flank_table_with_an_extra_locus_is_an_error(tmp_path):
         extract_panel(bam, bed, flanks)
 
 
-def test_a_run_side_base_outside_the_reference_window_is_an_error(tmp_path):
+def test_a_run_side_base_outside_the_reference_window_breaks_an_invariant(tmp_path):
     records = _records(INVARIANT)
     up, dn = records["PolyG151+"]
     shifted = tuple(p + 200 for p in dn.ref_positions)
     records["PolyG151+"] = (up, dataclasses.replace(dn, ref_positions=shifted))
     bam, bed, flanks = _write_case(tmp_path, INVARIANT, flank_records=records)
-    with pytest.raises(ValueError, match="PolyG151[+]: the downstream flank's run-side base "
+    with pytest.raises(RuntimeError, match="PolyG151[+]: the downstream flank's run-side base "
                                          "at reference position .* is outside"):
         extract_panel(bam, bed, flanks)
 
 
-def test_an_upstream_flank_past_the_downstream_flank_is_an_error(tmp_path):
+def test_an_upstream_flank_past_the_downstream_flank_breaks_an_invariant(tmp_path):
     records = _records(INVARIANT)
     up, dn = records["PolyG151+"]
     shift = dn.run_side_position - up.run_side_position
     moved = tuple(p + shift for p in up.ref_positions)
     records["PolyG151+"] = (dataclasses.replace(up, ref_positions=moved), dn)
     bam, bed, flanks = _write_case(tmp_path, INVARIANT, flank_records=records)
-    with pytest.raises(ValueError, match="PolyG151[+]: the upstream flank is not upstream"):
+    with pytest.raises(RuntimeError, match="PolyG151[+]: the upstream flank is not upstream"):
         extract_panel(bam, bed, flanks)
+
+
+def test_a_locus_with_no_flank_pair_has_that_status_and_no_reads(tmp_path):
+    bam, bed, flanks = _write_case(tmp_path, INVARIANT)
+    table = pd.read_csv(flanks, sep="\t", dtype=str, keep_default_na=False)
+    plus = table.locus == "PolyG151+"
+    table.loc[plus, "reference_window_status"] = "no_flank_pair"
+    table.loc[plus, ["flank_bases", "flank_ref_positions"]] = ""
+    table.to_csv(flanks, sep="\t", index=False)
+    panel = extract_panel(bam, bed, flanks)
+    locus = panel.loci["PolyG151+"]
+    assert locus.reference_window_status == "no_flank_pair"
+    assert len(locus.seq) == 0 and locus.upstream_flank is None
+    assert (locus.flanking_up_ref_pos_start, locus.flanking_dn_ref_pos_start) == (-1, -1)
+    assert panel.loci["PolyG151-"].reference_window_status == "recovered"
 
 
 def test_provenance_names_the_flank_table_sample(tmp_path):

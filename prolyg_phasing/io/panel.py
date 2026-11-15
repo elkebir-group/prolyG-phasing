@@ -157,8 +157,10 @@ class ExtractedLocus:
     n_read_pairs_merged: int
     n_reads: int                 # = count.sum()
     max_observed_run_length: int
-    # WINDOW_RECOVERED, or WINDOW_UNRECOVERABLE when no read of the matched
-    # normal or of this sample rebuilds the reference window; then no reads.
+    # WINDOW_RECOVERED; WINDOW_UNRECOVERABLE when no read of the matched
+    # normal or of this sample rebuilds the reference window; NO_FLANK_PAIR
+    # when the matched normal has no flank pair with a positive objective.
+    # The last two have no reads.
     reference_window_status: str
 
     # Schema-v2 additions (flanking extraction). All have defaults so
@@ -172,10 +174,14 @@ class ExtractedLocus:
     )
     g_walk_up: int = 0
     g_walk_dn: int = 0
+    # Each side's flanking field: its width, and the reference coordinate of
+    # its string index 0. A side with no flanking bases for want of a
+    # position (no reference window, no flank pair, or a flank with no
+    # reference position) has width 0 and start -1, never a coordinate.
     flanking_up_width: int = 0
     flanking_dn_width: int = 0
-    flanking_up_ref_pos_start: int = 0
-    flanking_dn_ref_pos_start: int = 0
+    flanking_up_ref_pos_start: int = -1
+    flanking_dn_ref_pos_start: int = -1
 
     def to_dataframe(self):
         """Materialize a pandas view of the (mi, strand, seq, count) rows."""

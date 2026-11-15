@@ -108,7 +108,8 @@ At each locus, the flanks are the pair of 10-base strings that maximizes
 one objective over the normal's reads: the sum over reads of the value of
 each read's best tract, where a G scores 1, any other base -2, and a
 flank match costs 1 for a substitution and 2 or 2.5 for a gap of 1 or 2
-bases. A read with no tract, or a negative value, adds 0. Each flank
+bases. A tract holds a read base aligned inside the BED interval. A read
+with no tract, or a negative value, adds 0. Each flank
 occurs exactly at a tract edge in at least one read. The table adds, per
 locus, the objective, the reads, the reads placed, and the number of
 tied optimal pairs. The read filters are the extraction's defaults. Loci
@@ -117,7 +118,12 @@ of this machine.
 
 Each BED locus side gets a row. A locus whose reference window no read
 rebuilds has the status ref_window_unrecoverable on both sides and no
-flank; extraction records it with that status and no reads.
+flank; a locus with no flank pair of positive objective has the status
+no_flank_pair. Extraction records either with that status and no reads.
+A side whose flank no read aligns at both end bases, or whose position
+falls outside BED +- 50 bases or out of order, has the status
+no_reference_position: it keeps its flank bases and gives no flanking
+bases in extraction.
 
 The table names the sample. The name is the BAM's read-group SM; give
 --sample only for a BAM with no SM."""

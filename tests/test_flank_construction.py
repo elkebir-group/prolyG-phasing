@@ -29,6 +29,7 @@ from prolyg_phasing.io._flank_placement import (
     code_matrix,
     decode,
     edge_windows,
+    marks_matrix,
     place_flanks,
     place_polyg_reads,
     read_flank_table,
@@ -131,12 +132,12 @@ def _counted(reads: list[str]) -> list[tuple[str, frozenset[int], int]]:
 def _check(reads: list[str], u: str, v: str, tracts: set[str]) -> fc.FlankPair:
     """The expected pair is optimal, F equals the slow reference, and every
     optimal pair gives the expected tracts."""
-    pair = fc.solve_flank_pair(reads, slow.marks_matrix(reads))
+    pair = fc.solve_flank_pair(reads, slow.marks(reads))
     counted = _counted(reads)
     assert (u, v) in pair.optimal_pairs
     assert pair.objective_half_units == slow.objective(counted, u, v)[0]
     for pu, pv in pair.optimal_pairs:
-        got = place_polyg_reads(reads, pu, pv, slow.marks_matrix(reads))
+        got = place_polyg_reads(reads, pu, pv, slow.marks(reads))
         assert set(got.tracts[got.kept]) == tracts, (pu, pv)
     return pair
 
@@ -190,9 +191,19 @@ def test_a_run_ending_in_a_non_g_error_is_not_placed_at_the_old_edge():
     reads = clean + error
     counted = _counted(reads)
     assert slow.objective(counted, UP, DN) == (30 * 20, 30)
-    pair = fc.solve_flank_pair(reads, slow.marks_matrix(reads))
+    pair = fc.solve_flank_pair(reads, slow.marks(reads))
     for pu, pv in pair.optimal_pairs:
         assert slow.objective(counted, pu, pv)[0] == pair.objective_half_units
+
+
+def test_reads_of_300_bases():
+    """Edges past base 255 and runs past 255 bases from the read start place."""
+    hap = _background(400) + UP + "G" * 12 + DN + _background(200)
+    reads = [hap[s:s + 300] for s in range(133, 153)]
+    assert {len(r) for r in reads} == {300}
+    assert all(r.index(UP) + 9 > 255 for r in reads)
+    pair = _check(reads, UP, DN, {"G" * 12})
+    assert pair.objective_half_units == 20 * 24
 
 
 def test_a_homopolymer_length_change_in_the_flank_is_a_gap():
@@ -226,7 +237,8 @@ def test_a_non_g_base_and_three_g_next_to_the_run_join_the_tract():
         reads = _reads_from(hap, 60)
         pair = _check(reads, UP, DN, {tract})
         distinct = sorted(set(reads))
-        search = fc._LocusSearch(distinct, slow.marks_matrix(distinct), [1] * len(distinct))
+        search = fc._LocusSearch(distinct, marks_matrix(slow.marks(distinct), 100),
+                                 [1] * len(distinct))
         us = [decode(int(c)) for c in search.u.candidates]
         vs = [decode(int(c))[::-1] for c in search.v.candidates]
         assert not any(u[-4:-1] == "GGG" for u in us)
@@ -272,7 +284,7 @@ def test_search_matches_a_brute_force_search_on_random_read_sets():
         us, vs = slow.candidates(counted)
         values = {(u, v): slow.objective(counted, u, v)[0] for u in us for v in vs}
         best = max(values.values(), default=0)
-        pair = fc.solve_flank_pair(reads, slow.marks_matrix(reads))
+        pair = fc.solve_flank_pair(reads, slow.marks(reads))
         if best <= 0:
             assert pair is None
             continue
@@ -329,7 +341,7 @@ def test_search_matches_a_brute_force_search_with_marks():
         us, vs = slow.candidates(counted)
         values = {(u, v): slow.objective(counted, u, v)[0] for u in us for v in vs}
         best = max(values.values(), default=0)
-        pair = fc.solve_flank_pair(reads, slow.marks_matrix(reads, marks))
+        pair = fc.solve_flank_pair(reads, slow.marks(reads, marks))
         if best <= 0:
             assert pair is None
             continue
@@ -343,8 +355,8 @@ def test_search_matches_a_brute_force_search_with_marks():
 
 def test_no_pair_reaches_a_positive_objective():
     reads = ["ACTACTACTACTACTACTACT"] * 5
-    assert fc.solve_flank_pair(reads, slow.marks_matrix(reads)) is None
-    assert fc.solve_flank_pair([], slow.marks_matrix([])) is None
+    assert fc.solve_flank_pair(reads, slow.marks(reads)) is None
+    assert fc.solve_flank_pair([], slow.marks([])) is None
 
 
 # ---------------------------------------------------------------------------
@@ -354,10 +366,10 @@ def test_no_pair_reaches_a_positive_objective():
 
 def _locus_flanks(records, name="L") -> fc.LocusFlanks:
     pair = fc.FlankPair("ACTTCAGCAT", "CAAATTTTAT", 41, (("ACTTCAGCAT", "CAAATTTTAT"),),
-                        30, 25)
+                        30, 25, placement=None)
     positions = tuple(fc.FlankPosition(r, 20, 18) if r.has_position
                       else fc.FlankPosition(r, 0, 0) for r in records)
-    return fc.LocusFlanks(name, "+", pair, positions)
+    return fc.LocusFlanks(name, "+", pair, positions, 30)
 
 
 def test_side_table_round_trips_flanks_of_any_reference_length(tmp_path):
@@ -408,10 +420,19 @@ def test_a_flank_table_status_must_match_its_positions(tmp_path):
         read_flank_table(_side_table(tmp_path, rows))
 
 
-def test_a_locus_with_no_positive_pair_stops_construction():
-    with pytest.raises(ValueError, match=r"no flank pair reaches F > 0 at 1 loci: \['L'\]"):
-        fc.construct_flanks([("L", fc.LocusFlanks("L", "+", None, None))],
-                            sample="S1")
+def test_a_locus_with_no_positive_pair_gets_its_own_status(tmp_path):
+    result = fc.construct_flanks([("L", fc.LocusFlanks("L", "+", None, None, 7))],
+                                 sample="S1")
+    assert result.records == {}
+    path = fc.write_flank_table(result, tmp_path / "x")
+    sides = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    assert set(sides.reference_window_status) == {"no_flank_pair"}
+    assert set(sides.flank_bases) == set(sides.flank_ref_positions) == {""}
+    assert set(zip(sides.objective, sides.n_reads, sides.n_reads_placed, strict=True)) == \
+        {("0.0", "7", "0")}
+    table = read_flank_table(path)
+    assert table.no_flank_pair == {"L"} and table.records == {}
+    assert table.loci == {"L"}
 
 
 @pytest.mark.skipif(not hasattr(os, "sched_getaffinity"), reason="Linux only")
@@ -620,12 +641,17 @@ def test_the_most_common_coordinate_wins_and_a_tie_goes_nearer_the_run(
         assert dn.ref_positions == _positions("PolyG454", o, start, start + outer)
 
 
-def _locus_reads(reads: list[str], coords: list[list[int]]) -> fc.LocusReads:
-    width = max(map(len, reads))
-    matrix = np.full((len(reads), width), -1, dtype=np.int64)
-    for row, c in enumerate(coords):
-        matrix[row, :len(c)] = c
-    return fc.LocusReads("L", "+", 0, "", 0, 0, reads, matrix, 0, 1 << 30)
+def _locus_reads(reads: list[str], coords: list[list[int]], bed: tuple[int, int] = (0, 1 << 30)
+                 ) -> fc.LocusReads:
+    """Reads on a "+" locus whose alignments give polyG index i the coordinate
+    ``coords[r][i]`` (-1: none), one aligned block per base. Every base is
+    marked; `bed` is the BED interval."""
+    blocks = [[(i, c, 1) for i, c in enumerate(row) if c >= 0] for row in coords]
+    return fc.LocusReads("L", "+", reads, slow.marks(reads), blocks, *bed)
+
+
+def _vote(loc: fc.LocusReads):
+    return fc.flank_records_from_alignments(loc, fc.solve_flank_pair(loc.reads, loc.marks))
 
 
 _READ = "TTACCAGTCA" + "ACTTCAGCAT" + "G" * 12 + "CAAATTTTAT" + "ACCAGTCATT"
@@ -641,7 +667,7 @@ def _coords_with(outer: int, run: int) -> list[int]:
 
 def test_a_flank_range_against_the_polyg_direction_is_an_invariant_error():
     """No real alignment maps two read bases out of order."""
-    pair = fc.solve_flank_pair([_READ], slow.marks_matrix([_READ]))
+    pair = fc.solve_flank_pair([_READ], slow.marks([_READ]))
     assert (pair.upstream, pair.downstream) == ("ACTTCAGCAT", "CAAATTTTAT")
     loc = _locus_reads([_READ], [_coords_with(120, 119)])
     with pytest.raises(RuntimeError, match="L: the upstream flank ACTTCAGCAT runs from"):
@@ -649,7 +675,7 @@ def test_a_flank_range_against_the_polyg_direction_is_an_invariant_error():
 
 
 def test_a_flank_base_without_a_coordinate_leaves_no_position():
-    pair = fc.solve_flank_pair([_READ], slow.marks_matrix([_READ]))
+    pair = fc.solve_flank_pair([_READ], slow.marks([_READ]))
     coords = list(range(100, 100 + len(_READ)))
     coords[41] = -1  # the downstream outer base is soft-clipped
     up, dn = fc.flank_records_from_alignments(_locus_reads([_READ], [coords]), pair)
@@ -664,10 +690,27 @@ def test_the_pair_vote_differs_from_two_separate_votes():
     give (110, 119) and 2 give (112, 121)."""
     rows = ([_coords_with(110, 119)] * 3 + [_coords_with(112, 121)] * 2
             + [_coords_with(112, -1)] * 2 + [_coords_with(-1, 121)] * 2)
-    pair = fc.solve_flank_pair([_READ], slow.marks_matrix([_READ]))
-    up, _ = fc.flank_records_from_alignments(_locus_reads([_READ] * len(rows), rows), pair)
+    up, _ = _vote(_locus_reads([_READ] * len(rows), rows))
     assert up.record.ref_positions == tuple(range(110, 120))
     assert (up.n_reads_positioned, up.n_reads_at_position) == (5, 3)
+
+
+def test_a_voted_coordinate_outside_the_reference_window_gives_no_position():
+    """BED [120, 132): the window is [70, 182). The upstream outer base votes
+    for 60, so the upstream side has no position; it keeps its vote counts."""
+    up, dn = _vote(_locus_reads([_READ] * 3, [_coords_with(60, 119)] * 3, bed=(120, 132)))
+    assert not up.record.has_position and up.record.bases == "ACTTCAGCAT"
+    assert (up.n_reads_positioned, up.n_reads_at_position) == (3, 3)
+    assert dn.record.ref_positions == tuple(range(132, 142))
+
+
+def test_an_upstream_flank_past_the_downstream_flank_gives_neither_a_position():
+    coords = list(range(100, 100 + len(_READ)))
+    coords[10], coords[19] = 141, 150   # upstream: outer, run side
+    coords[32], coords[41] = 140, 149   # downstream: run side, outer
+    up, dn = _vote(_locus_reads([_READ], [coords]))
+    assert not up.record.has_position and not dn.record.has_position
+    assert (up.record.bases, dn.record.bases) == ("ACTTCAGCAT", "CAAATTTTAT")
 
 
 def test_modal_pair_breaks_a_tie_by_the_run_side_then_the_outer_base():
@@ -858,8 +901,10 @@ def test_flank_table_rejects_flank_fields_without_a_window(tmp_path):
         read_flank_table(path)
 
 
-def test_a_window_with_no_edge_base_is_an_error(tmp_path):
-    """The G run reaches the end of the reference window: no flank can exist."""
+def test_a_window_with_no_edge_base_still_gives_the_strand(tmp_path):
+    """The G run reaches the end of the reference window. The window still
+    gives the strand; the one read has no MI tag, so no read is kept and the
+    locus has no flank pair."""
     contig = "A" * 10 + "G" * 100 + "A" * 10
     header = pysam.AlignmentHeader.from_dict({
         "HD": {"VN": "1.6", "SO": "coordinate"}, "SQ": [{"SN": "g", "LN": len(contig)}]})
@@ -876,6 +921,8 @@ def test_a_window_with_no_edge_base_is_an_error(tmp_path):
         seg.set_tags([("MD", str(len(contig))), ("NM", 0)])
         out.write(seg)
     pysam.index(str(bam_path))
-    with pysam.AlignmentFile(str(bam_path)) as bam, \
-            pytest.raises(ValueError, match="G60: the reference window holds no edge base"):
-        fc.locus_reads(bam, "G60", "g", 60, 70)
+    with pysam.AlignmentFile(str(bam_path)) as bam:
+        loc = fc.locus_reads(bam, "G60", "g", 60, 70)
+        assert (loc.ref_orientation, loc.reads) == ("+", [])
+        solved = fc.solve_locus(bam, "G60", "g", 60, 70)
+    assert solved.pair is None and solved.n_reads == 0

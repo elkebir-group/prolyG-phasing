@@ -326,7 +326,7 @@ def test_placement_matches_the_slow_reference_on_random_reads():
     reads = [_random_read(rng) for _ in range(800)]
     # Two copies of the flank in one read, before and after the run.
     reads += [UP + "GGGG" + UP + "GGGGGG" + DN + "GG" + DN, UP + "GGT" + DN + "GGGG" + DN]
-    result = place_polyg_reads(reads, UP, DN, slow.marks_matrix(reads))
+    result = place_polyg_reads(reads, UP, DN, slow.marks(reads))
     n_placed = 0
     for i, read in enumerate(reads):
         want = slow.best_placement(read, UP, DN, slow.every_base(read))
@@ -361,7 +361,7 @@ def test_placement_matches_the_slow_reference_with_marks():
     rng = random.Random(23)
     reads = [_random_read(rng) for _ in range(800)]
     marks = [_random_marks(rng, read) for read in reads]
-    result = place_polyg_reads(reads, UP, DN, slow.marks_matrix(reads, marks))
+    result = place_polyg_reads(reads, UP, DN, slow.marks(reads, marks))
     n_placed = n_no_bed_base = 0
     for i, read in enumerate(reads):
         want = slow.best_placement(read, UP, DN, marks[i])
@@ -386,9 +386,9 @@ def test_equal_value_placements_keep_the_shortest_tract():
     periodic = "TGGTGGTGGT"
     downstream = UP + "GGGGG" + "TGGTGGTGGTGGT" + "AAAAAAAA"
     upstream = "CCCC" + "TGGTGGTGGTGGT" + "GGGGG" + DN
-    result = place_polyg_reads([downstream], UP, periodic, slow.marks_matrix([downstream]))
+    result = place_polyg_reads([downstream], UP, periodic, slow.marks([downstream]))
     assert result.tracts[0] == "GGGGG"
-    result = place_polyg_reads([upstream], periodic, DN, slow.marks_matrix([upstream]))
+    result = place_polyg_reads([upstream], periodic, DN, slow.marks([upstream]))
     assert result.tracts[0] == "GGGGG"
 
 
@@ -418,7 +418,7 @@ def test_tracts_match_the_slow_reference_where_placements_tie():
                          ("AGG", "AGGAGGAGGA", "TAGGAGGAGG"),
                          ("TGGG", "GGTGGGTGGT", "TTGGGTGGGT")):
         reads = [_repeat_unit_read(rng, unit) for _ in range(300)]
-        result = place_polyg_reads(reads, up, dn, slow.marks_matrix(reads))
+        result = place_polyg_reads(reads, up, dn, slow.marks(reads))
         for i, read in enumerate(reads):
             want = slow.best_placement(read, up, dn, slow.every_base(read))
             if want is None:
@@ -437,7 +437,7 @@ def test_negative_value_and_no_placement_are_counted_not_kept():
     decoy = "ACTTCAGCTT" + "G" + "ACTTACATCATTACCATACA" + "G" + "CAAATTTAAT"
     reversed_order = "G" + DN + "TA" + UP + "GGGG"
     result = place_polyg_reads([decoy, reversed_order], UP, DN,
-                               slow.marks_matrix([decoy, reversed_order]))
+                               slow.marks([decoy, reversed_order]))
     # G + 20 other bases + G, and one substitution in each flank.
     assert result.placed[0] and result.value[0] == 2 * 2 - 4 * 20 - 2 - 2
     assert not result.kept[0] and result.tracts[0] is None

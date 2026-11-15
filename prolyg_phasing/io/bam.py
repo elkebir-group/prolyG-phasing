@@ -7,8 +7,8 @@ Every locus needs its two flanks from the matched normal's flank table
 (`prolyg-phasing build-flanks`). Two steps per locus:
 
 1. **Reference window** — reconstruct the reference on BED ± `pad` bp
-   from MD tags, and check that each flank's run-side base, at the
-   reference position the flank table records, lies in it.
+   from MD tags. It gives the strand, the reference tract between the two
+   flanks' run-side bases, and the G walk past each BED end.
 2. **Extraction** — fetch overlapping alignments, apply the read filters
    (MAPQ, SA, TLEN, MI), cut each read's tract between its best placement
    of the two flanks (`_flank_placement.place_flanks`; the tract must hold
@@ -46,12 +46,12 @@ import pysam
 from tqdm.auto import tqdm
 
 from prolyg_phasing.io._anchors import (
-    build_anchors,
     get_reference_window,
+    reference_walk,
     revcomp,
 )
 from prolyg_phasing.io._flank_placement import (
-    FLANK_LEN,
+    NO_FLANK_PAIR,
     WINDOW_RECOVERED,
     WINDOW_UNRECOVERABLE,
     FlankPlacement,
@@ -73,6 +73,9 @@ REF_WINDOW_PAD = 50
 # A reference coordinate past the end of every chromosome: the bound of the
 # flanked interval on a side whose flank has no reference position.
 _NO_FLANKING_BOUND = 1 << 62
+
+# The flanking start of a side with no position: never a coordinate.
+_NO_FLANKING_START = -1
 
 PAIR_DISAGREEMENT_POLICY = "merge_by_quality"
 DEFAULT_MIN_FLANKING_BASE_Q = 20
@@ -183,22 +186,20 @@ def locus_geometry(
     *,
     min_mapq: int,
 ) -> LocusGeometry | None:
-    """The reference window of one locus from MD tags, checked against its flanks.
+    """The reference window of one locus from MD tags, with its two flanks.
 
-    The flank table gives each flank's reference positions (from the
-    matched normal's alignments). Each run-side position must lie in this
-    BAM's reference window, and when both flanks have a position the
-    upstream flank must be upstream of the downstream flank. A flank with
-    no reference position takes no check. Returns None when no read
-    rebuilds the reference window. Raises ValueError, naming the locus,
-    when a check fails.
+    Returns None when no read rebuilds the reference window. build-flanks
+    writes a reference position only inside BED ± `REF_WINDOW_PAD`, and
+    only with the upstream run-side base upstream of the downstream one.
+    Raises RuntimeError, naming the locus, when the flank table breaks
+    this.
     """
     window_start = bed_start - REF_WINDOW_PAD
     window = get_reference_window(bam, chrom, window_start, bed_end + REF_WINDOW_PAD,
                                   min_mapq=min_mapq)
     if window is None:
         return None
-    walk = build_anchors(window, REF_WINDOW_PAD, bed_end - bed_start, k=FLANK_LEN)
+    walk = reference_walk(window, REF_WINDOW_PAD, bed_end - bed_start)
     geometry = LocusGeometry(
         ref_orientation=walk.ref_orientation,
         reference_window=window,
@@ -211,14 +212,16 @@ def locus_geometry(
     for side, flank in zip(("upstream", "downstream"), flanks, strict=True):
         if flank.has_position and \
                 not 0 <= geometry.polyg_index(flank.run_side_position) < len(window):
-            raise ValueError(
+            raise RuntimeError(
                 f"{name}: the {side} flank's run-side base at reference position "
                 f"{flank.run_side_position} is outside the reference window "
-                f"[{window_start}, {window_start + len(window)}) of this BAM")
+                f"[{window_start}, {window_start + len(window)}); the flank table "
+                "breaks an invariant of build-flanks")
     if flanks[0].has_position and flanks[1].has_position and \
             geometry.polyg_index(flanks[0].run_side_position) \
             >= geometry.polyg_index(flanks[1].run_side_position):
-        raise ValueError(f"{name}: the upstream flank is not upstream of the downstream flank")
+        raise RuntimeError(f"{name}: the upstream flank is not upstream of the downstream "
+                           "flank; the flank table breaks an invariant of build-flanks")
     return geometry
 
 
@@ -896,9 +899,10 @@ def extract_panel(
 
     Per locus:
 
-    1. Reconstruct the reference window from MD tags, determine
-       polyG-canonical orientation, and check both flanks from the flank
-       table against it.
+    1. Reconstruct the reference window from MD tags and determine the
+       polyG-canonical orientation. A locus with no flank in the flank
+       table (no reference window or no flank pair in the matched normal)
+       gets that status and no reads.
     2. If the window is recovered, fetch alignments overlapping the BED
        interval, apply parser-side QC filters, place both flanks in each
        read, pair-collapse R1+R2 by `query_name`, and emit per-(MI,
@@ -941,8 +945,10 @@ def extract_panel(
     Raises
     ------
     ValueError
-        When the flank table and the BED do not hold the same loci, or a
-        flank does not match the reference window of its locus.
+        When the flank table and the BED do not hold the same loci.
+    RuntimeError
+        When a flank position breaks an invariant of build-flanks (see
+        :func:`locus_geometry`).
     """
     bam_path = Path(bam_path)
     bed_path = Path(bed_path)
@@ -979,10 +985,16 @@ def extract_panel(
     try:
         for name, chrom, bed_start, bed_end in bed_iter:
             # A locus has no geometry when the matched normal had no reference
-            # window, so it has no flanks, or when this BAM has none.
-            if name in flank_table.no_reference_window:
+            # window or no flank pair, so it has no flanks, or when this BAM
+            # has no reference window.
+            if name in flank_table.no_flank_pair:
                 flanks = geometry = None
+                no_geometry_status = NO_FLANK_PAIR
+            elif name in flank_table.no_reference_window:
+                flanks = geometry = None
+                no_geometry_status = WINDOW_UNRECOVERABLE
             else:
+                no_geometry_status = WINDOW_UNRECOVERABLE
                 flanks = flank_table.records[name]
                 geometry = locus_geometry(bam, name, chrom, bed_start, bed_end, flanks,
                                           min_mapq=min_mapq)
@@ -1004,7 +1016,8 @@ def extract_panel(
 
             locus = _build_locus(
                 name, chrom, bed_start, bed_end,
-                flanks=flanks, geometry=geometry, counts=counts, qc=qc,
+                flanks=flanks, geometry=geometry, no_geometry_status=no_geometry_status,
+                counts=counts, qc=qc,
                 flanking_seqs=flanking_seqs, up_width=up_width, dn_width=dn_width,
             )
             loci[name] = locus
@@ -1043,6 +1056,7 @@ def _build_locus(
     *,
     flanks: tuple[FlankRecord, FlankRecord] | None,
     geometry: LocusGeometry | None,
+    no_geometry_status: str,
     counts: Counter,
     qc: dict,
     flanking_seqs: list[str],
@@ -1058,8 +1072,14 @@ def _build_locus(
     the inference adapter (prolyG's ``to_loci``) recomputes the
     locus-level run count from the observed patterns, and extraction
     stays faithful with no pattern filter here. `flanks` is None when the
-    matched normal had no reference window. `geometry` is None when
-    the BAM does not rebuild the reference window of the locus.
+    matched normal had no reference window or no flank pair. `geometry` is
+    None then, or when the BAM does not rebuild the reference window of
+    the locus; the locus then has the status `no_geometry_status` and no
+    reads.
+
+    A side with no flanking bases for want of a position (no reference
+    window, no flank pair, or a flank with no reference position) has
+    width 0 and a start of -1, so it never reads as a coordinate.
     """
     if counts:
         mi_arr = np.asarray([k[0] for k in counts], dtype=object)
@@ -1087,7 +1107,7 @@ def _build_locus(
         # The flanking window starts past each flank's outer base. The
         # upstream field is written most-distant-first, so its start is
         # its most distant base. A side whose flank has no reference
-        # position has width 0 and start 0, as a locus with no window.
+        # position has width 0 and start -1.
         lo, hi = geometry.flanked_interval
         if ref_orientation == "+":
             flanking_up_ref_pos_start = lo - up_width
@@ -1096,17 +1116,17 @@ def _build_locus(
             flanking_up_ref_pos_start = hi + up_width - 1
             flanking_dn_ref_pos_start = lo - 1
         if not geometry.upstream.has_position:
-            flanking_up_ref_pos_start = 0
+            flanking_up_ref_pos_start = _NO_FLANKING_START
         if not geometry.downstream.has_position:
-            flanking_dn_ref_pos_start = 0
+            flanking_dn_ref_pos_start = _NO_FLANKING_START
     else:
         reference_tract = ""
         ref_run_lengths = ()
         ref_orientation = ""
         g_walk_up = g_walk_dn = 0
-        status = WINDOW_UNRECOVERABLE
-        flanking_up_ref_pos_start = 0
-        flanking_dn_ref_pos_start = 0
+        status = no_geometry_status
+        flanking_up_ref_pos_start = _NO_FLANKING_START
+        flanking_dn_ref_pos_start = _NO_FLANKING_START
 
     per_locus_max_n_runs = 0
     per_locus_max = 0

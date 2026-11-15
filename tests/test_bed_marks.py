@@ -155,7 +155,7 @@ def test_a_read_that_holds_only_the_copy_has_no_placement(orientation):
     assert result.no_bed_base[0] and not result.placed[0]
     # Without the condition the read places at the copy.
     read = COPY_ONLY[0]
-    every = place_polyg_reads([read], COPY_UP, COPY_DN, slow.marks_matrix([read]))
+    every = place_polyg_reads([read], COPY_UP, COPY_DN, slow.marks([read]))
     assert every.tracts[0] == "GGGGGGGGAG"
 
 
@@ -166,7 +166,7 @@ def test_a_read_that_holds_both_copies_places_at_the_bed_copy(orientation):
     assert result.upstream_run_side[0] == _N_UP - 1
     # Without the condition the higher-value copy wins.
     read = BOTH[0]
-    every = place_polyg_reads([read], COPY_UP, COPY_DN, slow.marks_matrix([read]))
+    every = place_polyg_reads([read], COPY_UP, COPY_DN, slow.marks([read]))
     assert every.tracts[0] == "GGGGGGGGAG"
 
 
@@ -215,7 +215,7 @@ def test_the_optimum_surrounds_the_bed_run_not_a_longer_run_outside(tmp_path):
     larger objective. With the BED marks, only the BED run's flanks place."""
     reads = [_gapless(LOCUS_TWO_RUNS, 0, len(LOCUS_TWO_RUNS.reference), 20)]
     strings = [reads[0][0]] * 20
-    every = fc.solve_flank_pair(strings, slow.marks_matrix(strings))
+    every = fc.solve_flank_pair(strings, slow.marks(strings))
     assert (every.upstream, every.downstream) == (RUN_A_UP, RUN_A_DN)
     assert every.objective_half_units == 20 * 28
 
@@ -273,7 +273,7 @@ def test_a_soft_clipped_downstream_flank_has_no_position_and_keeps_its_tracts(tm
         assert sorted(map(str, got.seq)) == sorted(map(str, want.seq)) == ["G" * 12] * 20
         assert got.n_alignments_placed == 20
         # No downstream flanking bases, and no reference tract.
-        assert (got.flanking_dn_width, got.flanking_dn_ref_pos_start) == (0, 0)
+        assert (got.flanking_dn_width, got.flanking_dn_ref_pos_start) == (0, -1)
         assert (got.reference_tract, got.reference_run_lengths) == ("", ())
         assert want.reference_tract == "G" * 12 and want.flanking_dn_width > 0
         # The upstream side is intact.
@@ -298,6 +298,6 @@ def test_extraction_with_an_upstream_side_without_a_position(tmp_path):
     for o in ORIENTATIONS:
         got = panel.loci[f"PolyG151{o}"]
         assert {str(s) for s in got.seq} == {"G" * 12}
-        assert (got.flanking_up_width, got.flanking_up_ref_pos_start) == (0, 0)
+        assert (got.flanking_up_width, got.flanking_up_ref_pos_start) == (0, -1)
         assert got.flanking_dn_width > 0
         assert not got.upstream_flank.has_position

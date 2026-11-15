@@ -469,6 +469,13 @@ WINDOW_UNRECOVERABLE = "ref_window_unrecoverable"
 # side keeps its flank bases and has no reference positions.
 NO_REFERENCE_POSITION = "no_reference_position"
 
+# The status of both sides of a locus whose matched normal has a reference
+# window but no flank pair with a positive objective. The locus has no flank.
+NO_FLANK_PAIR = "no_flank_pair"
+
+# The statuses of a locus with no flank, so with no reads in extraction.
+_NO_FLANK_STATUSES = (WINDOW_UNRECOVERABLE, NO_FLANK_PAIR)
+
 # Side-table fields that a side with no reference window leaves empty.
 _FLANK_FIELDS = ("flank_bases", "flank_ref_positions")
 
@@ -477,9 +484,9 @@ _FLANK_FIELDS = ("flank_bases", "flank_ref_positions")
 class FlankTable:
     """The per-side flank table of one matched normal.
 
-    Every BED locus is in exactly one of `records` and
-    `no_reference_window`. A locus with no reference window has no flank
-    record, so it cannot be placed by mistake.
+    Every BED locus is in exactly one of `records`, `no_reference_window`
+    and `no_flank_pair`. A locus in the last two has no flank record, so it
+    cannot be placed by mistake.
 
     Attributes
     ----------
@@ -489,16 +496,19 @@ class FlankTable:
         Upstream and downstream flank per locus with a reference window.
     no_reference_window : frozenset of str
         Loci whose reference window no read of the sample rebuilt.
+    no_flank_pair : frozenset of str
+        Loci with a reference window but no flank pair with F > 0.
     """
 
     sample: str
     records: dict[str, tuple[FlankRecord, FlankRecord]]
     no_reference_window: frozenset[str]
+    no_flank_pair: frozenset[str]
 
     @property
     def loci(self) -> set[str]:
         """Every locus of the table."""
-        return set(self.records) | self.no_reference_window
+        return set(self.records) | self.no_reference_window | self.no_flank_pair
 
 
 def read_flank_table(path: str | Path) -> FlankTable:
@@ -507,8 +517,9 @@ def read_flank_table(path: str | Path) -> FlankTable:
     A side with the status `NO_REFERENCE_POSITION` gives a record with
     empty `ref_positions`. Raises ValueError when the table has no
     ``sample`` or ``reference_window_status`` column, names more than one
-    sample, lacks one side of a locus, has a reference window on one side
-    of a locus only, has flank fields on a side with no reference window,
+    sample, lacks one side of a locus, gives the two sides of a locus
+    different statuses where one of them has no flank (no reference window
+    or no flank pair), has flank fields on such a side,
     or has reference positions on a side with `NO_REFERENCE_POSITION` or
     none on a `WINDOW_RECOVERED` side.
     """
@@ -523,14 +534,14 @@ def read_flank_table(path: str | Path) -> FlankTable:
     if len(samples) != 1:
         raise ValueError(f"{path}: the flank table must name one sample, not "
                          f"{sorted(samples)}")
-    by_locus: dict[str, dict[str, FlankRecord | None]] = {}
+    by_locus: dict[str, dict[str, FlankRecord | str]] = {}
     for row in rows:
         status = row["reference_window_status"]
-        if status == WINDOW_UNRECOVERABLE:
+        if status in _NO_FLANK_STATUSES:
             if any(row[field] for field in _FLANK_FIELDS):
-                raise ValueError(f"{path}: {row['locus']} {row['side']} has no reference "
-                                 "window but carries flank fields")
-            by_locus.setdefault(row["locus"], {})[row["side"]] = None
+                raise ValueError(f"{path}: {row['locus']} {row['side']} has the status "
+                                 f"{status!r} but carries flank fields")
+            by_locus.setdefault(row["locus"], {})[row["side"]] = status
             continue
         if status not in (WINDOW_RECOVERED, NO_REFERENCE_POSITION):
             raise ValueError(f"{path}: {row['locus']} {row['side']} has the unknown "
@@ -551,15 +562,19 @@ def read_flank_table(path: str | Path) -> FlankTable:
     if incomplete:
         raise ValueError(f"{path}: loci without both sides: {incomplete}")
     mixed = sorted(locus for locus, pair in by_locus.items()
-                   if (pair["upstream"] is None) != (pair["downstream"] is None))
+                   if (isinstance(pair["upstream"], str) or isinstance(pair["downstream"], str))
+                   and pair["upstream"] != pair["downstream"])
     if mixed:
         raise ValueError(f"{path}: loci whose two sides differ in reference window "
                          f"status: {mixed}")
     records = {locus: (pair["upstream"], pair["downstream"])
-               for locus, pair in by_locus.items() if pair["upstream"] is not None}
-    no_window = frozenset(locus for locus, pair in by_locus.items()
-                          if pair["upstream"] is None)
-    return FlankTable(sample=samples.pop(), records=records, no_reference_window=no_window)
+               for locus, pair in by_locus.items() if not isinstance(pair["upstream"], str)}
+    no_flank = {status: frozenset(locus for locus, pair in by_locus.items()
+                                  if pair["upstream"] == status)
+                for status in _NO_FLANK_STATUSES}
+    return FlankTable(sample=samples.pop(), records=records,
+                      no_reference_window=no_flank[WINDOW_UNRECOVERABLE],
+                      no_flank_pair=no_flank[NO_FLANK_PAIR])
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +637,12 @@ class FlankPlacement:
         between them.
     negative_value : ndarray of bool
         The read's best placement has a negative value.
+    value : ndarray of int64
+        The best value in half units; 0 where the read has no placement.
+    upstream_run_side, downstream_run_side : ndarray of int64
+        ``a`` and ``b`` of the best placement, read indices in polyG
+        orientation, or -1. The tract of a kept read is the read on
+        ``[upstream_run_side + 1, downstream_run_side)``.
 
     Notes
     -----
@@ -629,12 +650,6 @@ class FlankPlacement:
     gives its side's reason; when neither flank matches, the read has both
     side reasons and no other. A read whose two flanks match has exactly
     one of `no_placement`, `no_bed_base`, `negative_value`, or is kept.
-    value : ndarray of int64
-        The best value in half units; 0 where the read has no placement.
-    upstream_run_side, downstream_run_side : ndarray of int64
-        ``a`` and ``b`` of the best placement, read indices in polyG
-        orientation, or -1. The tract of a kept read is the read on
-        ``[upstream_run_side + 1, downstream_run_side)``.
     """
 
     tracts: np.ndarray
@@ -649,38 +664,51 @@ class FlankPlacement:
     upstream_run_side: np.ndarray
     downstream_run_side: np.ndarray
 
+    def take(self, index: np.ndarray) -> FlankPlacement:
+        """The placement of the reads at `index`, in that order."""
+        return FlankPlacement(*(getattr(self, f.name)[index]
+                                for f in dataclasses.fields(self)))
 
-def distinct_reads(reads: Sequence[str], marks: np.ndarray
-                   ) -> tuple[list[str], np.ndarray, np.ndarray]:
+
+# A read's marked bases: sorted, disjoint half-open intervals ``(start,
+# end)`` of polyG read positions.
+Marks = tuple[tuple[int, int], ...]
+
+
+def marks_matrix(marks: Sequence[Marks], width: int) -> np.ndarray:
+    """The marks as a bool matrix: one row per read, `width` columns."""
+    out = np.zeros((len(marks), width), dtype=bool)
+    for row, intervals in enumerate(marks):
+        for start, end in intervals:
+            out[row, start:end] = True
+    return out
+
+
+def distinct_reads(reads: Sequence[str], marks: Sequence[Marks]
+                   ) -> tuple[list[str], list[Marks], np.ndarray, np.ndarray]:
     """The distinct (read, marks) pairs, in sorted order, and each read's index among them.
 
-    Two reads are the same when their strings and their marks over the
-    read's length agree. Returns the distinct strings, their marks as a
-    bool matrix as wide as the longest read, and the inverse index.
+    Returns the distinct strings, their marks, the marks as a bool matrix
+    as wide as the longest read, and the inverse index.
     """
-    longest = max(map(len, reads), default=0)
-    width = max(longest, 1)
-    if marks.ndim != 2 or marks.shape[0] != len(reads) or marks.shape[1] < longest:
-        raise ValueError("marks must hold one row per read, as wide as the longest read")
-    keys = [(s, np.packbits(marks[i, :len(s)]).tobytes()) for i, s in enumerate(reads)]
+    if len(marks) != len(reads):
+        raise ValueError("marks must hold one entry per read")
+    keys = list(zip(reads, marks, strict=True))
     order = {key: i for i, key in enumerate(sorted(set(keys)))}
     inverse = np.fromiter((order[key] for key in keys), dtype=np.int64, count=len(keys))
-    first = np.zeros(len(order), dtype=np.int64)
-    first[inverse[::-1]] = np.arange(len(keys))[::-1]
-    strings = [reads[i] for i in first]
-    out = np.zeros((len(order), width), dtype=bool)
-    for j, i in enumerate(first):
-        out[j, :len(reads[i])] = marks[i, :len(reads[i])]
-    return strings, out, inverse
+    distinct = sorted(order, key=order.__getitem__)
+    strings = [read for read, _ in distinct]
+    distinct_marks = [m for _, m in distinct]
+    width = max(max(map(len, strings), default=0), 1)
+    return strings, distinct_marks, marks_matrix(distinct_marks, width), inverse
 
 
 def place_polyg_reads(reads: Sequence[str], upstream: str, downstream: str,
-                      marks: np.ndarray) -> FlankPlacement:
+                      marks: Sequence[Marks]) -> FlankPlacement:
     """Each read's tract under the flanks `upstream` and `downstream`.
 
-    Reads are in polyG orientation and upper-case. `marks` holds one row
-    per read, in polyG read order, at least as wide as the longest read:
-    True at a marked base (see the module docstring). A distinct (read,
+    Reads are in polyG orientation and upper-case. `marks` gives each
+    read's marked bases (see the module docstring). A distinct (read,
     marks) pair is placed once, however often it occurs.
     """
     n = len(reads)
@@ -689,9 +717,9 @@ def place_polyg_reads(reads: Sequence[str], upstream: str, downstream: str,
         no = np.zeros(0, dtype=bool)
         z = np.zeros(0, dtype=np.int64)
         return FlankPlacement(tracts, no, no, no, no, no, no, no, z, z, z)
-    distinct, distinct_marks, inverse = distinct_reads(reads, marks)
+    distinct, _, mark_matrix, inverse = distinct_reads(reads, marks)
     up, dn = flank_matches(distinct, upstream, downstream)
-    best = best_placements(tract_scores(code_matrix(distinct)[0]), up, dn, distinct_marks)
+    best = best_placements(tract_scores(code_matrix(distinct)[0]), up, dn, mark_matrix)
     up_any = np.zeros(len(distinct), dtype=bool)
     dn_any = np.zeros(len(distinct), dtype=bool)
     up_any[up[0]] = True
@@ -729,31 +757,63 @@ def place_polyg_reads(reads: Sequence[str], upstream: str, downstream: str,
     )
 
 
-def polyg_reference_coordinates(alignments: Sequence, ref_orientation: str) -> np.ndarray:
-    """The reference coordinate of each read base, in polyG read order.
+# CIGAR operations by the cursors they move. P moves the query cursor, as
+# pysam's `get_aligned_pairs` does; `bam._alignment_flanking` agrees.
+_ALIGNED_OPS = frozenset((0, 7, 8))       # M, =, X
+_QUERY_OPS = frozenset((1, 4, 6))         # I, S, P
+_REFERENCE_OPS = frozenset((2, 3))        # D, N
 
-    Returns an int64 array of shape (n_reads, longest read). Only aligned
-    read bases (CIGAR M, = or X) get a coordinate; every other entry is -1.
-    At a "-" locus polyG index ``i`` is query index ``len - 1 - i``.
-    `alignments` are `pysam.AlignedSegment` records.
+
+def aligned_blocks(cigartuples: Sequence[tuple[int, int]], reference_start: int
+                   ) -> list[tuple[int, int, int]]:
+    """The aligned blocks of an alignment as ``(query start, reference start, length)``.
+
+    Only CIGAR M, = and X align a read base to a reference base.
     """
-    lengths = [len(r.query_sequence) for r in alignments]
-    out = np.full((len(alignments), max(lengths, default=0) or 1), -1, dtype=np.int64)
-    for row, (r, n) in enumerate(zip(alignments, lengths, strict=True)):
-        pairs = np.asarray(r.get_aligned_pairs(matches_only=True), dtype=np.int64)
-        if pairs.size == 0:
-            continue
-        query = pairs[:, 0] if ref_orientation == "+" else n - 1 - pairs[:, 0]
-        out[row, query] = pairs[:, 1]
+    blocks = []
+    q, r = 0, reference_start
+    for op, n in cigartuples:
+        if op in _ALIGNED_OPS:
+            blocks.append((q, r, n))
+            q += n
+            r += n
+        elif op in _QUERY_OPS:
+            q += n
+        elif op in _REFERENCE_OPS:
+            r += n
+    return blocks
+
+
+def bed_marks(blocks: Sequence[tuple[int, int, int]], query_length: int,
+              ref_orientation: str, bed_start: int, bed_end: int) -> Marks:
+    """The marked bases of one read: aligned to a position in ``[bed_start, bed_end)``.
+
+    `blocks` are :func:`aligned_blocks` of the read. The intervals are in
+    polyG read order: at a "-" locus query index ``q`` is polyG index
+    ``query_length - 1 - q``.
+    """
+    out = []
+    for q, r, n in blocks:
+        lo, hi = max(r, bed_start), min(r + n, bed_end)
+        if lo < hi:
+            out.append((q + lo - r, q + hi - r))
+    if ref_orientation == "-":
+        out = [(query_length - end, query_length - start) for start, end in reversed(out)]
+    return tuple(out)
+
+
+def reference_coordinates(blocks: Sequence[tuple[int, int, int]], query_length: int,
+                          ref_orientation: str, polyg_positions: Sequence[int]) -> list[int]:
+    """The reference coordinate the alignment gives each polyG read position, or -1.
+
+    -1 marks a base that is soft-clipped or in an insertion. `blocks` are
+    :func:`aligned_blocks` of the read.
+    """
+    out = []
+    for i in polyg_positions:
+        q = i if ref_orientation == "+" else query_length - 1 - i
+        out.append(next((r + q - q0 for q0, r, n in blocks if q0 <= q < q0 + n), -1))
     return out
-
-
-def bed_marks(ref_coords: np.ndarray, bed_start: int, bed_end: int) -> np.ndarray:
-    """The marked bases: those aligned to a reference position in ``[bed_start, bed_end)``.
-
-    `ref_coords` is :func:`polyg_reference_coordinates` of the reads.
-    """
-    return (ref_coords >= bed_start) & (ref_coords < bed_end)
 
 
 def place_flanks(alignments: Sequence, *, upstream: FlankRecord, downstream: FlankRecord,
@@ -772,10 +832,12 @@ def place_flanks(alignments: Sequence, *, upstream: FlankRecord, downstream: Fla
     bed_start, bed_end : int
         The locus's BED interval; it sets the marked bases.
     """
-    reads = polyg_reads([r.query_sequence for r in alignments], ref_orientation)
-    marks = bed_marks(polyg_reference_coordinates(alignments, ref_orientation),
-                      bed_start, bed_end)
-    return place_polyg_reads(reads, upstream.bases, downstream.bases, marks)
+    seqs = [r.query_sequence for r in alignments]
+    marks = [bed_marks(aligned_blocks(r.cigartuples, r.reference_start), len(seq),
+                       ref_orientation, bed_start, bed_end)
+             for r, seq in zip(alignments, seqs, strict=True)]
+    return place_polyg_reads(polyg_reads(seqs, ref_orientation), upstream.bases,
+                             downstream.bases, marks)
 
 
 # ---------------------------------------------------------------------------
