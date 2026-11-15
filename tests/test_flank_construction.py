@@ -35,11 +35,14 @@ from prolyg_phasing.io._flank_placement import (
     tract_edges,
     window_costs,
 )
+from prolyg_phasing.io.bam import extract_panel
+from prolyg_phasing.io.panel import parse_run_lengths
 from tests import _slow_flank_eval as slow
 from tests._hand_built_reads import (
     CHROM_PAD,
     LOCI,
     ReadCase,
+    _sub,
     chromosome,
     downstream_flank,
     placements,
@@ -306,10 +309,10 @@ def test_side_table_round_trips_flanks_of_any_reference_length(tmp_path):
         ("20.5", "30", "25", "1")
 
 
-def test_a_flank_that_does_not_match_the_reference_stops_construction():
+def test_a_flank_with_no_reference_position_stops_construction():
     up = FlankRecord("ACTTCAGCAT", tuple(range(100, 110)), 9)
-    with pytest.raises(ValueError, match=r"1 flanks do not match the reference window: "
-                                         r"\['L downstream'\]"):
+    with pytest.raises(ValueError, match=r"no kept read gives a reference position for 1 "
+                                         r"flanks: \['L downstream'\]"):
         fc.construct_flanks([("L", _locus_flanks((up, None)))], sample="S1")
 
 
@@ -341,7 +344,9 @@ def _write_bam(tmp_path: Path, name: str, molecules: list[tuple[str, int]]) -> t
     """A BAM with one synthetic chromosome per orientation, and its BED.
 
     `molecules` lists ``(read, copies)`` full-length reads in polyG
-    orientation. One gapless read of the whole chromosome lets the
+    orientation, each written with its first alignment in `placements`, or
+    ``(read, copies, form)`` with alignment `form` of that list. One
+    gapless read of the whole chromosome lets the
     extraction rebuild the reference window from its MD tag. One low-MAPQ
     read carries the reference molecule and must be filtered out.
     """
@@ -366,10 +371,11 @@ def _write_bam(tmp_path: Path, name: str, molecules: list[tuple[str, int]]) -> t
             seg.cigartuples = [(0, len(whole))]
             seg.set_tags([("MD", str(len(whole))), ("NM", 0), ("MI", "reference/A", "Z")])
             out.write(seg)
-            items = [(m, c, 60) for m, c in molecules] + [(locus.reference, 1, 0)]
-            for j, (molecule, copies, mapq) in enumerate(items):
+            items = [(m[0], m[1], 60, m[2] if len(m) > 2 else 0) for m in molecules]
+            items.append((locus.reference, 1, 0, 0))
+            for j, (molecule, copies, mapq, form) in enumerate(items):
                 case = _molecule_case(name, molecule)
-                p = placements(case)[0]
+                p = placements(case)[form]
                 for c in range(copies):
                     seg = to_record(header, case, p, orientation, f"m{j}_{c}")
                     seg.reference_id = ref_id
@@ -427,6 +433,134 @@ def test_build_flanks_end_to_end(tmp_path):
     table = read_flank_table(path)
     assert table.records == result.records
     assert table.sample == "normal"
+
+
+# ---------------------------------------------------------------------------
+# Reference positions from the alignments
+# ---------------------------------------------------------------------------
+
+
+def _coordinate(name: str, orientation: str, index: int) -> int:
+    """Reference coordinate of polyG index `index` of a locus on its synthetic contig."""
+    n = len(LOCI[name].reference)
+    return CHROM_PAD + index if orientation == "+" else CHROM_PAD + n - 1 - index
+
+
+def _positions(name: str, orientation: str, first: int, last: int) -> tuple[int, ...]:
+    """Coordinates of polyG indices `first` to `last`, in polyG order."""
+    return tuple(_coordinate(name, orientation, i) for i in range(first, last + 1))
+
+
+def _built(tmp_path: Path, name: str, molecules) -> dict:
+    bam_path, bed = _write_bam(tmp_path, name, molecules)
+    return fc.build_flanks(bam_path, bed, n_workers=1, sample="normal").records
+
+
+def test_a_flank_equal_to_the_reference(tmp_path):
+    locus = LOCI["PolyG151"]
+    records = _built(tmp_path, "PolyG151", [(locus.reference, 20)])
+    up_spec, dn_spec = upstream_flank(locus, 0), downstream_flank(locus, 0)
+    for o in ORIENTATIONS:
+        up, dn = records[f"PolyG151{o}"]
+        assert (up.bases, dn.bases) == (up_spec.bases, dn_spec.bases)
+        assert up.ref_positions == _positions("PolyG151", o, up_spec.start, up_spec.run_side)
+        assert dn.ref_positions == _positions("PolyG151", o, dn_spec.start, dn_spec.start + 9)
+
+
+def test_a_donor_flank_with_three_substitutions(tmp_path):
+    """The donor flank is three edits from the reference: no reference search
+    matches it, and the alignments place it on the reference flank's bases.
+    Extraction with that flank gives every read its tract."""
+    locus = LOCI["PolyG151"]
+    # Upstream flank ATATTTAGAT at polyG indices 20 to 29; ACATATACAT in the donor.
+    donor = _sub(_sub(_sub(locus.reference, 21, "C"), 24, "A"), 27, "C")
+    bam_path, bed = _write_bam(tmp_path, "PolyG151", [(donor, 20)])
+    result = fc.build_flanks(bam_path, bed, n_workers=1, sample="normal")
+    for o in ORIENTATIONS:
+        up, _ = result.records[f"PolyG151{o}"]
+        assert up.bases == "ACATATACAT"
+        assert up.ref_positions == _positions("PolyG151", o, 20, 29)
+    flanks = fc.write_flank_table(result, tmp_path / "normal")
+    panel = extract_panel(bam_path, bed, flanks)
+    for o in ORIENTATIONS:
+        locus_out = panel.loci[f"PolyG151{o}"]
+        assert locus_out.n_alignments_placed == 20
+        assert {parse_run_lengths(t) for t in locus_out.seq} == {(12,)}
+
+
+def test_a_donor_insertion_inside_the_flank(tmp_path):
+    """A C between reference indices 22 and 23: the donor flank TACTTTAGAT
+    covers 9 reference bases, from index 21 to the edge base at 29."""
+    locus = LOCI["PolyG151"]
+    donor = locus.reference[:23] + "C" + locus.reference[23:]
+    records = _built(tmp_path, "PolyG151", [(donor, 20)])
+    for o in ORIENTATIONS:
+        up, _ = records[f"PolyG151{o}"]
+        assert up.bases == "TACTTTAGAT"
+        assert up.ref_positions == _positions("PolyG151", o, 21, 29)
+
+
+def _deletion_form(name: str, molecule: str, deleted: int) -> int:
+    """Index in `placements` of the alignment that deletes reference index `deleted`."""
+    every = placements(_molecule_case(name, molecule))
+    return next(i for i, p in enumerate(every)
+                if p.form == "gap_shift" and p.cigar[0][1] == deleted)
+
+
+@pytest.mark.parametrize(("n_left", "n_right", "outer"), [(11, 10, 9), (12, 10, 10)])
+def test_the_most_common_coordinate_wins_and_a_tie_goes_nearer_the_run(
+        tmp_path, n_left, n_right, outer):
+    """PolyG454 downstream AAACCACTTAAG: the donor lacks one A of the AA at
+    downstream indices 9 and 10. The aligner deletes either A, so the outer
+    flank base maps to index 10 (left A deleted) or 9 (right A deleted). The
+    whole-contig read also places, and maps it to 9. So 11 left-deletion reads
+    tie with it and 10 right-deletion reads; 12 outvote them."""
+    locus = LOCI["PolyG454"]
+    start = len(locus.upstream) + len(locus.tract)
+    donor = locus.reference[:start + 10] + locus.reference[start + 11:]
+    left = _deletion_form("PolyG454", donor, start + 9)
+    right = _deletion_form("PolyG454", donor, start + 10)
+    records = _built(tmp_path, "PolyG454", [(donor, n_left, left), (donor, n_right, right)])
+    for o in ORIENTATIONS:
+        _, dn = records[f"PolyG454{o}"]
+        assert dn.bases == "AAACCACTTA"
+        assert dn.ref_positions == _positions("PolyG454", o, start, start + outer)
+
+
+def _locus_reads(reads: list[str], coords: list[list[int]]) -> fc.LocusReads:
+    width = max(map(len, reads))
+    matrix = np.full((len(reads), width), -1, dtype=np.int64)
+    for row, c in enumerate(coords):
+        matrix[row, :len(c)] = c
+    return fc.LocusReads("L", "+", 0, "", 0, 0, reads, matrix)
+
+
+def test_a_flank_range_against_the_polyg_direction_is_an_error():
+    read = "TTACCAGTCA" + "ACTTCAGCAT" + "G" * 12 + "CAAATTTTAT" + "ACCAGTCATT"
+    pair = fc.solve_flank_pair([read])
+    assert (pair.upstream, pair.downstream) == ("ACTTCAGCAT", "CAAATTTTAT")
+    coords = list(range(100, 100 + len(read)))
+    # The read maps its upstream flank backward: outer base 19 past its run side.
+    coords[10] = coords[19] + 1
+    with pytest.raises(ValueError, match="L: the upstream flank ACTTCAGCAT runs from"):
+        fc.flank_records_from_alignments(_locus_reads([read], [coords]), pair)
+
+
+def test_a_flank_base_without_a_coordinate_leaves_no_record():
+    read = "TTACCAGTCA" + "ACTTCAGCAT" + "G" * 12 + "CAAATTTTAT" + "ACCAGTCATT"
+    pair = fc.solve_flank_pair([read])
+    coords = list(range(100, 100 + len(read)))
+    coords[41] = -1  # the downstream outer base is soft-clipped
+    up, dn = fc.flank_records_from_alignments(_locus_reads([read], [coords]), pair)
+    assert up.ref_positions == tuple(range(110, 120))
+    assert dn is None
+
+
+def test_modal_coordinate_breaks_a_tie_toward_the_run():
+    coords = np.array([5, 7, 5, 7, 9])
+    assert fc.modal_coordinate(coords, 1) == 7
+    assert fc.modal_coordinate(coords, -1) == 5
+    assert fc.modal_coordinate(np.array([], dtype=np.int64), 1) is None
 
 
 # ---------------------------------------------------------------------------

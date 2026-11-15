@@ -30,7 +30,6 @@ from prolyg_phasing.io._flank_placement import (
     FlankRecord,
     code_matrix,
     flank_codes,
-    locate_flank,
     place_flanks,
     place_polyg_reads,
     window_costs,
@@ -468,44 +467,3 @@ def test_a_tract_starts_and_ends_with_g():
         result = _place(case, "+")
         for tract in result.tracts[result.kept]:
             assert tract[0] == G and tract[-1] == G
-
-
-# ---------------------------------------------------------------------------
-# The flank in the reference
-# ---------------------------------------------------------------------------
-
-_WINDOW = "TTACCAGTCA" + "ACTTCAGCAT" + "GGGGGGGGGGGG" + "CAAATTTTAT" + "ACCAGTCATT"
-_SPLIT = 26
-
-
-def test_locate_flank_exact_on_each_side():
-    assert locate_flank(_WINDOW, "ACTTCAGCAT", upstream=True, split=_SPLIT) == (10, 19)
-    assert locate_flank(_WINDOW, "CAAATTTTAT", upstream=False, split=_SPLIT) == (32, 41)
-
-
-def test_locate_flank_by_the_read_match_rule():
-    # One substitution: the same reference bases.
-    assert locate_flank(_WINDOW, "ACTTGAGCAT", upstream=True, split=_SPLIT) == (10, 19)
-    # The donor flank has one base more than the reference: 9 reference bases.
-    assert locate_flank(_WINDOW, "CTTCAGGCAT", upstream=True, split=_SPLIT) == (11, 19)
-    # The donor flank lacks a reference base: 11 reference bases.
-    assert locate_flank(_WINDOW, "CAAATTTATA", upstream=False, split=_SPLIT) == (32, 42)
-    # Two edits: no match.
-    assert locate_flank(_WINDOW, "CAAAGGTTAT", upstream=False, split=_SPLIT) is None
-
-
-def test_locate_flank_takes_the_copy_nearest_the_repeat():
-    copy = "TTACCAGTCA"
-    window = copy + "CA" + copy + "GGGGGGGG" + copy + "CA" + copy
-    assert locate_flank(window, copy, upstream=True, split=26) == (12, 21)
-    assert locate_flank(window, copy, upstream=False, split=26) == (30, 39)
-
-
-def test_locate_flank_prefers_the_lower_cost_over_the_nearer_copy():
-    window = "TTACCAGTCA" + "CA" + "TTACGAGTCA" + "GGGGGGGG" + "AAAA"
-    assert locate_flank(window, "TTACCAGTCA", upstream=True, split=26) == (0, 9)
-
-
-def test_locate_flank_stays_on_its_side():
-    assert locate_flank(_WINDOW, "CAAATTTTAT", upstream=True, split=_SPLIT) is None
-    assert locate_flank(_WINDOW, "ACTTCAGCAT", upstream=False, split=_SPLIT) is None

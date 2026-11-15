@@ -5,7 +5,8 @@ upstream and ``v`` downstream, in polyG orientation. The matched normal's
 reads choose the pair (see :mod:`prolyg_phasing.io._flank_construction`).
 This module states what the pair does to one read. The tract depends only
 on the read sequence, not on the alignment. The search for the pair and
-the extraction use this one definition.
+the extraction use this one definition. The alignments give only the
+reference coordinates of each flank (`FlankRecord.ref_positions`).
 
 **Match.** A flank matches a read substring if the substring differs from
 it by nothing, by one substitution, or by one gap of 1 or 2 bases. A gap
@@ -349,50 +350,6 @@ def best_placements(scores: np.ndarray, upstream: Sequence[np.ndarray],
 
 
 # ---------------------------------------------------------------------------
-# The flank in the reference
-# ---------------------------------------------------------------------------
-
-
-def locate_flank(polyg_window: str, flank: str, *, upstream: bool, split: int
-                 ) -> tuple[int, int] | None:
-    """Where the flank matches the reference window, by the read match rule.
-
-    The match may end at any window position, not only at a tract edge: a
-    donor flank can sit where the reference has no G next to it. An
-    upstream match must end before window index `split`, and a downstream
-    match must start at or after it (polyG orientation). Of the matches,
-    the lowest cost wins, then the one nearest `split`. Of two match
-    lengths with the same cost at that position, the first shape in
-    `SHAPES` order wins.
-
-    Returns
-    -------
-    (first, last) or None
-        Window indices of the first and last matched reference base, or
-        None when the flank does not match on its side.
-    """
-    codes = flank_codes(flank)
-    n = len(polyg_window)
-    window, _ = code_matrix([polyg_window], reverse=not upstream)
-    if upstream:
-        ends = np.arange(min(max(split, 0), n))
-    else:
-        ends = np.arange(max(0, n - max(split, 0)))
-        codes = codes[::-1].copy()
-    if ends.size == 0:
-        return None
-    cost, length = window_costs(edge_windows(window, np.zeros_like(ends), ends), codes)
-    hit = np.flatnonzero(cost != NO_MATCH)
-    if hit.size == 0:
-        return None
-    end = int(hit[cost[hit] == cost[hit].min()].max())
-    first, last = end - int(length[end]) + 1, end
-    if not upstream:
-        first, last = n - 1 - last, n - 1 - first
-    return first, last
-
-
-# ---------------------------------------------------------------------------
 # Flank records and the flank table
 # ---------------------------------------------------------------------------
 
@@ -407,8 +364,10 @@ class FlankRecord:
         The flank, 10 bases in polyG orientation, in read order. It comes
         from the matched normal's reads and can differ from the reference.
     ref_positions : tuple of int
-        The 0-based reference coordinate of each reference base the flank
-        matches by the read match rule, in polyG read order: 8 to 12 bases.
+        The 0-based reference coordinates from the flank's outer base to
+        its run-side base, contiguous and in polyG read order. The matched
+        normal's read alignments give the two end coordinates (see
+        :mod:`prolyg_phasing.io._flank_construction`).
     run_side_offset : int
         Offset in `ref_positions` of the base next to the repeat: the last
         offset for the upstream flank, 0 for the downstream flank.
@@ -548,32 +507,6 @@ def window_index(position: int, *, ref_orientation: str, window_start: int,
     return position - window_start
 
 
-def window_reference_position(index: int, *, ref_orientation: str, window_start: int,
-                              window_len: int) -> int:
-    """Reference coordinate of index `index` in the polyG-orientation window."""
-    if ref_orientation == "-":
-        return window_start + window_len - 1 - index
-    return window_start + index
-
-
-def reference_flank(polyg_window: str, bases: str, *, upstream: bool, split: int,
-                    ref_orientation: str, window_start: int) -> FlankRecord | None:
-    """The flank record of `bases` at its match in the reference window, or None.
-
-    The match is looked for before or after window index `split` (see
-    :func:`locate_flank`).
-    """
-    found = locate_flank(polyg_window, bases, upstream=upstream, split=split)
-    if found is None:
-        return None
-    first, last = found
-    positions = tuple(
-        window_reference_position(i, ref_orientation=ref_orientation,
-                                  window_start=window_start, window_len=len(polyg_window))
-        for i in range(first, last + 1))
-    return FlankRecord(bases, positions, len(positions) - 1 if upstream else 0)
-
-
 # ---------------------------------------------------------------------------
 # Placement of a block of reads
 # ---------------------------------------------------------------------------
@@ -695,3 +628,55 @@ def place_flanks(read_seqs: Sequence[str], *, upstream: FlankRecord,
     """
     return place_polyg_reads(polyg_reads(read_seqs, ref_orientation), upstream.bases,
                              downstream.bases)
+
+
+# ---------------------------------------------------------------------------
+# The flank's read bases at the best placement
+# ---------------------------------------------------------------------------
+
+
+def flank_outer_bases(reads: Sequence[str], placement: FlankPlacement, upstream: str,
+                      downstream: str) -> tuple[np.ndarray, np.ndarray]:
+    """Read index of each flank's outer base at each kept read's best placement.
+
+    The upstream flank's substring ends at ``a`` and the downstream flank's
+    substring starts at ``b`` (see :class:`FlankPlacement`). Its length is
+    the length of the lowest-cost match there: 8 to 12 read bases. Of two
+    shapes with the same cost, the first in `SHAPES` order gives the
+    length, as in :func:`window_costs`.
+
+    Parameters
+    ----------
+    reads : sequence of str
+        The reads that `placement` placed, in polyG orientation.
+    placement : FlankPlacement
+        The placement of `reads` under `upstream` and `downstream`.
+    upstream, downstream : str
+        The two flanks.
+
+    Returns
+    -------
+    upstream_outer, downstream_outer : ndarray of int64
+        Read indices in polyG orientation of the base farthest from the
+        repeat; -1 where the read is not kept.
+    """
+    n = len(reads)
+    up_outer = np.full(n, -1, dtype=np.int64)
+    dn_outer = np.full(n, -1, dtype=np.int64)
+    rows = np.flatnonzero(placement.kept)
+    if rows.size == 0:
+        return up_outer, dn_outer
+    kept_reads = [reads[i] for i in rows]
+    local = np.arange(rows.size)
+    a = placement.upstream_run_side[rows]
+    b = placement.downstream_run_side[rows]
+    forward, _ = code_matrix(kept_reads)
+    _, up_len = window_costs(edge_windows(forward, local, a), flank_codes(upstream))
+    backward, lengths = code_matrix(kept_reads, reverse=True)
+    _, dn_len = window_costs(edge_windows(backward, local, lengths - 1 - b),
+                             flank_codes(downstream)[::-1].copy())
+    if (up_len == 0).any() or (dn_len == 0).any():
+        raise RuntimeError("a kept read has no flank match at its best placement")
+    up_outer[rows] = a - up_len + 1
+    dn_outer[rows] = b + dn_len - 1
+    return up_outer, dn_outer

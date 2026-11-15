@@ -7,8 +7,8 @@ Every locus needs its two flanks from the matched normal's flank table
 (`prolyg-phasing build-flanks`). Two steps per locus:
 
 1. **Reference window** — reconstruct the reference on BED ± `pad` bp
-   from MD tags, and check that each flank matches it where the flank
-   table says.
+   from MD tags, and check that each flank's run-side base, at the
+   reference position the flank table records, lies in it.
 2. **Extraction** — fetch overlapping alignments, apply the read filters
    (MAPQ, SA, TLEN, MI), cut each read's tract between its best placement
    of the two flanks (`_flank_placement.place_flanks`), group by
@@ -57,7 +57,6 @@ from prolyg_phasing.io._flank_placement import (
     FlankRecord,
     place_flanks,
     read_flank_table,
-    reference_flank,
     window_index,
 )
 from prolyg_phasing.io.panel import (
@@ -167,12 +166,11 @@ def locus_geometry(
 ) -> LocusGeometry | None:
     """The reference window of one locus from MD tags, checked against its flanks.
 
-    Each flank is found again in this BAM's window by the read match rule
-    (:func:`~prolyg_phasing.io._flank_placement.reference_flank`), and it
-    must land on the reference positions that the flank table records.
-    Returns None when no read rebuilds the reference window. Raises
-    ValueError, naming the locus, when a flank does not land there, or
-    when the flanks do not enclose the repeat.
+    The flank table gives each flank's reference positions (from the
+    matched normal's alignments). Both run-side positions must lie in this
+    BAM's reference window, and the upstream flank must be upstream of the
+    downstream flank. Returns None when no read rebuilds the reference
+    window. Raises ValueError, naming the locus, when a check fails.
     """
     window_start = bed_start - REF_WINDOW_PAD
     window = get_reference_window(bam, chrom, window_start, bed_end + REF_WINDOW_PAD,
@@ -189,17 +187,12 @@ def locus_geometry(
         g_walk_up=walk.g_walk_up,
         g_walk_dn=walk.g_walk_dn,
     )
-    polyg_window = revcomp(window) if walk.ref_orientation == "-" else window
-    split = REF_WINDOW_PAD + (bed_end - bed_start) // 2
     for side, flank in zip(("upstream", "downstream"), flanks, strict=True):
-        found = reference_flank(polyg_window, flank.bases, upstream=side == "upstream",
-                                split=split, ref_orientation=walk.ref_orientation,
-                                window_start=window_start)
-        if found != flank:
+        if not 0 <= geometry.polyg_index(flank.run_side_position) < len(window):
             raise ValueError(
-                f"{name}: the {side} flank {flank.bases} at reference positions "
-                f"{flank.ref_positions[0]}..{flank.ref_positions[-1]} does not match the "
-                f"reference window of this BAM ({walk.ref_orientation} orientation)")
+                f"{name}: the {side} flank's run-side base at reference position "
+                f"{flank.run_side_position} is outside the reference window "
+                f"[{window_start}, {window_start + len(window)}) of this BAM")
     if geometry.polyg_index(flanks[0].run_side_position) \
             >= geometry.polyg_index(flanks[1].run_side_position):
         raise ValueError(f"{name}: the upstream flank is not upstream of the downstream flank")

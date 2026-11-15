@@ -9,7 +9,8 @@ counter of its drop reason.
 
 The other tests check what the flank moves besides the tract: the phasing
 window, the reference tract and its run lengths, and the checks of the flank
-table against the BED and the reference window.
+table against the BED and the reference window: each run-side base lies in
+the window, and the upstream flank is upstream of the downstream flank.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import pytest
 
 import prolyg_phasing.io._flank_construction as fc
 from prolyg_phasing.io._anchors import revcomp
-from prolyg_phasing.io._flank_placement import FlankRecord, reference_flank
+from prolyg_phasing.io._flank_placement import FlankRecord
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import parse_run_lengths
 from prolyg_phasing.phasing import ref_pos_at_offset
@@ -262,18 +263,18 @@ def test_phasing_window_starts_past_each_moved_flank(tmp_path, orientation):
 
 @pytest.mark.parametrize("orientation", ORIENTATIONS)
 def test_a_flank_with_a_gap_against_the_reference(tmp_path, orientation):
-    """A donor flank with TT where the reference has TTT matches 11 reference
+    """A donor flank with TT where the reference has TTT covers 11 reference
     bases. Extraction accepts it, the reads place with the 1-base gap, and the
-    phasing window starts past the outer matched base."""
+    phasing window starts past the outer base."""
     case = INVARIANT
     donor_up = "CATATTAGAT"
+    n = len(case.locus.reference)
     records = {}
     for o in ORIENTATIONS:
-        chrom = chromosome(case.locus, o)
-        polyg = chrom if o == "+" else revcomp(chrom)
-        split = CHROM_PAD + len(case.locus.upstream) + len(case.locus.tract) // 2
-        up = reference_flank(polyg, donor_up, upstream=True, split=split,
-                             ref_orientation=o, window_start=0)
+        # Reference CATATTTAGAT at polyG indices 19 to 29.
+        positions = tuple(CHROM_PAD + i if o == "+" else CHROM_PAD + n - 1 - i
+                          for i in range(19, 30))
+        up = FlankRecord(donor_up, positions, len(positions) - 1)
         records[f"PolyG151{o}"] = (up, flank_record(case, case.dn, o))
     bam, bed, flanks = _write_case(tmp_path, case, flank_records=records)
     locus = extract_panel(bam, bed, flanks).loci[f"PolyG151{orientation}"]
@@ -313,24 +314,25 @@ def test_flank_table_with_an_extra_locus_is_an_error(tmp_path):
         extract_panel(bam, bed, flanks)
 
 
-def test_flank_that_does_not_match_the_reference_is_an_error(tmp_path):
-    """Two substitutions: the flank does not match the reference window."""
+def test_a_run_side_base_outside_the_reference_window_is_an_error(tmp_path):
     records = _records(INVARIANT)
     up, dn = records["PolyG151+"]
-    records["PolyG151+"] = (dataclasses.replace(up, bases="CC" + up.bases[2:]), dn)
+    shifted = tuple(p + 200 for p in dn.ref_positions)
+    records["PolyG151+"] = (up, dataclasses.replace(dn, ref_positions=shifted))
     bam, bed, flanks = _write_case(tmp_path, INVARIANT, flank_records=records)
-    with pytest.raises(ValueError, match="PolyG151[+]: the upstream flank"):
+    with pytest.raises(ValueError, match="PolyG151[+]: the downstream flank's run-side base "
+                                         "at reference position .* is outside"):
         extract_panel(bam, bed, flanks)
 
 
-def test_flank_recorded_at_other_positions_is_an_error(tmp_path):
-    """The flank matches the window, but not at the positions of the table."""
+def test_an_upstream_flank_past_the_downstream_flank_is_an_error(tmp_path):
     records = _records(INVARIANT)
     up, dn = records["PolyG151+"]
-    shifted = tuple(p - 1 for p in dn.ref_positions)
-    records["PolyG151+"] = (up, dataclasses.replace(dn, ref_positions=shifted))
+    shift = dn.run_side_position - up.run_side_position
+    moved = tuple(p + shift for p in up.ref_positions)
+    records["PolyG151+"] = (dataclasses.replace(up, ref_positions=moved), dn)
     bam, bed, flanks = _write_case(tmp_path, INVARIANT, flank_records=records)
-    with pytest.raises(ValueError, match="PolyG151[+]: the downstream flank"):
+    with pytest.raises(ValueError, match="PolyG151[+]: the upstream flank is not upstream"):
         extract_panel(bam, bed, flanks)
 
 
