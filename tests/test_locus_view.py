@@ -222,6 +222,28 @@ def test_with_phasing_the_snv_columns_and_label_rows(tmp_path):
         {("hap_major", "C"), ("hap_minor", "G"), ("unk", ".")}
 
 
+def test_the_list_shows_phasing_snvs_no_snv_or_no_phasing_result(tmp_path):
+    """L1 has a phased SNV; L2's reads share one flanking string, so its phasing
+    result has no SNV; the second sample is given without a phasing directory."""
+    from tests.test_phasing_tables import _make_locus, _make_provenance
+
+    db, _ = _snv_panel(tmp_path)
+    one = ExtractedPanel.load_db(db).loci["L1"]
+    flat = _make_locus(flanking_strings=["AAAACAAT|TTTTTTTT"], counts=[40],
+                       seqs=["GGGGGG"] * 40, up_width=8, dn_width=8)
+    both = tmp_path / "both.panel.db"
+    ExtractedPanel(loci={"L1": one, "L2": flat}, n_alleles=8,
+                   provenance=_make_provenance()).save_db(both)
+    out = tmp_path / "both_phasing"
+    cli.main(["phase", "--panel-db", str(both), "--out-dir", str(out)])
+    panel = ExtractedPanel.load_db(both)
+    listing = lv.locus_list([panel, panel], [lv.PhasingIndex.read(out), None])
+    snvs = {e["locus"]: [s["snvs"] for s in e["samples"]] for e in listing["loci"]}
+    assert snvs == {"L1": [{"phased": 1, "dropped": 0}, None],
+                    "L2": [{"phased": 0, "dropped": 0}, None]}
+    assert [s["phasing"] is not None for s in listing["samples"]] == [True, False]
+
+
 def test_labels_join_the_panel_rows_in_order(tmp_path):
     """haplotype_calls.tsv has one row per panel row, so one (mi, strand) can
     occur twice; the join is by row position, checked by (mi, strand, count)."""
@@ -270,7 +292,8 @@ def test_the_server_serves_the_page_the_list_and_one_locus(server):
     assert status == 200 and b"<html" in page
     listing = json.loads(_get(server + "/loci")[1])
     assert [e["locus"] for e in listing["loci"]] == ["L1"]
-    assert [s["n_snvs"] for s in listing["loci"][0]["samples"]] == [1, None]
+    assert [s["snvs"] for s in listing["loci"][0]["samples"]] == \
+        [{"phased": 1, "dropped": 0}, None]
     assert listing["samples"][0]["phasing"] is not None and listing["samples"][1]["phasing"] is None
     with_phasing = json.loads(_get(server + "/locus?sample=0&locus=L1")[1])
     without = json.loads(_get(server + "/locus?sample=1&locus=L1")[1])

@@ -80,7 +80,7 @@ canvas{display:block}
   <section class="list" aria-label="Loci">
     <div class="filters" id="filters"></div>
     <div class="tablewrap"><table id="loci"><thead><tr>
-      <th data-k="locus">Locus</th><th data-k="n_reads" class="num">Reads</th><th data-k="largest_run" class="num">Largest run</th><th data-k="status">Status</th>
+      <th data-k="locus">Locus</th><th data-k="n_reads" class="num">Reads</th><th data-k="largest_run" class="num">Largest run</th><th data-k="snvs" class="num" id="snvhead">Phasing SNVs</th><th data-k="status">Status</th>
     </tr></thead><tbody></tbody></table></div>
   </section>
   <section class="detail" id="detail"></section>
@@ -133,19 +133,24 @@ function visible(){
   if(filter==="noflank")rows=rows.filter(e=>info(e)&&info(e).status!=="recovered");
   if(filter==="noposition")rows=rows.filter(e=>info(e)&&info(e).no_position);
   if(filter==="noreads")rows=rows.filter(e=>info(e)&&info(e).n_reads===0);
-  const key=e=>sortKey==="locus"?e.locus:info(e)?info(e)[sortKey]:null;
+  const key=e=>{if(sortKey==="locus")return e.locus;const s=info(e);if(!s)return null;
+    if(sortKey==="snvs")return s.snvs?s.snvs.phased+s.snvs.dropped/1000:null;return s[sortKey]};
   return rows.slice().sort((a,b)=>{const x=key(a),y=key(b);
     if(sortKey==="locus")return natural.compare(x,y)*sortDir;
     if(x==null)return 1; if(y==null)return -1;
     return (x>y?1:x<y?-1:0)*sortDir});
 }
+function snvText(s){if(!s||!s.snvs)return "–";const v=s.snvs;
+  if(!v.phased&&!v.dropped)return `<span class="note">no SNV</span>`;
+  return fmt(v.phased)+(v.dropped?` <span class="note">(${fmt(v.dropped)})</span>`:"")}
 function renderList(){
+  $("#snvhead").title=LIST.samples[sample].phasing?"SNVs of this sample's phasing result (snv_calls.tsv): phased, and dropped for low linkage in brackets":"no phasing result given for this sample";
   document.querySelectorAll("#filters button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.k===filter));
   const tb=$("#loci tbody");tb.textContent="";
   for(const e of visible()){const s=info(e);
     const tr=document.createElement("tr");tr.tabIndex=0;tr.setAttribute("aria-selected",current===e);
     const pill=!s?`<span class="pill p-n">not in panel</span>`:s.status!=="recovered"?`<span class="pill p-bad">${esc(s.status.replaceAll("_"," "))}</span>`:s.no_position?`<span class="pill p-warn">side with no position</span>`:`<span class="pill p-ok">recovered</span>`;
-    tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.largest_run):"–"}</td><td>${pill}</td>`;
+    tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.largest_run):"–"}</td><td class="num">${snvText(s)}</td><td>${pill}</td>`;
     tr.onclick=()=>select(e);tr.onkeydown=ev=>{if(ev.key==="Enter")select(e)};
     tb.appendChild(tr)}
   // Keep the open locus in view inside the list panel, without moving the page.

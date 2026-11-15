@@ -417,8 +417,9 @@ def locus_list(panels: Sequence[ExtractedPanel],
     Read from the panels' metadata columns, without decoding any locus's
     rows. Per sample: ``n_reads``, ``status``, ``largest_run`` (the largest
     observed G run), ``no_position`` (a flank side with no reference
-    position) and ``n_snvs`` (the SNVs of the phasing result, None without
-    one), or None when the panel does not hold the locus.
+    position) and ``snvs`` (``{"phased": n, "dropped": m}`` from the
+    phasing result's ``snv_calls.tsv``, None when no phasing result was
+    given), or None when the panel does not hold the locus.
     """
     columns = []
     for panel in panels:
@@ -439,7 +440,12 @@ def locus_list(panels: Sequence[ExtractedPanel],
         if name not in c["n_reads"]:
             return None
         out = {field: c[field][name] for field in fields}
-        out["n_snvs"] = None if phasing is None else len(phasing.snvs.get(name, []))
+        if phasing is None:
+            out["snvs"] = None
+        else:
+            status = [s["status"] for s in phasing.snvs.get(name, [])]
+            out["snvs"] = {"phased": status.count("phased"),
+                           "dropped": len(status) - status.count("phased")}
         return out
 
     entries = [{"locus": name,
