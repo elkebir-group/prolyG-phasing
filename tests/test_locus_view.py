@@ -98,36 +98,39 @@ def test_column_coordinates_on_each_strand(tmp_path, orientation):
         orientation, view["flanking"]["up"]["start"], up_cols[-1]["index"])
 
 
-def test_without_phasing_rows_group_by_tract(tmp_path):
+def _exact_rows(view, rows, label_of=None):
+    """The pile-up rows from the panel rows, counted by hand: tract, label, and
+    the read's own base at every shown column."""
+    up_idx = [c["index"] for c in view["pileup"]["up"]]
+    dn_idx = [c["index"] for c in view["pileup"]["dn"]]
+    want = Counter()
+    for t, up, dn, mi, n in rows:
+        label = None if label_of is None else label_of[mi]
+        want[(t, label, "".join(up[i] for i in up_idx), "".join(dn[i] for i in dn_idx))] += n
+    return want
+
+
+def _drawn(view):
+    return {(r["tract"], r["label"], r["up"], r["dn"]): r["reads"]
+            for r in view["pileup"]["rows"]}
+
+
+def test_without_phasing_a_row_is_exact(tmp_path):
+    """A row's cells are its reads' own bases, and reads that differ at any
+    shown column are in different rows."""
     _, panel = _panel(tmp_path, MOVED)
     for name in ("PolyG5177+", "PolyG5177-"):
-        view = locus_view_data(name, panel.loci[name], "S", near=2)
+        locus = panel.loci[name]
+        view = locus_view_data(name, locus, "S", near=2)
         assert view["phasing"] is None
         assert len(view["pileup"]["up"]) == len(view["pileup"]["dn"]) == 2
-        assert [(r["tract"], r["reads"], r["label"]) for r in view["pileup"]["rows"]] == \
-            [(t, n, None) for t, n, _ in view["tracts"]]
         assert view["flanking"]["up"]["snv"] == view["flanking"]["dn"]["snv"] == []
+        want = _exact_rows(view, list(_rows(locus)))
+        assert _drawn(view) == dict(want)
+        assert len(view["pileup"]["rows"]) == view["pileup"]["n_rows"] == len(want)
     plus = locus_view_data("PolyG5177+", panel.loci["PolyG5177+"], "S")
     minus = locus_view_data("PolyG5177-", panel.loci["PolyG5177-"], "S")
     assert plus["pileup"]["rows"] == minus["pileup"]["rows"]
-
-
-def test_a_cell_is_the_majority_of_the_rows_reads_and_never_invented(tmp_path):
-    _, panel = _panel(tmp_path, MOVED)
-    locus = panel.loci["PolyG5177+"]
-    view = locus_view_data("PolyG5177+", locus, "S")
-    rows = list(_rows(locus))
-    for row in view["pileup"]["rows"]:
-        mine = [r for r in rows if r[0] == row["tract"]]
-        for k, col in enumerate(view["pileup"]["up"]):
-            want = Counter()
-            for r in mine:
-                if r[1][col["index"]] != ".":
-                    want[r[1][col["index"]]] += r[4]
-            base, counts = row["up"][k]
-            assert counts == [want[b] for b in lv.FLANKING_BASES]
-            assert base == (max(want, key=lambda b: (want[b], -lv.FLANKING_BASES.index(b)))
-                            if want else "")
 
 
 def test_the_rows_past_the_cap_are_counted(tmp_path, monkeypatch):
@@ -150,7 +153,7 @@ def test_a_side_with_no_position(tmp_path):
     assert view["flanks"]["downstream"]["status"] == "no_reference_position"
     assert view["flanking"]["dn"] == {"start": -1, "width": 0, "counts": [], "snv": []}
     assert view["pileup"]["dn"] == []
-    assert all(r["dn"] == [] for r in view["pileup"]["rows"])
+    assert all(r["dn"] == "" for r in view["pileup"]["rows"])
     assert sum(r["reads"] for r in view["pileup"]["rows"]) == view["counters"]["n_reads"] > 0
 
 
@@ -211,18 +214,12 @@ def test_with_phasing_the_snv_columns_and_label_rows(tmp_path):
     labels = pd.read_csv(out / "haplotype_calls.tsv", sep="\t", dtype=str)
     label_of = dict(zip(labels.mi, labels.phase_label, strict=True))
     locus = panel.loci["L1"]
-    want = Counter()
-    for mi, seq, n in zip(locus.mi, locus.seq, locus.count, strict=True):
-        want[(str(seq), label_of[str(mi)])] += int(n)
-    rows = view["pileup"]["rows"]
-    assert {(r["tract"], r["label"]): r["reads"] for r in rows} == dict(want)
+    want = _exact_rows(view, list(_rows(locus)), label_of)
+    assert _drawn(view) == dict(want)
+    # The cell at the SNV is each read's own base: "." where it has none.
     at_snv = view["pileup"]["up"].index(snv_cols[0])
-    for r in rows:
-        base, counts = r["up"][at_snv]
-        expected = {"hap_major": "C", "hap_minor": "G", "unk": ""}[r["label"]]
-        assert base == expected
-        if r["label"] == "unk":
-            assert counts == [0] * len(lv.FLANKING_BASES)
+    assert {(r["label"], r["up"][at_snv]) for r in view["pileup"]["rows"]} == \
+        {("hap_major", "C"), ("hap_minor", "G"), ("unk", ".")}
 
 
 def test_labels_join_the_panel_rows_in_order(tmp_path):

@@ -277,14 +277,13 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
         from the flank; downstream index 0 is the nearest.
     pileup : dict
         ``up`` and ``dn``: the columns, in drawing order, each with
-        ``index``, ``position``, ``counts``, ``coverage``, ``majority`` and,
-        at an SNV, ``snv`` (its row of ``snv_calls.tsv``). ``rows``: per
-        group of reads with one tract and one phase label (the label is
-        None without phasing), ``tract``, ``label``, ``reads``, ``up`` and
-        ``dn`` (per column, the most common base of the group's reads, empty
-        when none of them has a base there, and the group's base counts).
-        ``n_rows`` and ``reads_not_drawn`` count the groups past
-        `PILEUP_ROWS`.
+        ``index``, ``position``, ``counts``, ``coverage`` and, at an SNV,
+        ``snv`` (its row of ``snv_calls.tsv``). ``rows``: one per distinct
+        (tract, phase label, the read's own base or "." at every shown
+        column), with ``tract``, ``label`` (None without phasing),
+        ``reads``, ``up`` and ``dn`` (the bases at the side's columns, one
+        character each). Sorted by reads. ``n_rows`` and
+        ``reads_not_drawn`` count the rows past `PILEUP_ROWS`.
     """
     counters = {f.name: int(getattr(locus, f.name))
                 for f in dataclasses.fields(locus)
@@ -330,38 +329,31 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
         for i in _columns(block.shape[1], set(snv_at), near, upstream=upstream):
             cov = int(counts[i].sum())
             col = {"index": i, "position": start + i if orient == "+" else start - i,
-                   "counts": counts[i].tolist(), "coverage": cov,
-                   "majority": FLANKING_BASES[int(np.argmax(counts[i]))] if cov else ""}
+                   "counts": counts[i].tolist(), "coverage": cov}
             if i in snv_at:
                 col["snv"] = snv_at[i]
             cols.append(col)
         columns[name] = cols
 
-    # Pile-up groups: one tract and one phase label. Each cell is the most
-    # common base of the group's reads there.
-    group_key = np.char.add(np.char.add(seq, "\t"), row_label.astype(str))
-    keys, group_reads, group_of_row = _summed(group_key, count)
-    group_order = np.lexsort((keys, -group_reads))
-    drawn = group_order[:PILEUP_ROWS]
-    position = {g: k for k, g in enumerate(drawn)}
-    pick = np.array([position.get(g, -1) for g in group_of_row], dtype=np.int64)
-    rows = []
-    for g in drawn:
-        tract, label = str(keys[g]).split("\t")
-        rows.append({"tract": tract, "reads": int(group_reads[g]),
-                     "label": PHASE_LABELS[int(label)] if int(label) >= 0 else None})
-    for name, (block, _, _) in sides.items():
+    # Pile-up rows: the reads with one tract, one phase label and the same
+    # own base ("." for none) at every shown column, with their read count.
+    def shown(name):
+        block = sides[name][0]
         idx = [c["index"] for c in columns[name]]
-        cells = np.zeros((len(drawn), len(idx), len(FLANKING_BASES)), dtype=np.int64)
-        if idx and len(fid):
-            keep = pick >= 0
-            bases = block[np.ix_(fid[keep], idx)]
-            for b, base in enumerate(FLANKING_BASES):
-                np.add.at(cells[:, :, b], pick[keep],
-                          (bases == ord(base)) * count[keep][:, None])
-        for k, row in enumerate(rows):
-            row[name] = [[FLANKING_BASES[int(np.argmax(c))] if c.sum() else "", c.tolist()]
-                         for c in cells[k]]
+        cells = block[np.ix_(fid, idx)] if len(fid) else np.zeros((0, len(idx)), np.uint8)
+        return np.array([row.tobytes().decode("ascii") for row in cells] or [""], dtype=str)
+
+    up_cells, dn_cells = shown("up"), shown("dn")
+    row_key = seq
+    for part in (row_label.astype(str), up_cells[:len(seq)], dn_cells[:len(seq)]):
+        row_key = np.char.add(np.char.add(row_key, "\t"), part)
+    keys, key_reads, _ = _summed(row_key, count)
+    key_order = np.lexsort((keys, -key_reads))
+    rows = []
+    for k in key_order[:PILEUP_ROWS]:
+        tract, label, up, dn = str(keys[k]).split("\t")
+        rows.append({"tract": tract, "reads": int(key_reads[k]), "up": up, "dn": dn,
+                     "label": PHASE_LABELS[int(label)] if int(label) >= 0 else None})
 
     flanks = None
     if locus.upstream_flank is not None:
@@ -386,7 +378,7 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
         "flanking": flanking,
         "pileup": {"up": columns["up"], "dn": columns["dn"], "rows": rows,
                    "n_rows": len(keys),
-                   "reads_not_drawn": int(group_reads[group_order[PILEUP_ROWS:]].sum())},
+                   "reads_not_drawn": int(key_reads[key_order[PILEUP_ROWS:]].sum())},
     }
 
 

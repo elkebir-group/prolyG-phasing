@@ -244,10 +244,10 @@ function snvStatus(v){return v.status==="phased"?(v.is_anchor?"phased, anchor":"
 function pileCard(r){
   const c=document.createElement("div");c.className="card";const P=r.pileup;
   const snvCols=[...P.up,...P.dn].filter(x=>x.snv);
-  const how=r.phasing?`Columns: the ${r.near} flanking bases next to each flank and one column per SNV of the phasing result (${snvCols.length} here; header: the two bases and the status). A row is a group of reads with one tract and one phase label (major, minor or unk, from the read family's label).`
-    :`Columns: the ${r.near} flanking bases next to each flank. No phasing result was given for this sample, so a row is a group of reads with one tract.`;
+  const how=r.phasing?`Columns: the ${r.near} flanking bases next to each flank and one column per SNV of the phasing result (${snvCols.length} here; header: the two bases and the status).`
+    :`Columns: the ${r.near} flanking bases next to each flank. No phasing result was given for this sample.`;
   c.innerHTML=`<h2>Pile-up</h2>
-   <div class="note">G strand. ${how} At each column a row shows the most common base of its reads, and an empty cell where none of its reads has a base there (a gap, a clip, or a base below the quality limit); hover for the counts. A short mark stands for the positions skipped between two columns. The flank columns show the panel's flank, not each read's bases. The upstream flank sits in fixed columns; the tract is left-justified and padded (a line) to the longest tract drawn.
+   <div class="note">G strand. ${how} A row is the reads that share one tract${r.phasing?", one phase label (major, minor or unk)":""} and the same own base at every shown column, drawn once with their read count. An empty cell means the reads have no base there (a gap, a clip, or a base below the quality limit). Hover a column for its position and the base counts of all reads. A short mark stands for the positions skipped between two columns. The flank columns show the panel's flank, not each read's bases. The upstream flank sits in fixed columns; the tract is left-justified and padded (a line) to the longest tract drawn.
    ${fmt(P.n_rows)} rows${P.reads_not_drawn?`; ${fmt(P.reads_not_drawn)} reads in rows not drawn (the ${fmt(P.rows.length)} rows with the most reads are drawn)`:""}.</div>
    <div class="scroll" id="pilehost"></div>
    <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank</span><span><i style="background:var(--tract)"></i>tract</span><span><i style="background:var(--warn)"></i>SNV of the phasing result</span><span>empty cell: no read base</span></div>`;
@@ -275,15 +275,15 @@ function drawPile(r){
     const c=sl.col;
     if(c.snv){g.fillStyle=c.snv.status==="phased"?css("--warn"):css("--muted");g.fillRect(j*CW,4,CW-1,5);g.fillStyle=css("--fg");
       g.fillText(c.snv.allele_major,x,22);g.fillText(c.snv.allele_minor,x,38)}
-    else{g.fillStyle=css("--muted");g.fillText(c.majority,x,38)}});
+    else{g.fillStyle=css("--muted");g.fillRect(j*CW+CW/2-1,34,2,4)}});
   let y=HEAD;
   for(const row of P.rows){
     slots.forEach((sl,j)=>{let ch="",faded=false;
       if(sl.gap)return;
       if(sl.flank){ch=sl.b;faded=true}
       else if(sl.tract!=null){ch=row.tract[sl.tract]||" "}
-      else ch=row[sl.side][sl.k][0];
-      if(ch==="")return;
+      else ch=row[sl.side][sl.k];
+      if(ch===""||ch===".")return;
       if(ch===" "){g.fillStyle=css("--fg");g.fillRect(j*CW,y+RH/2-1,CW,2);return}
       g.globalAlpha=faded?.45:1;g.fillStyle=baseColor(ch);g.fillRect(j*CW,y,CW-1,RH-1);g.globalAlpha=1});
     g.fillStyle=css("--muted");g.textAlign="left";g.font=font;
@@ -300,7 +300,7 @@ function drawPile(r){
     const k=Math.floor((yy-HEAD)/RH);
     if(yy>=HEAD&&k<P.rows.length){const row=P.rows[k];
       html+=`<div class="mono">${fmt(row.reads)} reads${row.label?` · label ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;
-      if(sl.side){const cell=row[sl.side][sl.k];html+=`<div>this row: ${cellsText(cell[1])}</div>`}}
+      if(sl.side){const ch=row[sl.side][sl.k];html+=`<div>this row's reads: ${ch==="."?"no base here":esc(ch)}</div>`}}
     tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";tip.innerHTML=html};
   cv.onmouseleave=()=>tip.hidden=true;
 }
