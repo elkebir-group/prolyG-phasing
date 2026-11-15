@@ -21,9 +21,11 @@ from prolyg_phasing.io.panel import ExtractedLocus, ExtractedPanel
 from prolyg_phasing.phasing import (
     FlankingHaplotype,
     FlankingHaplotypeAssignment,
+    PhasingPanel,
     PicklePanel,
     SNVCandidate,
     all_unk_assignment,
+    family_consensus_counts,
     offset_at_ref_pos,
     per_row_bases_at_positions,
     vote_assignment,
@@ -181,3 +183,74 @@ def assign_flanking_haplotypes_ref(
         assignments=assignments,
         usable_snvs=usable,
     )
+
+
+_ACGT = "ACGT"
+
+
+def target_phasing_panel(
+    target_panel: ExtractedPanel,
+    anchored: RefPhasingPanel,
+    reference_phased: dict[str, FlankingHaplotype],
+) -> PhasingPanel:
+    """The ref-phase result in the shape the ``phase`` tables are built from.
+
+    Per target locus, a :class:`~prolyg_phasing.phasing.FlankingHaplotype`
+    over the reference SNVs the target covers (``anchored.usable_snvs``),
+    in the reference's profile order, and the ref-phase assignments. Each
+    SNV carries the target's own position (``segment``, ``string_index``)
+    and the reference's ``ref_pos``, alleles and haplotype bases.
+    ``coverage`` is the target's family count at the position (the family
+    consensus of :func:`~prolyg_phasing.phasing.family_consensus_counts`,
+    as ``find_informative_snvs`` counts), and ``vaf_minor`` the target's
+    families with the reference's ``allele_minor`` over that coverage (NaN
+    with no coverage). The anchor is the reference anchor when the target
+    covers it, else none (-1). The pair columns, ``max_discordance`` and
+    ``n_anchor_families`` are not measured on the target: NaN or None.
+
+    :func:`~prolyg_phasing.io.phasing_tables.build_haplotype_calls`,
+    :func:`~prolyg_phasing.io.phasing_tables.build_snv_calls` and
+    :func:`~prolyg_phasing.io.phasing_tables.build_locus_summary` take the
+    result as they take the output of ``phase``.
+    """
+    haplotypes: dict[str, FlankingHaplotype] = {}
+    for locus_id, locus in target_panel.loci.items():
+        usable = anchored.usable_snvs.get(locus_id, ())
+        reference = reference_phased.get(locus_id)
+        if not usable or reference is None:
+            haplotypes[locus_id] = FlankingHaplotype(
+                locus_id=locus_id, snvs=(), hap_major_profile=(), hap_minor_profile=(),
+                anchor_index=-1, pair_discordance=(), pair_double_coverage=(),
+                max_discordance=float("nan"), n_anchor_families=None,
+                dropped_low_linkage_snvs=())
+            continue
+        up_fam, dn_fam = family_consensus_counts(
+            locus.flanking_seq, locus.flanking_id, locus.count, locus.mi,
+            locus.flanking_up_width, locus.flanking_dn_width)
+        snvs, major, minor, anchor = [], [], [], -1
+        for snv in usable:
+            k = reference.snvs.index(snv)
+            offset = _remap_snv_to_target_position(snv, locus)
+            if offset < locus.flanking_up_width:
+                segment, index, fam = "up", offset, up_fam[offset]
+            else:
+                index = offset - locus.flanking_up_width - 1
+                segment, fam = "dn", dn_fam[index]
+            coverage = int(fam.sum())
+            minor_count = int(fam[_ACGT.index(snv.allele_minor)]) \
+                if snv.allele_minor in _ACGT else 0
+            if k == reference.anchor_index:
+                anchor = len(snvs)
+            snvs.append(dataclasses.replace(
+                snv, segment=segment, string_index=index, coverage=coverage,
+                vaf_minor=minor_count / coverage if coverage else float("nan")))
+            major.append(reference.hap_major_profile[k])
+            minor.append(reference.hap_minor_profile[k])
+        nan = tuple(float("nan") for _ in snvs)
+        haplotypes[locus_id] = FlankingHaplotype(
+            locus_id=locus_id, snvs=tuple(snvs), hap_major_profile=tuple(major),
+            hap_minor_profile=tuple(minor), anchor_index=anchor, pair_discordance=nan,
+            pair_double_coverage=nan, max_discordance=float("nan"), n_anchor_families=None,
+            dropped_low_linkage_snvs=())
+    return PhasingPanel(snvs={k: list(h.snvs) for k, h in haplotypes.items()},
+                        haplotypes=haplotypes, assignments=anchored.assignments)

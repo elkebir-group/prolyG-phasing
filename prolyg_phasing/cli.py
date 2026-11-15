@@ -28,7 +28,7 @@ from prolyg_phasing.io.phasing_tables import (
 )
 from prolyg_phasing.locus_view import make_server
 from prolyg_phasing.phasing import PhasingPanel
-from prolyg_phasing.ref_phasing import assign_flanking_haplotypes_ref
+from prolyg_phasing.ref_phasing import assign_flanking_haplotypes_ref, target_phasing_panel
 
 _EXTRACT_DESCRIPTION = """\
 Walk a sorted, indexed BAM against a BED panel and write the extracted
@@ -271,6 +271,20 @@ def _add_phase_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _write_phasing_tables(panel: ExtractedPanel, phasing: PhasingPanel, out_dir: Path,
+                          min_pattern_freq: float) -> None:
+    """haplotype_calls.tsv, locus_summary.tsv and snv_calls.tsv of one phasing result."""
+    build_haplotype_calls(panel, phasing).to_csv(
+        out_dir / "haplotype_calls.tsv", sep="\t", index=False,
+    )
+    build_locus_summary(panel, phasing, min_pattern_freq=min_pattern_freq).to_csv(
+        out_dir / "locus_summary.tsv", sep="\t", index=False,
+    )
+    build_snv_calls(phasing).to_csv(
+        out_dir / "snv_calls.tsv", sep="\t", index=False,
+    )
+
+
 def _run_phase(args: argparse.Namespace) -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -284,16 +298,7 @@ def _run_phase(args: argparse.Namespace) -> None:
         vote_margin=args.vote_margin,
     )
     phasing.save_pickle(args.out_dir / "phasing.pkl")
-
-    build_haplotype_calls(panel, phasing).to_csv(
-        args.out_dir / "haplotype_calls.tsv", sep="\t", index=False,
-    )
-    build_locus_summary(panel, phasing, min_pattern_freq=args.min_pattern_freq).to_csv(
-        args.out_dir / "locus_summary.tsv", sep="\t", index=False,
-    )
-    build_snv_calls(phasing).to_csv(
-        args.out_dir / "snv_calls.tsv", sep="\t", index=False,
-    )
+    _write_phasing_tables(panel, phasing, args.out_dir, args.min_pattern_freq)
 
     n_loci = len(phasing.assignments)
     n_with_snvs = sum(1 for h in phasing.haplotypes.values() if len(h.snvs) > 0)
@@ -345,8 +350,10 @@ def _add_ref_phase_args(p: argparse.ArgumentParser) -> None:
                     help="Identifier recorded on the output, not used to "
                          "look up anything.")
     p.add_argument("--out-dir", required=True, type=Path,
-                    help="Directory for ref_phasing.pkl + "
-                         "ref_phasing_summary.tsv. Created if missing.")
+                    help="Directory for ref_phasing.pkl, ref_phasing_summary.tsv, "
+                         "and the haplotype_calls.tsv, snv_calls.tsv and "
+                         "locus_summary.tsv tables in the formats of `phase`. "
+                         "Created if missing.")
     p.add_argument("--min-informative-positions", type=int, default=1,
                     help="Minimum number of usable reference SNVs a target "
                          "read must have votes at (n_major + n_minor) to "
@@ -355,6 +362,11 @@ def _add_ref_phase_args(p: argparse.ArgumentParser) -> None:
                     help="Minimum |n_major - n_minor| vote margin a target "
                          "read needs to get a non-'unk' label; a tie or "
                          "near-tie within this margin labels 'unk'.")
+    p.add_argument(
+        "--min-pattern-freq", type=float, default=0.1,
+        help="Display threshold for locus_summary.tsv's admitted_patterns "
+             "column, as for `phase`.",
+    )
 
 
 def _run_ref_phase(args: argparse.Namespace) -> None:
@@ -379,6 +391,9 @@ def _run_ref_phase(args: argparse.Namespace) -> None:
     build_ref_phasing_summary(target_panel, anchored).to_csv(
         args.out_dir / "ref_phasing_summary.tsv", sep="\t", index=False,
     )
+    _write_phasing_tables(
+        target_panel, target_phasing_panel(target_panel, anchored, reference_haplotypes),
+        args.out_dir, args.min_pattern_freq)
 
     n_loci = len(anchored.assignments)
     n_phasable = sum(1 for v in anchored.usable_snvs.values() if len(v) > 0)

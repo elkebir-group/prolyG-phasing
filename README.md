@@ -93,8 +93,11 @@ the reference, despite the target never discovering that allele itself.
 `--reference-phasing-pkl phasing/phasing.pkl` also works in place of
 `--reference-snv-calls`; the two are equivalent, but the table is smaller —
 `phasing.pkl` also carries the O(reads) per-family phase-label assignments
-this command never needs. `ref-phase` always writes `ref_phasing.pkl` plus
-`ref_phasing_summary.tsv` into `--out-dir` (below).
+this command never needs. `ref-phase` always writes `ref_phasing.pkl`,
+`ref_phasing_summary.tsv`, and `haplotype_calls.tsv`, `snv_calls.tsv` and
+`locus_summary.tsv` in the formats `phase` writes, into `--out-dir`
+(below). So `view-loci --panel <target>.panel.db <ref-phase out-dir>` shows
+the target's labels.
 
 Run `prolyg-phasing <command> --help` for any command's full flag list.
 
@@ -212,6 +215,26 @@ snakemake -s workflow/Snakefile --cores N \
     distinct molecules, and the subset with a non-`unk` label.
   - `reads_total`/`reads_major`/`reads_minor`/`reads_unk` — raw read
     counts, split by vote outcome.
+
+- **`haplotype_calls.tsv`, `snv_calls.tsv`, `locus_summary.tsv`**
+  (`ref-phase`) — the same columns as from `phase`, for the target panel:
+  - `haplotype_calls.tsv` — one row per target panel row, in panel order,
+    with the ref-phase label.
+  - `snv_calls.tsv` — one row per reference SNV the target covers, all
+    `phased`. `segment` and `string_index` are the target's own position of
+    the SNV (re-located by `ref_pos`). `allele_major`/`allele_minor`,
+    `hap_major_base`/`hap_minor_base` and `is_anchor` are the reference's.
+    **`vaf_minor` and `coverage` are the target's own family counts at that
+    position**, counted as `find_informative_snvs` counts: `coverage` is
+    the target's ACGT family depth, and `vaf_minor` the target's families
+    with the reference's `allele_minor` over that depth (blank with no
+    depth). `pair_discordance` and `pair_double_coverage` are blank. A
+    locus whose target does not cover the reference anchor has no
+    `is_anchor` row.
+  - `locus_summary.tsv` — the profiles over those SNVs, and the target's
+    reads per label. `n_snvs_dropped_low_linkage` is `0`;
+    `max_discordance` and `n_anchor_families` are blank (not measured on
+    the target).
 
 ## Scope
 
