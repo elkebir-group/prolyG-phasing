@@ -74,6 +74,9 @@ canvas{display:block}
 .help{display:inline-block;width:15px;height:15px;line-height:15px;border-radius:50%;text-align:center;font-size:10px;background:var(--chip);color:var(--muted);cursor:help;text-transform:none;letter-spacing:0;vertical-align:1px}
 .sec{margin-top:10px}
 .rowband{position:absolute;left:0;box-sizing:border-box;pointer-events:none;border:2px solid var(--fg);background:none;border-radius:2px}
+.pair{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:stretch}
+.pair>.card,.pair>.slot{min-width:0;margin:0} .pair>.slot{display:block}
+.colhead{font-size:13px;font-weight:600}
 .zoomreset{font:inherit;font-size:11px;padding:0 8px;border:1px solid var(--line);border-radius:4px;background:var(--panel);color:var(--fg);cursor:pointer}
 .zoomreset:disabled{opacity:.4;cursor:default} .sec h3{font-size:12px;margin:0 0 4px;font-weight:600;display:flex;gap:8px;align-items:center}
 .sec h3 i{display:inline-block;width:10px;height:10px;border-radius:2px}
@@ -82,6 +85,8 @@ canvas{display:block}
 <header>
   <h1>PolyG Locus Reads <small>from panel.db · G strand</small></h1>
   <div class="seg" role="group" aria-label="Sample" id="samples"></div>
+  <span id="pickers" hidden><select id="pickA" aria-label="Left sample"></select> <select id="pickB" aria-label="Right sample"></select></span>
+  <label class="note"><input type="checkbox" id="side"> side by side</label>
   <input type="search" id="q" placeholder="Find locus, e.g. PolyG4320" aria-label="Find locus">
   <label class="note">bases next to each flank <input type="number" id="near" min="0" max="50" step="1" style="width:4em"></label>
 </header>
@@ -99,7 +104,7 @@ canvas{display:block}
 <script>
 // The page reads the locus list from /loci and one locus from /locus, served by
 // prolyg-phasing view-loci on the local machine.
-let LIST,sample=0,current=null,sortKey="locus",sortDir=1,filter="all";
+let LIST,sample=0,sample2=1,side=false,current=null,sortKey="locus",sortDir=1,filter="all";
 const $=s=>document.querySelector(s);
 const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const fmt=n=>n==null?"–":Number(n).toLocaleString();
@@ -115,7 +120,11 @@ async function load(){
   $("#near").value=LIST.near;
   $("#near").addEventListener("change",renderDetail);
   LIST.samples.forEach((s,k)=>{const b=document.createElement("button");b.textContent=s.sample;
-    b.onclick=()=>{sample=k;route()};$("#samples").appendChild(b)});
+    b.onclick=()=>{sample=k;route()};$("#samples").appendChild(b);
+    for(const id of ["#pickA","#pickB"]){const o=document.createElement("option");o.value=k;o.textContent=s.sample;$(id).appendChild(o)}});
+  $("#pickA").onchange=()=>{sample=+$("#pickA").value;route()};
+  $("#pickB").onchange=()=>{sample2=+$("#pickB").value;route()};
+  $("#side").onchange=()=>{side=$("#side").checked;route()};
   const F=[["all","All"],["noflank","No flank"],["noposition","Side with no position"],["noreads","No reads"]];
   for(const [k,l] of F){const b=document.createElement("button");b.textContent=l;b.dataset.k=k;b.onclick=()=>{filter=k;renderList()};$("#filters").appendChild(b)}
   document.querySelectorAll("#loci th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;if(sortKey===k)sortDir*=-1;else{sortKey=k;sortDir=k==="locus"||k==="status"?1:-1}renderList()});
@@ -124,16 +133,21 @@ async function load(){
   window.addEventListener("hashchange",fromHash);
   fromHash();
 }
+// The route: "#<sample>/<locus>" for one sample, "#<sample>+<sample>/<locus>"
+// for two side by side.
 function fromHash(){
-  const m=decodeURIComponent(location.hash.slice(1)).match(/^(\d+)\/(.+)$/);
-  sample=0;current=null;
-  if(m){sample=Math.min(+m[1],LIST.samples.length-1);current=LIST.loci.find(e=>e.locus===m[2])||null}
+  const m=decodeURIComponent(location.hash.slice(1)).match(/^(\d+)(?:\+(\d+))?\/(.*)$/);
+  const last=LIST.samples.length-1;sample=0;current=null;side=false;
+  if(m){sample=Math.min(+m[1],last);side=m[2]!==undefined;if(side)sample2=Math.min(+m[2],last);
+    current=LIST.loci.find(e=>e.locus===m[3])||null}
   renderAll();
 }
-function route(){location.hash=sample+"/"+encodeURIComponent(current?current.locus:"")}
+function route(){location.hash=sample+(side?"+"+sample2:"")+"/"+encodeURIComponent(current?current.locus:"")}
 function select(e){current=e;route()}
 function renderAll(){
   document.querySelectorAll("#samples button").forEach((b,k)=>b.setAttribute("aria-pressed",k===sample));
+  $("#side").checked=side;$("#samples").hidden=side;$("#pickers").hidden=!side;
+  $("#pickA").value=sample;$("#pickB").value=sample2;
   renderList();renderDetail();
 }
 function info(e){return e.samples[sample]}
@@ -167,25 +181,61 @@ function renderList(){
   const sel=tb.querySelector('tr[aria-selected="true"]'),wrap=$(".tablewrap");
   if(sel&&(sel.offsetTop<wrap.scrollTop+30||sel.offsetTop>wrap.scrollTop+wrap.clientHeight-20))wrap.scrollTop=sel.offsetTop-60;
 }
+async function fetchLocus(s){
+  const q=new URLSearchParams({sample:s,locus:current.locus,near:$("#near").value});
+  const resp=await fetch("locus?"+q);
+  return resp.ok?{data:await resp.json()}:{error:await resp.text()}}
+// One card per kind; a missing card is null. "col" names the column, so the
+// element ids of the two columns differ.
+function cardsOf(r,col){r._col=col;
+  return {head:headCard(r),ref:r.flanks?refCard(r):null,tract:tractCard(r),hist:histCard(r),
+    pile:r.flanks&&r.pileup.sections.some(S=>S.rows.length)?pileCard(r):null,
+    flanking:r.flanks&&r.pileup.sections.some(S=>S.rows.length)?flankingCard(r):null,
+    counters:counterCard(r)}}
 async function renderDetail(){
   const el=$("#detail");el.textContent="";
   if(!current){el.innerHTML=`<div class="card"><p class="note">Pick a locus in the list. All sequence is on the G strand.</p></div>`;return}
-  if(!info(current)){el.innerHTML=`<div class="card"><p class="note">${esc(current.locus)} is not in the panel of ${esc(LIST.samples[sample].sample)}.</p></div>`;return}
-  const want=current,ws=sample;
-  const q=new URLSearchParams({sample,locus:current.locus,near:$("#near").value});
-  const resp=await fetch("locus?"+q);
-  if(want!==current||ws!==sample)return;
-  if(!resp.ok){el.innerHTML=`<div class="card"><p class="note">${esc(await resp.text())}</p></div>`;return}
-  const r=await resp.json();
-  if(want!==current||ws!==sample)return;
+  const want=current,key=route_key();
+  if(!side){
+    if(!info(current)){el.innerHTML=`<div class="card"><p class="note">${esc(current.locus)} is not in the panel of ${esc(LIST.samples[sample].sample)}.</p></div>`;return}
+    const got=await fetchLocus(sample);
+    if(want!==current||key!==route_key())return;
+    if(got.error){el.innerHTML=`<div class="card"><p class="note">${esc(got.error)}</p></div>`;return}
+    const r=got.data;r._shared=null;const C=cardsOf(r,"");el.textContent="";
+    el.appendChild(C.head);if(C.ref)el.appendChild(C.ref);
+    const two=document.createElement("div");two.className="two";two.appendChild(C.tract);two.appendChild(C.hist);el.appendChild(two);
+    if(C.pile){el.appendChild(C.pile);el.appendChild(C.flanking)}
+    el.appendChild(C.counters);return}
+  const got=await Promise.all([sample,sample2].map(s=>current.samples[s]?fetchLocus(s):Promise.resolve({error:`${current.locus} is not in the panel of ${LIST.samples[s].sample}.`})));
+  if(want!==current||key!==route_key())return;
   el.textContent="";
-  el.appendChild(headCard(r));
-  if(r.flanks){el.appendChild(refCard(r))}
-  const two=document.createElement("div");two.className="two";
-  two.appendChild(tractCard(r));two.appendChild(histCard(r));el.appendChild(two);
-  if(r.flanks&&r.pileup.sections.some(S=>S.rows.length)){el.appendChild(pileCard(r));el.appendChild(flankingCard(r))}
-  el.appendChild(counterCard(r));
+  const rs=got.map(g=>g.data||null);
+  const shared={hist:mergeHistScale(...rs.filter(Boolean).map(histScale)),
+    tract:sharedTractWidth(...rs.filter(Boolean)),link:{}};
+  const cols=rs.map((r,i)=>r?(r._shared=shared,cardsOf(r,"ab"[i])):null);
+  const top=document.createElement("div");top.className="pair";
+  [sample,sample2].forEach(s=>{const d=document.createElement("div");d.className="colhead";d.textContent=LIST.samples[s].sample;top.appendChild(d)});
+  el.appendChild(top);
+  for(const kind of ["head","ref","tract","hist","pile","flanking","counters"]){
+    const row=document.createElement("div");row.className="pair";
+    cols.forEach((C,i)=>{let card=C?C[kind]:null;
+      if(!card&&!C&&kind==="head"){card=document.createElement("div");card.className="card";card.innerHTML=`<p class="note">${esc(got[i].error)}</p>`}
+      if(!card){card=document.createElement("div");card.className="slot"}
+      row.appendChild(card)});
+    if([...row.children].some(c=>c.className!=="slot"))el.appendChild(row)}
 }
+function route_key(){return sample+"/"+sample2+"/"+side}
+// Shared scales of the side-by-side view.
+function histScale(r){
+  const ks=r.largest_run.map(x=>x[0]);if(!ks.length)return null;
+  const SH=r.largest_run_shares;let ymax;
+  if(SH)ymax=Math.max(0.01,...Object.values(SH).flatMap(v=>v.map(x=>x[1])));
+  else{const tot=r.largest_run.reduce((a,x)=>a+x[1],0)||1;ymax=Math.max(0.01,...r.largest_run.map(x=>x[1]/tot))}
+  return {lo:Math.min(...ks,0),hi:Math.max(...ks,1),ymax}}
+function mergeHistScale(...scales){const v=scales.filter(Boolean);if(!v.length)return null;
+  return {lo:Math.min(...v.map(x=>x.lo)),hi:Math.max(...v.map(x=>x.hi)),ymax:Math.max(...v.map(x=>x.ymax))}}
+function tractWidth(r){return Math.max(1,...r.pileup.sections.flatMap(S=>S.rows.map(x=>x.tract.length)))}
+function sharedTractWidth(...rs){return rs.length?Math.max(...rs.map(tractWidth)):1}
 function flankText(f){
   if(f.status!=="recovered")return `<span class="mono">${esc(f.bases)}</span> <span class="pill p-warn">no reference position</span>`;
   return `<span class="mono">${esc(f.bases)}</span> <span class="note">${fmt(Math.min(f.outer_position,f.run_side_position))}–${fmt(Math.max(f.outer_position,f.run_side_position))}</span>`}
@@ -247,7 +297,8 @@ function histCard(r){
   const SH=r.largest_run_shares;
   c.innerHTML=`<h2>Largest G run per read, share of reads${SH?helpMark("One histogram per phase label: each shows the share of that label's reads at each largest G run, on one x axis and one y scale."):""}</h2>`;
   if(!r.largest_run.length){c.innerHTML+=`<p class="note">No reads.</p>`;return c}
-  const ks=r.largest_run.map(x=>x[0]);const lo=Math.min(...ks,0),hi=Math.max(...ks,1);
+  // One sample: its own axis and scale; side by side: the shared ones.
+  const sc=r._shared&&r._shared.hist?r._shared.hist:histScale(r);const lo=sc.lo,hi=sc.hi;
   const W=460,pl=36,bw=(W-pl-8)/(hi-lo+1);
   const axis=(y)=>{let s="";for(let k=lo;k<=hi;k++){const x=pl+(k-lo)*bw;
     if((k-lo)%Math.ceil((hi-lo+1)/14)===0)s+=`<text x="${x+bw/2}" y="${y}" font-size="9" text-anchor="middle" fill="var(--muted)">${k}</text>`}return s};
@@ -259,12 +310,12 @@ function histCard(r){
         :`<rect x="${x+1}" y="${H-pb-hh}" width="${Math.max(1,bw-2)}" height="${hh}" fill="${color}"><title>${tipOf(k,v,n)}</title></rect>`}
     return s+axis(H-2)+`</svg>`};
   if(!SH){const tot=r.largest_run.reduce((a,x)=>a+x[1],0)||1;const rows=r.largest_run.map(([k,n])=>[k,n/tot,n]);
-    const ymax=Math.max(...rows.map(x=>x[1]),0.01);
+    const ymax=sc.ymax;
     c.innerHTML+=panel(rows,ymax,190,"var(--muted)",(k,v,n)=>`largest G run ${k}: ${fmt(n)} reads (${pct(v)})`)+`<div class="note" style="text-align:center">largest G run</div>`;return c}
   const lab=["hap_major","hap_minor","unk"];
   const counts=Object.fromEntries(r.largest_run_labels);
   const totals=lab.map((_,i)=>r.largest_run_labels.reduce((a,[,v])=>a+v[i],0));
-  const ymax=Math.max(0.01,...lab.flatMap(l=>SH[l].map(x=>x[1])));
+  const ymax=sc.ymax;
   lab.forEach((l,i)=>{const rows=SH[l].map(([k,v])=>[k,v,(counts[k]||[0,0,0])[i]]);
     c.innerHTML+=`<div class="sec" style="margin-top:4px"><h3>${labelSwatch(l)}${LABEL_NAME[l].toLowerCase()} · ${fmt(totals[i])} reads</h3>`+
       panel(rows,ymax,78,l==="unk"?"outline":`var(${LABEL_COLOR[l]})`,(k,v,n)=>`${LABEL_NAME[l].toLowerCase()}, largest G run ${k}: ${fmt(n)} reads (${pct(v)} of ${LABEL_NAME[l].toLowerCase()})`)+`</div>`});
@@ -310,14 +361,14 @@ function pileCard(r){
   const snvCols=[...P.up,...P.dn].filter(x=>x.snv);
   const dropped=r.phasing?r.phasing.snvs.filter(v=>v.status!=="phased").sort((a,b)=>a.ref_pos-b.ref_pos):[];
   const help=(r.phasing?"Columns: the bases next to each flank, and one column per SNV of the phasing result. A phased SNV's header shows the major haplotype's base over the minor haplotype's base; a dropped SNV's header shows its two alleles. Major: the phasing code's name for the haplotype with the more common base at the anchor SNV; not maternal or paternal, and not the longer allele. Framed cell: the base differs from its row's haplotype base at that phased SNV. ":"Columns: the bases next to each flank. ")+"The flank columns show the panel's flank, not each read's bases. The tract is left-justified and padded with a line. A short mark between columns stands for skipped positions. Hover a column for its position and base counts.";
-  const secs=P.sections.map((S,k)=>`<div class="sec">${sectionHeading(r,S)}<div class="note">${fmt(S.n_rows)} rows, ${fmt(S.rows.length)} drawn${S.reads_not_drawn?` (${fmt(S.reads_not_drawn)} reads not drawn)`:""}.</div><div class="scroll" id="pilehost${k}"></div></div>`).join("");
+  const secs=P.sections.map((S,k)=>`<div class="sec">${sectionHeading(r,S)}<div class="note">${fmt(S.n_rows)} rows, ${fmt(S.rows.length)} drawn${S.reads_not_drawn?` (${fmt(S.reads_not_drawn)} reads not drawn)`:""}.</div><div class="scroll" id="pilehost${r._col}${k}"></div></div>`).join("");
   c.innerHTML=`<h2>Pile-up${helpMark(help)}</h2>
    <div class="note">Each row: reads with the same tract${r.phasing?", phase label":""} and bases at the shown columns. Empty cell: no base.${r.phasing?"":" No phasing result given for this sample."}</div>
    ${dropped.length?`<div class="note">Dropped SNVs, not in the profile: ${dropped.map(v=>`${fmt(v.ref_pos)} ${esc(v.allele_major)}/${esc(v.allele_minor)}`).join(", ")}.</div>`:""}
    ${secs}
    <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank band</span><span><i style="background:var(--tract)"></i>tract band</span>${r.phasing?`<span><i style="background:var(--snvband)"></i>phased SNV</span><span><i style="background:transparent;border:1.5px dashed var(--muted)"></i>dropped SNV</span><span>${labelSwatch("hap_major")}major</span><span>${labelSwatch("hap_minor")}minor</span><span>${labelSwatch("unk")}unk</span><span><i style="background:transparent;outline:2px solid var(--fg)"></i>differs from its haplotype</span>`:""}<span>faded bases: the panel's flank</span><span>— tract padding</span><span>▮ skipped positions</span></div>`;
-  queueMicrotask(()=>{const T=Math.max(1,...P.sections.flatMap(S=>S.rows.map(x=>x.tract.length)));
-    P.sections.forEach((S,k)=>drawPile(r,S,$("#pilehost"+k),T))});
+  queueMicrotask(()=>{const T=r._shared?r._shared.tract:tractWidth(r);
+    P.sections.forEach((S,k)=>drawPile(r,S,$("#pilehost"+r._col+k),T))});
   return c;
 }
 function layoutSide(cols,upstream){
@@ -403,12 +454,12 @@ function flankingCard(r){
   const c=document.createElement("div");c.className="card";
   c.innerHTML=`<h2>Flanking base counts${helpMark("Every flanking position of each side, in reference columns. Each side zooms on its own: drag over a range or turn the mouse wheel to zoom; when zoomed in, drag to pan and shift-drag to zoom further. Reset returns to the full width. At high zoom the ticks show reference coordinates and wide columns show each base count. Marks: the SNVs of the phasing result. Hover for the position and the counts.")}</h2>
    <div class="note">Coverage (top) and base shares (bottom) of the kept reads.</div>
-   <div id="flankhost"></div><div class="note" id="flanklist"></div>
+   <div id="flankhost${r._col}"></div><div class="note" id="flanklist${r._col}"></div>
    <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--bN)"></i>N</span>${r.phasing?`<span><i style="background:var(--snvband)"></i>SNV of the phasing result</span>`:""}</div>`;
   queueMicrotask(()=>drawFlanking(r));return c;
 }
 function drawFlanking(r){
-  const host=$("#flankhost");if(!host)return;const F=r.flanking,B=LIST.flanking_bases;
+  const host=$("#flankhost"+r._col);if(!host)return;const F=r.flanking,B=LIST.flanking_bases;
   host.textContent="";const marked=[];
   let maxCov=1;for(const S of [F.up,F.dn])for(const cnt of S.counts)maxCov=Math.max(maxCov,cnt.reduce((a,b)=>a+b,0));
   for(const [name,S] of [["upstream",F.up],["downstream",F.dn]]){
@@ -422,7 +473,7 @@ function drawFlanking(r){
     const cv=document.createElement("canvas");cv.style.cursor="crosshair";box.appendChild(cv);
     zoomSide(r,name,S,cv,reset,maxCov,B);
   }
-  $("#flanklist").innerHTML=marked.length?"Marked positions: "+marked.map(m=>`${m.name} ${fmt(m.at)}: `+B.split("").map((b,k)=>m.cnt[k]?`${b} ${pct(m.cnt[k]/m.cov)}`:"").filter(Boolean).join(" ")).join(" · "):(r.phasing?"The phasing result has no SNV at this locus.":"");
+  $("#flanklist"+r._col).innerHTML=marked.length?"Marked positions: "+marked.map(m=>`${m.name} ${fmt(m.at)}: `+B.split("").map((b,k)=>m.cnt[k]?`${b} ${pct(m.cnt[k]/m.cov)}`:"").filter(Boolean).join(" ")).join(" · "):(r.phasing?"The phasing result has no SNV at this locus.":"");
 }
 function zoomSide(r,name,S,cv,reset,maxCov,B){
   // The view is the index range [lo, hi) of this side's positions. Zoom and
@@ -450,17 +501,24 @@ function zoomSide(r,name,S,cv,reset,maxCov,B){
     reset.disabled=lo===0&&hi===n;
   }
   const at=x=>lo+x/W*(hi-lo);
+  // Side by side: the same side of the other column follows this view by
+  // reference coordinate (null: back to the full width).
+  const link=r._shared?r._shared.link:null,toIndex=c=>orient==="-"?S.start-c:c-S.start;
+  const me={apply(range){if(range===null){lo=0;hi=n}else{const a=toIndex(range[0]),b=toIndex(range[1]);lo=Math.min(a,b);hi=Math.max(a,b);clamp()}draw()}};
+  if(link)(link[name]=link[name]||[]).push(me);
+  const share=full=>{if(!link)return;const range=full?null:[coord(orient,S.start,lo),coord(orient,S.start,hi)];
+    for(const o of link[name])if(o!==me)o.apply(range)};
   const clamp=()=>{const span=Math.max(3,Math.min(n,hi-lo));if(lo<0){lo=0}if(lo+span>n){lo=n-span}hi=lo+span;lo=Math.max(0,lo)};
   cv.onwheel=e=>{e.preventDefault();const rc=cv.getBoundingClientRect(),x=e.clientX-rc.left,c=at(x),f=e.deltaY<0?0.8:1.25;
-    lo=c-(c-lo)*f;hi=c+(hi-c)*f;clamp();draw()};
+    lo=c-(c-lo)*f;hi=c+(hi-c)*f;clamp();draw();share(false)};
   cv.onmousedown=e=>{const rc=cv.getBoundingClientRect(),x=e.clientX-rc.left;
     const zoomed=lo>0||hi<n;drag={x0:x,x1:x,select:!zoomed||e.shiftKey,lo0:lo,hi0:hi}};
   window.addEventListener("mousemove",e=>{if(!drag)return;const rc=cv.getBoundingClientRect();drag.x1=e.clientX-rc.left;
-    if(!drag.select){const d=(drag.x1-drag.x0)/W*(drag.hi0-drag.lo0);lo=drag.lo0-d;hi=drag.hi0-d;clamp()}draw()});
+    if(!drag.select){const d=(drag.x1-drag.x0)/W*(drag.hi0-drag.lo0);lo=drag.lo0-d;hi=drag.hi0-d;clamp();share(false)}draw()});
   window.addEventListener("mouseup",()=>{if(!drag)return;
-    if(drag.select&&Math.abs(drag.x1-drag.x0)>4){const a=at(Math.min(drag.x0,drag.x1)),b=at(Math.max(drag.x0,drag.x1));lo=a;hi=b;clamp()}
+    if(drag.select&&Math.abs(drag.x1-drag.x0)>4){const a=at(Math.min(drag.x0,drag.x1)),b=at(Math.max(drag.x0,drag.x1));lo=a;hi=b;clamp();share(false)}
     drag=null;draw()});
-  reset.onclick=()=>{lo=0;hi=n;draw()};
+  reset.onclick=()=>{lo=0;hi=n;draw();share(true)};
   cv.onmousemove=e=>{if(drag||HELP.open)return;const rc=cv.getBoundingClientRect(),i=Math.floor(at(e.clientX-rc.left));
     if(i<0||i>=n){tip.hidden=true;return}
     const cnt=S.counts[i],cov=cnt.reduce((a,b)=>a+b,0);
@@ -469,7 +527,7 @@ function zoomSide(r,name,S,cv,reset,maxCov,B){
   cv.onmouseleave=()=>{if(!HELP.open)tip.hidden=true};
   draw();
   // Exposed for a headless check: zoom to a reference range.
-  cv.zoomTo=(a,b)=>{lo=a;hi=b;clamp();draw()};
+  cv.zoomTo=(a,b)=>{lo=a;hi=b;clamp();draw();share(false)};
 }
 function counterCard(r){
   const c=document.createElement("div");c.className="card";
