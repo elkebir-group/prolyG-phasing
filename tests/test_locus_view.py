@@ -184,6 +184,8 @@ def _snv_panel(tmp_path, *, mi_prefix="M"):
     locus = _make_locus(flanking_strings=SNV_STRINGS, counts=SNV_COUNTS, seqs=seqs,
                         up_width=8, dn_width=8)
     locus.mi = np.asarray([f"{mi_prefix}{i}" for i in range(n)], dtype=object)
+    # Rows 0 and 1 are one read family with two tracts: one (mi, strand) on two rows.
+    locus.mi[1] = locus.mi[0]
     db = tmp_path / f"{mi_prefix}.panel.db"
     ExtractedPanel(loci={"L1": locus}, n_alleles=8, provenance=_make_provenance()).save_db(db)
     out = tmp_path / f"{mi_prefix}_phasing"
@@ -223,16 +225,17 @@ def test_with_phasing_the_snv_columns_and_label_rows(tmp_path):
             assert counts == [0] * len(lv.FLANKING_BASES)
 
 
-def test_the_label_join_uses_mi_and_strand(tmp_path):
+def test_labels_join_the_panel_rows_in_order(tmp_path):
+    """haplotype_calls.tsv has one row per panel row, so one (mi, strand) can
+    occur twice; the join is by row position, checked by (mi, strand, count)."""
     db, out = _snv_panel(tmp_path)
     phasing = lv.PhasingIndex.read(out)
     locus = ExtractedPanel.load_db(db).loci["L1"]
     labels = pd.read_csv(out / "haplotype_calls.tsv", sep="\t", dtype=str)
-    got = phasing.labels_of("L1", locus.mi, locus.strand)
-    want = {(m, s): lab for m, s, lab in zip(labels.mi, labels.strand, labels.phase_label,
-                                             strict=True)}
-    assert [lv.PHASE_LABELS[g] for g in got] == \
-        [want[(str(m), str(s))] for m, s in zip(locus.mi, locus.strand, strict=True)]
+    assert (labels.mi == labels.mi.iloc[0]).sum() == 2
+    assert list(labels.mi) == [str(m) for m in locus.mi]
+    got = phasing.labels_of("L1", len(locus.mi))
+    assert [lv.PHASE_LABELS[g] for g in got] == list(labels.phase_label)
 
 
 def test_a_stale_pair_is_refused(tmp_path):

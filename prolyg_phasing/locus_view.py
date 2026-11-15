@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import hashlib
 import json
 import threading
 from array import array
@@ -71,19 +72,23 @@ def panel_sample(panel: ExtractedPanel) -> str:
 # ---------------------------------------------------------------------------
 
 
-def family_key(mi: str, strand: str) -> int:
-    """The index key of one read family strand: a 64-bit hash of ``(mi, strand)``.
+def _row_digest() -> hashlib.blake2b:
+    return hashlib.blake2b(digest_size=16)
 
-    The hash is stable within one process, which is the life of an index.
-    Two different keys share a hash with a chance near ``n**2 / 2**65`` per
-    locus of ``n`` families.
-    """
-    return hash((mi, strand)) & 0xFFFF_FFFF_FFFF_FFFF
+
+def _add_row(digest: hashlib.blake2b, mi: str, strand: str, count: str | int) -> None:
+    digest.update(f"{mi}\t{strand}\t{count}\n".encode())
 
 
 @dataclasses.dataclass
 class PhasingIndex:
     """The saved phasing result of one panel, read from its output directory.
+
+    ``haplotype_calls.tsv`` holds one row per panel row, in the panel's row
+    order within each locus: the same (mi, strand) can occur on several
+    rows (one per tract and flanking string of the read family). So the
+    index joins a label to a panel row by its position within the locus,
+    and checks the join by a digest of every row's (mi, strand, count).
 
     Attributes
     ----------
@@ -92,24 +97,24 @@ class PhasingIndex:
         Per locus, the rows of ``snv_calls.tsv`` (phased and dropped).
     summary : dict of str to dict
         Per locus, the `SUMMARY_FIELDS` of ``locus_summary.tsv``.
-    keys, labels : dict of str to ndarray
-        Per locus, the sorted :func:`family_key` of each ``(mi, strand)`` of
-        ``haplotype_calls.tsv`` (uint64), and its phase label as an index
-        into `PHASE_LABELS` (uint8).
+    labels : dict of str to ndarray
+        Per locus, each row's phase label as an index into `PHASE_LABELS`
+        (uint8), in row order.
+    digests : dict of str to bytes
+        Per locus, the digest of its rows' (mi, strand, count) in row order.
     """
 
     directory: str
     snvs: dict[str, list[dict]]
     summary: dict[str, dict]
-    keys: dict[str, np.ndarray]
     labels: dict[str, np.ndarray]
+    digests: dict[str, bytes]
 
     @classmethod
     def read(cls, directory: str | Path) -> PhasingIndex:
         """Read the three TSVs; ``haplotype_calls.tsv`` streams into compact arrays.
 
-        Raises ValueError naming the file when a ``(locus, mi, strand)``
-        occurs twice in ``haplotype_calls.tsv`` or a label is unknown.
+        Raises ValueError naming the file when a label is unknown.
         """
         d = Path(directory)
         snvs: dict[str, list[dict]] = {}
@@ -127,54 +132,51 @@ class PhasingIndex:
             summary = {row["locus_id"]: {k: row[k] for k in SUMMARY_FIELDS}
                        for row in csv.DictReader(f, delimiter="\t")}
         code = {label: i for i, label in enumerate(PHASE_LABELS)}
-        raw: dict[str, tuple[array, array]] = {}
+        raw: dict[str, array] = {}
+        digests: dict[str, hashlib.blake2b] = {}
         path = d / "haplotype_calls.tsv"
         with open(path, newline="") as f:
             reader = csv.reader(f, delimiter="\t")
             header = next(reader)
-            at = {name: header.index(name) for name in ("locus_id", "mi", "strand",
-                                                        "phase_label")}
+            at = [header.index(name) for name in ("locus_id", "mi", "strand", "count",
+                                                  "phase_label")]
             for row in reader:
-                label = code.get(row[at["phase_label"]])
-                if label is None:
-                    raise ValueError(f"{path}: unknown phase label {row[at['phase_label']]!r}")
-                k, lab = raw.setdefault(row[at["locus_id"]], (array("Q"), array("B")))
-                k.append(family_key(row[at["mi"]], row[at["strand"]]))
-                lab.append(label)
-        keys, labels = {}, {}
-        for locus, (k, lab) in raw.items():
-            k_arr, lab_arr = np.frombuffer(k, dtype=np.uint64), np.frombuffer(lab, dtype=np.uint8)
-            order = np.argsort(k_arr, kind="stable")
-            keys[locus], labels[locus] = k_arr[order], lab_arr[order]
-            if len(keys[locus]) > 1 and (np.diff(keys[locus]) == 0).any():
-                raise ValueError(f"{path}: {locus} has one (mi, strand) on two rows")
-        return cls(str(d), snvs, summary, keys, labels)
+                locus, mi, strand, count, label = (row[i] for i in at)
+                label_code = code.get(label)
+                if label_code is None:
+                    raise ValueError(f"{path}: unknown phase label {label!r}")
+                if locus not in raw:
+                    raw[locus], digests[locus] = array("B"), _row_digest()
+                raw[locus].append(label_code)
+                _add_row(digests[locus], mi, strand, count)
+        labels = {locus: np.frombuffer(a, dtype=np.uint8) for locus, a in raw.items()}
+        return cls(str(d), snvs, summary, labels,
+                   {locus: h.digest() for locus, h in digests.items()})
 
-    def labels_of(self, locus_id: str, mi: np.ndarray, strand: np.ndarray) -> np.ndarray:
-        """The phase label code of each panel row of a locus, by its ``(mi, strand)``."""
-        keys = self.keys[locus_id]
-        row_keys = np.fromiter((family_key(str(m), str(s)) for m, s in zip(mi, strand,
-                                                                            strict=True)),
-                               dtype=np.uint64, count=len(mi))
-        at = np.searchsorted(keys, row_keys)
-        return self.labels[locus_id][at]
+    def labels_of(self, locus_id: str, n_rows: int) -> np.ndarray:
+        """The phase label code of each of the `n_rows` panel rows of a locus."""
+        labels = self.labels.get(locus_id, np.zeros(0, dtype=np.uint8))
+        if len(labels) != n_rows:
+            raise RuntimeError(f"{self.directory}: {locus_id} has {len(labels)} labels for "
+                               f"{n_rows} panel rows")
+        return labels
 
     def check(self, panel: ExtractedPanel, panel_path: str | Path) -> None:
-        """Raise ValueError unless every locus's labeled ``(mi, strand)`` set equals the panel's.
+        """Raise ValueError unless every locus's rows match the panel's, in order.
 
-        The message names the panel, the phasing directory and the first
-        loci that differ. Decodes every locus of the panel once.
+        A locus matches when its labeled rows carry the same (mi, strand,
+        count) as the panel's rows, row by row. The message names the panel,
+        the phasing directory and the first loci that differ. Decodes every
+        locus of the panel once.
         """
-        # A locus with no reads has no rows in haplotype_calls.tsv.
-        differ = sorted(set(self.keys) - set(panel.loci))
-        no_rows = np.zeros(0, dtype=np.uint64)
+        empty = _row_digest().digest()
+        differ = sorted(set(self.labels) - set(panel.loci))
         for locus_id in panel.loci:
             locus = panel.loci[locus_id]
-            panel_keys = np.unique(np.fromiter(
-                (family_key(str(m), str(s)) for m, s in zip(locus.mi, locus.strand,
-                                                            strict=True)),
-                dtype=np.uint64, count=len(locus.mi)))
-            if not np.array_equal(panel_keys, self.keys.get(locus_id, no_rows)):
+            digest = _row_digest()
+            for mi, strand, count in zip(locus.mi, locus.strand, locus.count, strict=True):
+                _add_row(digest, mi, strand, int(count))
+            if digest.digest() != self.digests.get(locus_id, empty):
                 differ.append(locus_id)
             if len(differ) >= 5:
                 break
@@ -307,9 +309,8 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
 
     # The phasing result of this locus, if any.
     snvs = phasing.snvs.get(locus_id, []) if phasing is not None else []
-    row_label = (phasing.labels_of(locus_id, locus.mi, locus.strand)
-                 if phasing is not None and len(locus.mi) else
-                 np.full(len(count), -1, dtype=np.int64))
+    row_label = (phasing.labels_of(locus_id, len(count)).astype(np.int64)
+                 if phasing is not None else np.full(len(count), -1, dtype=np.int64))
 
     # Base counts over each side's flanking width, and the pile-up columns.
     up_w = int(locus.flanking_up_width)
