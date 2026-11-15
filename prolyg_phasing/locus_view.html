@@ -265,7 +265,23 @@ function histCard(r){
 function cellsText(cnt){const B=LIST.flanking_bases;return cnt?B.split("").map((b,k)=>cnt[k]?`${b} ${fmt(cnt[k])}`:"").filter(Boolean).join(" · ")||"no read base":""}
 function snvStatus(v){return v.status==="phased"?(v.is_anchor?"phased, anchor":"phased"):v.status==="dropped_low_linkage"?"dropped, low linkage":v.status}
 // A small "?" next to a card title; its hover holds the explanation.
-function helpMark(text){return ` <span class="help" title="${esc(text)}">?</span>`}
+function helpMark(text){return ` <span class="help" tabindex="0" role="button" aria-label="help" data-help="${esc(text)}">?</span>`}
+// The "?" help uses the page's #tip box: shown on hover, toggled (pinned) on
+// click or Enter. While it shows, the canvases leave #tip alone.
+const HELP={open:null,pinned:false};
+function helpShow(el){const tip=$("#tip"),rc=el.getBoundingClientRect();
+  tip.textContent=el.dataset.help;tip.hidden=false;HELP.open=el;
+  const w=Math.min(420,innerWidth-16);tip.style.maxWidth=w+"px";
+  const left=Math.max(8,Math.min(rc.right+8,innerWidth-w-8));tip.style.left=left+"px";
+  const top=rc.bottom+6,h=tip.offsetHeight;tip.style.top=(top+h>innerHeight-8?Math.max(8,rc.top-h-6):top)+"px"}
+function helpHide(){if(!HELP.open)return;$("#tip").hidden=true;HELP.open=null;HELP.pinned=false}
+document.addEventListener("mouseover",e=>{const el=e.target.closest(".help");if(el&&!HELP.pinned)helpShow(el)});
+document.addEventListener("mouseout",e=>{const el=e.target.closest(".help");if(el&&!HELP.pinned&&!el.contains(e.relatedTarget))helpHide()});
+document.addEventListener("click",e=>{const el=e.target.closest(".help");
+  if(el){if(HELP.pinned&&HELP.open===el){helpHide()}else{helpShow(el);HELP.pinned=true}return}
+  if(HELP.pinned)helpHide()});
+document.addEventListener("keydown",e=>{const el=e.target.closest&&e.target.closest(".help");
+  if(el&&(e.key==="Enter"||e.key===" ")){e.preventDefault();el.click()}if(e.key==="Escape")helpHide()});
 const LABEL_COLOR={hap_major:"--hmajor",hap_minor:"--hminor",unk:"--hunk"};
 const LABEL_NAME={hap_major:"Major",hap_minor:"Minor",unk:"Unk"};
 function profileText(r,label){
@@ -336,7 +352,7 @@ function drawPile(r,S,host,T){
   const band=document.createElement("div");band.className="rowband";band.hidden=true;
   wrap.appendChild(cv);wrap.appendChild(band);host.textContent="";host.appendChild(wrap);
   const tip=$("#tip");
-  cv.onmousemove=e=>{const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left-STRIPE,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
+  cv.onmousemove=e=>{if(HELP.open)return;const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left-STRIPE,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
     const kk=Math.floor((yy-HEAD)/RH),onRow=yy>=HEAD&&kk>=0&&kk<S.rows.length;
     band.hidden=!onRow;if(onRow){band.style.top=(HEAD+kk*RH-1)+"px";band.style.height=(RH+1)+"px";band.style.width=W+"px"}
     if(onRow&&(j<0||j>=width)){const row=S.rows[kk];tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";
@@ -355,7 +371,7 @@ function drawPile(r,S,host,T){
       html+=`<div class="mono">${fmt(row.reads)} reads${row.label?` · ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;
       if(sl.side){const ch=row[sl.side][sl.k];html+=`<div>this row's reads: ${ch==="."?"no base here":esc(ch)}${row.differs&&row.differs[sl.side].includes(sl.k)?" (differs from the row's haplotype base)":""}</div>`}}
     tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";tip.innerHTML=html};
-  cv.onmouseleave=()=>{tip.hidden=true;band.hidden=true};
+  cv.onmouseleave=()=>{band.hidden=true;if(!HELP.open)tip.hidden=true};
 }
 function flankingCard(r){
   const c=document.createElement("div");c.className="card";
@@ -419,12 +435,12 @@ function zoomSide(r,name,S,cv,reset,maxCov,B){
     if(drag.select&&Math.abs(drag.x1-drag.x0)>4){const a=at(Math.min(drag.x0,drag.x1)),b=at(Math.max(drag.x0,drag.x1));lo=a;hi=b;clamp()}
     drag=null;draw()});
   reset.onclick=()=>{lo=0;hi=n;draw()};
-  cv.onmousemove=e=>{if(drag)return;const rc=cv.getBoundingClientRect(),i=Math.floor(at(e.clientX-rc.left));
+  cv.onmousemove=e=>{if(drag||HELP.open)return;const rc=cv.getBoundingClientRect(),i=Math.floor(at(e.clientX-rc.left));
     if(i<0||i>=n){tip.hidden=true;return}
     const cnt=S.counts[i],cov=cnt.reduce((a,b)=>a+b,0);
     tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-320))+"px";tip.style.top=(e.clientY+12)+"px";
     tip.innerHTML=`<b>reference ${fmt(coord(orient,S.start,i))}</b> · ${name}, ${name==="upstream"?n-i:i+1} from the flank${S.snv.includes(i)?" · SNV of the phasing result":""}<div>${fmt(cov)} reads: `+B.split("").map((b,k)=>cnt[k]?`${b} ${fmt(cnt[k])} (${pct(cnt[k]/cov)})`:"").filter(Boolean).join(" · ")+`</div>`};
-  cv.onmouseleave=()=>{tip.hidden=true};
+  cv.onmouseleave=()=>{if(!HELP.open)tip.hidden=true};
   draw();
   // Exposed for a headless check: zoom to a reference range.
   cv.zoomTo=(a,b)=>{lo=a;hi=b;clamp();draw()};
