@@ -10,10 +10,11 @@ import pandas as pd
 import pytest
 
 import prolyg_phasing.cli as cli
+import prolyg_phasing.locus_view as lv
 from prolyg_phasing.io._flank_placement import FlankRecord
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import ExtractedPanel
-from prolyg_phasing.locus_view import locus_view_data, page_data
+from prolyg_phasing.locus_view import locus_blocks, locus_view_data
 from tests.test_extract_hand_built import INVARIANT, MOVED, _write_case
 from tests.test_flank_placement import flank_record
 
@@ -110,13 +111,35 @@ def test_a_side_with_no_position(tmp_path):
     assert sum(m["reads"] for m in view["molecules"]) == view["counters"]["n_reads"] > 0
 
 
-def test_page_data_labels_each_panel_and_reads_only_the_requested_loci(tmp_path):
+def test_locus_blocks_label_each_panel_and_name_a_missing_locus(tmp_path):
     db, _ = _panel(tmp_path, INVARIANT)
-    data = page_data([db, db], ["PolyG151-"])
-    assert [s["sample"] for s in data["samples"]] == ["sample", "sample"]
-    assert [b["locus"] for b in data["loci"][0]["blocks"]] == ["PolyG151-", "PolyG151-"]
+    panels = [(str(db), ExtractedPanel.load_db(db))] * 2
+    blocks = locus_blocks(panels, "PolyG151-")
+    assert [b["sample"] for b in blocks] == ["sample", "sample"]
     with pytest.raises(KeyError, match="holds no locus PolyG9"):
-        page_data([db], ["PolyG9"])
+        locus_blocks(panels, "PolyG9")
+
+
+def test_the_rows_past_the_cap_are_counted(tmp_path, monkeypatch):
+    """With a cap of 1 row, the other rows and their reads are counted, and the
+    kept row is the one with the most reads."""
+    _, panel = _panel(tmp_path, MOVED)
+    locus = panel.loci["PolyG5177+"]
+    full = locus_view_data("PolyG5177+", locus, "S")
+    assert full["n_rows"] == len(full["molecules"]) >= 2
+    assert (full["rows_not_shown"], full["reads_not_shown"]) == (0, 0)
+    monkeypatch.setattr(lv, "ROWS_SHOWN", 1)
+    capped = locus_view_data("PolyG5177+", locus, "S")
+    assert capped["molecules"] == full["molecules"][:1]
+    assert capped["n_rows"] == full["n_rows"]
+    assert capped["rows_not_shown"] == full["n_rows"] - 1
+    assert capped["reads_not_shown"] + capped["molecules"][0]["reads"] == locus.n_reads
+
+
+def _page_blocks(page: str) -> dict:
+    """The JSON elements of a written page, by element id."""
+    return {m.group(1): json.loads(m.group(2)) for m in re.finditer(
+        r'<script type="application/json" id="([^"]+)">(.*?)</script>', page, re.S)}
 
 
 def test_the_cli_writes_a_page_with_each_requested_locus(tmp_path):
@@ -125,12 +148,15 @@ def test_the_cli_writes_a_page_with_each_requested_locus(tmp_path):
     cli.main(["view-loci", "--panel", str(db), "--loci", "PolyG151+,PolyG151-",
               "--out", str(out)])
     page = out.read_text()
-    payload = re.search(r'<script id="data" type="application/json">(.*?)</script>', page,
-                        re.S).group(1)
-    data = json.loads(payload)
-    assert [entry["locus"] for entry in data["loci"]] == ["PolyG151+", "PolyG151-"]
-    for entry in data["loci"]:
+    elements = _page_blocks(page)
+    # One data element per locus, and the index.
+    assert set(elements) == {"locus-PolyG151+", "locus-PolyG151-", "index"}
+    assert [name for name, _ in elements["index"]["loci"]] == ["PolyG151+", "PolyG151-"]
+    for name in ("PolyG151+", "PolyG151-"):
+        entry = elements[f"locus-{name}"]
         (block,) = entry["blocks"]
+        assert elements["index"]["loci"][["PolyG151+", "PolyG151-"].index(name)][1] == \
+            [[panel.loci[name].n_reads, "recovered"]]
         reads = Counter()
         for m in block["molecules"]:
             reads[m["tract"]] += m["reads"]

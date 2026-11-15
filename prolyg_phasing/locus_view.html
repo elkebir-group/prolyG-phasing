@@ -41,6 +41,12 @@ table.ctr td{padding:1px 8px;border-bottom:1px solid var(--line)} table.ctr td.n
 .gap{color:transparent} .pad{color:transparent}
 .fl{background:var(--flank)} .tr{background:var(--tract)}
 .ruler{color:var(--muted)} .refrow td{border-bottom:1px solid var(--line)}
+.list{max-height:40vh;overflow:auto;margin-top:6px}
+#loci{border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+#loci th{position:sticky;top:0;background:var(--panel);text-align:left;font-size:11px;color:var(--muted);padding:2px 8px}
+#loci td{padding:1px 8px;border-bottom:1px solid var(--line)} #loci td.n{text-align:right}
+#loci tbody tr{cursor:pointer} #loci tbody tr:hover,#loci tr[aria-selected="true"]{background:var(--chip)}
+.mono{font-family:var(--mono)} #filter{font:inherit;padding:4px 8px;width:16em}
 .legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--muted);margin-top:4px}
 .legend i{display:inline-block;width:12px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
 </style>
@@ -57,10 +63,14 @@ gap. The panel holds no reference bases outside the tract, so the reference row 
 <div class="legend"><span><i class="fl"></i>flank (the donor's flank bases)</span><span><i class="tr"></i>tract</span>
 <span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span>
 <span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span></div>
-<div id="app"></div>
-<script id="data" type="application/json">__DATA__</script>
+<div class="card"><h3>Loci</h3>
+<input type="search" id="filter" placeholder="Filter loci, e.g. PolyG4320" aria-label="Filter loci">
+<p class="note" id="samples"></p>
+<div class="list"><table id="loci"><thead></thead><tbody></tbody></table></div></div>
+<div id="app"><p class="note">Click a locus to draw it.</p></div>
+__DATA__
 <script>
-const DATA=JSON.parse(document.getElementById("data").textContent);
+const DATA=JSON.parse(document.getElementById("index").textContent);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const fmt=n=>n==null?"–":Number(n).toLocaleString();
 function cells(s,cls){let o="";for(const ch of s){
@@ -84,7 +94,7 @@ function flankText(f){if(!f)return "–";
   const p=f.ref_positions;return `${esc(f.bases)} at ${fmt(p[0])}..${fmt(p[p.length-1])}`}
 function alignment(b){
   const f=b.flanks,fl=b.flanking,o=b.ref_orientation;
-  const mols=b.molecules,shown=mols.slice(0,DATA.rows_shown);
+  const shown=b.molecules;
   const upW=fl.up_width,dnW=fl.dn_width;
   const tw=Math.max(b.reference_tract.length,...shown.map(m=>m.tract.length));
   const up=f.upstream.bases,dn=f.downstream.bases;
@@ -99,9 +109,8 @@ function alignment(b){
   for(const m of shown){
     h+=`<tr title="tract length ${m.tract.length}; runs ${esc(runs(m.tract))}"><td class="meta">${fmt(m.reads)}</td><td class="meta">${fmt(m.molecules)}</td><td>${cells(m.up_flanking)}${cells(up,"fl")}${cells(m.tract,"tr")}${cells(dn,"fl")}${cells(m.dn_flanking)}${pad(rowLen(m.tract))}</td></tr>`}
   h+=`</table>`;
-  const rest=mols.slice(DATA.rows_shown),restReads=rest.reduce((a,m)=>a+m.reads,0);
-  h+=`<p class="note">${fmt(mols.length)} distinct rows; "reads" is the read count and "mols" the molecules (distinct MI).`+
-    (rest.length?` ${fmt(rest.length)} more rows with ${fmt(restReads)} reads are not drawn.`:"")+`</p></div>`;
+  h+=`<p class="note">${fmt(b.n_rows)} distinct rows; "reads" is the read count and "mols" the molecules (distinct MI).`+
+    (b.rows_not_shown?` ${fmt(b.rows_not_shown)} more rows with ${fmt(b.reads_not_shown)} reads are not drawn.`:"")+`</p></div>`;
   return h}
 function runs(t){return t.split(/[^G]+/).map(s=>s.length).join(",")||"0"}
 function block(b){
@@ -119,8 +128,32 @@ function block(b){
   else h+=`<p class="note">This locus has no flank in this sample (${esc(st)}), so it has no reads.</p>`;
   return h+`</div>`}
 const app=document.getElementById("app");
-let html=`<p class="note">Samples: `+DATA.samples.map(s=>`${esc(s.sample)} (flanks from ${esc(s.flank_table_sample)})`).join("; ")+`.</p>`;
-for(const L of DATA.loci){html+=`<section id="${esc(L.locus)}"><h2>${esc(L.locus)}</h2>`+L.blocks.map(block).join("")+`</section>`}
-app.innerHTML=html;
+document.getElementById("samples").textContent="Samples: "+DATA.samples.map(
+  s=>`${s.sample} (flanks from ${s.flank_table_sample})`).join("; ")+".";
+document.querySelector("#loci thead").innerHTML="<tr><th>Locus</th>"+DATA.samples.map(
+  s=>`<th>${esc(s.sample)}: reads</th><th>status</th>`).join("")+"</tr>";
+function drawList(){
+  const q=document.getElementById("filter").value.trim().toLowerCase();
+  const rows=DATA.loci.filter(([name])=>name.toLowerCase().includes(q));
+  document.querySelector("#loci tbody").innerHTML=rows.map(([name,per])=>
+    `<tr data-locus="${esc(name)}" tabindex="0"><td class="mono">${esc(name)}</td>`+
+    per.map(([n,st])=>`<td class="n">${fmt(n)}</td><td>${esc(st)}</td>`).join("")+"</tr>").join("");
+}
+function openLocus(name){
+  const el=document.getElementById("locus-"+name);
+  if(!el)return;
+  const L=JSON.parse(el.textContent);
+  app.innerHTML=`<section><h2>${esc(L.locus)}</h2>`+L.blocks.map(block).join("")+`</section>`;
+  document.querySelectorAll("#loci tbody tr").forEach(
+    tr=>tr.setAttribute("aria-selected",tr.dataset.locus===name?"true":"false"));
+  if(location.hash.slice(1)!==name)history.replaceState(null,"","#"+name);
+}
+document.getElementById("filter").addEventListener("input",drawList);
+document.querySelector("#loci tbody").addEventListener("click",e=>{
+  const tr=e.target.closest("tr");if(tr)openLocus(tr.dataset.locus)});
+document.querySelector("#loci tbody").addEventListener("keydown",e=>{
+  const tr=e.target.closest("tr");if(tr&&e.key==="Enter")openLocus(tr.dataset.locus)});
+drawList();
+if(location.hash.length>1)openLocus(decodeURIComponent(location.hash.slice(1)));
 </script>
 </html>
