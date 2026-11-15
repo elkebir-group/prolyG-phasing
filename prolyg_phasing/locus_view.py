@@ -42,8 +42,9 @@ PILEUP_ROWS = 150
 # Tract rows kept per locus and sample; the rest are counted.
 TRACT_ROWS = 200
 
-# Default page setting: the flanking bases shown next to each flank.
-NEAR_BASES = 6
+# Default page setting: the flanking bases shown next to each flank. The page
+# reads it from /loci, and /locus uses it when the request names none.
+NEAR_BASES = 0
 
 # Characters counted at each flanking position. "." (no read base) is not
 # counted.

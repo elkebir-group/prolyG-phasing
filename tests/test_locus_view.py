@@ -97,11 +97,11 @@ def test_column_coordinates_on_each_strand(tmp_path, orientation):
     base, and the near columns run to it."""
     _, panel = _panel(tmp_path, MOVED)
     name = f"PolyG5177{orientation}"
-    view = locus_view_data(name, panel.loci[name], "S")
+    view = locus_view_data(name, panel.loci[name], "S", near=6)
     step = 1 if orientation == "+" else -1
     up_cols, dn_cols = view["pileup"]["up"], view["pileup"]["dn"]
     assert [c["index"] for c in up_cols] == list(range(
-        view["flanking"]["up"]["width"] - lv.NEAR_BASES, view["flanking"]["up"]["width"]))
+        view["flanking"]["up"]["width"] - 6, view["flanking"]["up"]["width"]))
     assert up_cols[-1]["position"] == view["flanks"]["upstream"]["outer_position"] - step
     assert dn_cols[0]["position"] == view["flanks"]["downstream"]["outer_position"] + step
     assert up_cols[-1]["position"] == ref_pos_at_offset(
@@ -327,7 +327,9 @@ def test_the_near_setting_changes_the_columns(server):
 
     assert up_columns("near=2") == [4, 6, 7]
     assert up_columns("near=0") == [4]
-    assert up_columns("") == list(range(2, 8))
+    assert up_columns("near=6") == list(range(2, 8))
+    # The default shows no bases next to the flank: only the SNV column.
+    assert lv.NEAR_BASES == 0 and up_columns("") == [4]
 
 
 # ---------------------------------------------------------------------------
