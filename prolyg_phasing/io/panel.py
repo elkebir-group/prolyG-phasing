@@ -129,14 +129,17 @@ class ExtractedLocus:
     ref_orientation: str        # '+' (G-dominant) / '-' (C-dominant; revcomp'd)
     # None when the matched normal had no reference window at this locus. A
     # flank with empty `ref_positions` has no reference position: it sets
-    # the tract, and its side has no flanking bases (width 0, start 0).
+    # the tract, and its side has no flanking bases (width 0, start -1).
     upstream_flank: FlankRecord | None
     downstream_flank: FlankRecord | None
 
-    # QC counters. `n_alignments_placed` counts the reads with at least one
-    # placement, of any value. A read dropped by the flank placement counts
-    # once in `n_alignments_drop_flank`. It also counts once per side with
-    # no match of that side's flank, or, with both matches, once in
+    # QC counters. Of the alignments that overlap the BED interval
+    # (`n_alignments_overlap_locus`), the MAPQ, SA, TLEN and missing-MI drops
+    # leave the reads that reach the flank step. `n_alignments_placed` counts
+    # the reads with at least one placement, of any value. A read dropped by
+    # the flank placement counts once in `n_alignments_drop_flank`. It also
+    # counts once per side with no match of that side's flank, or, with both
+    # matches, once in
     # `n_alignments_drop_no_placement` (no upstream match before a
     # downstream match), `n_alignments_drop_no_bed_base` (no such pair holds
     # a base aligned inside the BED interval) or
@@ -145,6 +148,7 @@ class ExtractedLocus:
     n_alignments_drop_mapq: int
     n_alignments_drop_sa: int
     n_alignments_drop_tlen: int
+    n_alignments_drop_no_mi: int
     n_alignments_placed: int
     n_alignments_drop_flank: int
     n_alignments_drop_upstream_flank_not_placed: int
@@ -564,6 +568,7 @@ _PANEL_META_COLUMNS = [
     "n_alignments_drop_mapq",
     "n_alignments_drop_sa",
     "n_alignments_drop_tlen",
+    "n_alignments_drop_no_mi",
     *_FLANK_DROP_COLUMNS,
     "n_read_pairs",
     "n_read_pairs_drop_disagree",
@@ -591,7 +596,7 @@ _DB_LOCI_COLUMNS = [c for c in _PANEL_META_COLUMNS if c != "n_alleles"]
 _DB_INT_COLUMNS = {
     "n_runs", "bed_start", "bed_end", "max_observed_run_length",
     "n_alignments_overlap_locus", "n_alignments_drop_mapq",
-    "n_alignments_drop_sa", "n_alignments_drop_tlen",
+    "n_alignments_drop_sa", "n_alignments_drop_tlen", "n_alignments_drop_no_mi",
     *_FLANK_DROP_COLUMNS, "n_read_pairs",
     "n_read_pairs_drop_disagree", "n_read_pairs_merged", "n_reads",
     "g_walk_up", "g_walk_dn", "flanking_up_width", "flanking_dn_width",
@@ -793,6 +798,7 @@ def _locus_meta_row(locus: ExtractedLocus) -> dict:
         "n_alignments_drop_mapq": locus.n_alignments_drop_mapq,
         "n_alignments_drop_sa": locus.n_alignments_drop_sa,
         "n_alignments_drop_tlen": locus.n_alignments_drop_tlen,
+        "n_alignments_drop_no_mi": locus.n_alignments_drop_no_mi,
         **{c: getattr(locus, c) for c in _FLANK_DROP_COLUMNS},
         "n_read_pairs": locus.n_read_pairs,
         "n_read_pairs_drop_disagree": locus.n_read_pairs_drop_disagree,

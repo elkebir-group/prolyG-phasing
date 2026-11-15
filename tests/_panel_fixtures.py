@@ -98,6 +98,7 @@ def _make_locus_single_run(
         n_alignments_drop_mapq=0,
         n_alignments_drop_sa=0,
         n_alignments_drop_tlen=0,
+        n_alignments_drop_no_mi=0,
         **ZERO_FLANK_DROPS,
         n_read_pairs=int(count.sum()),
         n_read_pairs_drop_disagree=0, n_read_pairs_merged=0,

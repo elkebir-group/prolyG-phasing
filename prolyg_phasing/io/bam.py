@@ -565,8 +565,10 @@ def filtered_alignments(
     max_tlen`` and an empty stored sequence. An alignment that overlaps
     the BED interval must also carry an MI tag. For alignments that
     overlap the BED interval, the filters add to the
-    ``n_alignments_overlap_locus`` and ``n_alignments_drop_{mapq,sa,tlen}``
-    counters in `qc`.
+    ``n_alignments_overlap_locus`` and
+    ``n_alignments_drop_{mapq,sa,tlen,no_mi}`` counters in `qc`. The
+    overlapping alignments it yields are the overlap count less these four
+    drops.
     """
     for r in bam.fetch(chrom, fetch_start, fetch_end):
         if r.flag & _DROP_FLAGS:
@@ -604,6 +606,7 @@ def filtered_alignments(
         if bed_overlap:
             qc["n_alignments_overlap_locus"] += 1
             if not r.has_tag("MI"):
+                qc["n_alignments_drop_no_mi"] += 1
                 continue
         yield r, bed_overlap
 
@@ -617,6 +620,7 @@ def new_locus_qc() -> dict[str, int]:
         "n_alignments_drop_mapq": 0,
         "n_alignments_drop_sa": 0,
         "n_alignments_drop_tlen": 0,
+        "n_alignments_drop_no_mi": 0,
         "n_alignments_placed": 0,
         "n_alignments_drop_flank": 0,
         "n_alignments_drop_upstream_flank_not_placed": 0,

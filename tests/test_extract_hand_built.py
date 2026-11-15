@@ -355,6 +355,22 @@ def test_a_locus_with_no_flank_pair_has_that_status_and_no_reads(tmp_path):
     assert panel.loci["PolyG151-"].reference_window_status == "recovered"
 
 
+def test_an_mi_less_read_counts_as_a_drop(tmp_path):
+    """The whole-contig read of each contig overlaps the BED interval and has
+    no MI tag. Overlap less the MAPQ, SA, TLEN and MI drops is the reads that
+    reach the flank step: those placed plus those the flanks drop."""
+    bam, bed, flanks = _write_case(tmp_path, INVARIANT)
+    panel = extract_panel(bam, bed, flanks)
+    for o in ORIENTATIONS:
+        locus = panel.loci[f"PolyG151{o}"]
+        assert locus.n_alignments_drop_no_mi == 1
+        reach_flanks = (locus.n_alignments_overlap_locus - locus.n_alignments_drop_mapq
+                        - locus.n_alignments_drop_sa - locus.n_alignments_drop_tlen
+                        - locus.n_alignments_drop_no_mi)
+        assert reach_flanks == locus.n_alignments_placed + locus.n_alignments_drop_flank
+        assert reach_flanks == sum(_overlaps_tract(INVARIANT, p) for p in placements(INVARIANT))
+
+
 def test_provenance_names_the_flank_table_sample(tmp_path):
     bam, bed, flanks = _write_case(tmp_path, INVARIANT, sample="SD_NORMAL")
     assert extract_panel(bam, bed, flanks).provenance.flank_table_sample == "SD_NORMAL"

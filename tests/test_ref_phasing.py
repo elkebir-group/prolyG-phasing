@@ -87,7 +87,7 @@ def _make_locus(
         max_observed_run_length=6,
         n_alignments_overlap_locus=total * 2,
         n_alignments_drop_mapq=0, n_alignments_drop_sa=0,
-        n_alignments_drop_tlen=0, **ZERO_FLANK_DROPS,
+        n_alignments_drop_tlen=0, n_alignments_drop_no_mi=0, **ZERO_FLANK_DROPS,
         n_read_pairs=total, n_read_pairs_drop_disagree=0, n_read_pairs_merged=0, n_reads=total,
         flanking_id=flanking_id, flanking_seq=flanking_seq,
         flanking_up_width=up_width, flanking_dn_width=dn_width,
