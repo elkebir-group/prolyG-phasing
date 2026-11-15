@@ -278,12 +278,22 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
     pileup : dict
         ``up`` and ``dn``: the columns, in drawing order, each with
         ``index``, ``position``, ``counts``, ``coverage`` and, at an SNV,
-        ``snv`` (its row of ``snv_calls.tsv``). ``rows``: one per distinct
-        (tract, phase label, the read's own base or "." at every shown
-        column), with ``tract``, ``label`` (None without phasing),
+        ``snv`` (its row of ``snv_calls.tsv``). ``sections``: one per phase
+        label in `PHASE_LABELS` order (one, label None, without phasing),
+        each with ``label``, ``reads``, ``rows``, ``n_rows`` and
+        ``reads_not_drawn`` (the rows past `PILEUP_ROWS` in the section).
+        A row is one distinct (tract, the read's own base or "." at every
+        shown column) within the section, with ``tract``, ``label``,
         ``reads``, ``up`` and ``dn`` (the bases at the side's columns, one
-        character each). Sorted by reads. ``n_rows`` and
-        ``reads_not_drawn`` count the rows past `PILEUP_ROWS`.
+        character each), sorted by reads. A major or minor row also has
+        ``differs``: per side, the column numbers of the phased SNVs where
+        the row's base is not its label's haplotype base in
+        ``snv_calls.tsv`` (empty cells never count).
+    tract_labels : list or None
+        With phasing, per listed tract, its reads by phase label in
+        `PHASE_LABELS` order.
+    largest_run_labels : list or None
+        With phasing, ``[largest G run, reads by phase label]``.
     """
     counters = {f.name: int(getattr(locus, f.name))
                 for f in dataclasses.fields(locus)
@@ -345,15 +355,46 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
 
     up_cells, dn_cells = shown("up"), shown("dn")
     row_key = seq
-    for part in (row_label.astype(str), up_cells[:len(seq)], dn_cells[:len(seq)]):
+    for part in (up_cells[:len(seq)], dn_cells[:len(seq)]):
         row_key = np.char.add(np.char.add(row_key, "\t"), part)
-    keys, key_reads, _ = _summed(row_key, count)
-    key_order = np.lexsort((keys, -key_reads))
-    rows = []
-    for k in key_order[:PILEUP_ROWS]:
-        tract, label, up, dn = str(keys[k]).split("\t")
-        rows.append({"tract": tract, "reads": int(key_reads[k]), "up": up, "dn": dn,
-                     "label": PHASE_LABELS[int(label)] if int(label) >= 0 else None})
+    # One section per phase label (one section, label None, without phasing).
+    labels_present = list(range(len(PHASE_LABELS))) if phasing is not None else [-1]
+    snv_cols = {name: [(k, c["snv"]) for k, c in enumerate(columns[name])
+                       if "snv" in c and c["snv"]["status"] == "phased"]
+                for name in ("up", "dn")}
+    sections = []
+    for code in labels_present:
+        in_label = row_label == code
+        keys, key_reads, _ = _summed(row_key[in_label], count[in_label])
+        key_order = np.lexsort((keys, -key_reads))
+        label = PHASE_LABELS[code] if code >= 0 else None
+        rows = []
+        for k in key_order[:PILEUP_ROWS]:
+            tract, up, dn = str(keys[k]).split("\t")
+            row = {"tract": tract, "reads": int(key_reads[k]), "up": up, "dn": dn,
+                   "label": label}
+            if label in ("hap_major", "hap_minor"):
+                field = f"{label}_base"
+                row["differs"] = {
+                    name: [k2 for k2, snv in snv_cols[name]
+                           if bases[k2] != "." and bases[k2] != snv[field]]
+                    for name, bases in (("up", up), ("dn", dn))}
+            rows.append(row)
+        sections.append({"label": label, "rows": rows, "n_rows": len(keys),
+                         "reads": int(key_reads.sum()),
+                         "reads_not_drawn": int(key_reads[key_order[PILEUP_ROWS:]].sum())})
+
+    # Reads per tract and per largest G run, by phase label.
+    tract_labels = largest_labels = None
+    if phasing is not None:
+        by_label = np.zeros((len(tracts), len(PHASE_LABELS)), dtype=np.int64)
+        np.add.at(by_label, (tract_of_row, row_label), count)
+        tract_labels = [by_label[i].tolist() for i in order[:TRACT_ROWS]]
+        runs: dict[int, np.ndarray] = {}
+        for i, tract in enumerate(tracts):
+            run = max(parse_run_lengths(str(tract)))
+            runs[run] = runs.get(run, 0) + by_label[i]
+        largest_labels = [[k, v.tolist()] for k, v in sorted(runs.items())]
 
     flanks = None
     if locus.upstream_flank is not None:
@@ -369,16 +410,16 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
         "flanks": flanks,
         "counters": counters,
         "tracts": tract_rows,
+        "tract_labels": tract_labels,
         "n_tracts": len(tracts),
         "tract_reads_not_shown": int(tract_reads[order[TRACT_ROWS:]].sum()),
         "largest_run": [[k, v] for k, v in sorted(largest.items())],
+        "largest_run_labels": largest_labels,
         "near": near,
         "phasing": None if phasing is None else {
             "summary": phasing.summary.get(locus_id), "snvs": snvs},
         "flanking": flanking,
-        "pileup": {"up": columns["up"], "dn": columns["dn"], "rows": rows,
-                   "n_rows": len(keys),
-                   "reads_not_drawn": int(key_reads[key_order[PILEUP_ROWS:]].sum())},
+        "pileup": {"up": columns["up"], "dn": columns["dn"], "sections": sections},
     }
 
 

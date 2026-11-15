@@ -7,6 +7,7 @@ import threading
 import urllib.error
 import urllib.request
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -45,6 +46,15 @@ def _rows(locus):
         yield str(seq), up, dn, str(mi), int(count)
 
 
+def _all_rows(view):
+    """The drawn pile-up rows of every section, in section order."""
+    return [row for section in view["pileup"]["sections"] for row in section["rows"]]
+
+
+def _section_sum(view, field):
+    return sum(section[field] for section in view["pileup"]["sections"])
+
+
 # ---------------------------------------------------------------------------
 # The data of one locus
 # ---------------------------------------------------------------------------
@@ -76,7 +86,7 @@ def test_tracts_and_base_counts_match_the_panel_rows(tmp_path, case):
                     if row[column][i] != ".":
                         want[row[column][i]] += row[4]
                 assert per_base == [want[b] for b in lv.FLANKING_BASES]
-        assert sum(r["reads"] for r in view["pileup"]["rows"]) == locus.n_reads
+        assert sum(r["reads"] for r in _all_rows(view)) == locus.n_reads
 
 
 
@@ -112,7 +122,7 @@ def _exact_rows(view, rows, label_of=None):
 
 def _drawn(view):
     return {(r["tract"], r["label"], r["up"], r["dn"]): r["reads"]
-            for r in view["pileup"]["rows"]}
+            for r in _all_rows(view)}
 
 
 def test_without_phasing_a_row_is_exact(tmp_path):
@@ -127,10 +137,10 @@ def test_without_phasing_a_row_is_exact(tmp_path):
         assert view["flanking"]["up"]["snv"] == view["flanking"]["dn"]["snv"] == []
         want = _exact_rows(view, list(_rows(locus)))
         assert _drawn(view) == dict(want)
-        assert len(view["pileup"]["rows"]) == view["pileup"]["n_rows"] == len(want)
+        assert len(_all_rows(view)) == _section_sum(view, "n_rows") == len(want)
     plus = locus_view_data("PolyG5177+", panel.loci["PolyG5177+"], "S")
     minus = locus_view_data("PolyG5177-", panel.loci["PolyG5177-"], "S")
-    assert plus["pileup"]["rows"] == minus["pileup"]["rows"]
+    assert _all_rows(plus) == _all_rows(minus)
 
 
 def test_the_rows_past_the_cap_are_counted(tmp_path, monkeypatch):
@@ -139,9 +149,9 @@ def test_the_rows_past_the_cap_are_counted(tmp_path, monkeypatch):
     full = locus_view_data("PolyG5177+", locus, "S")
     monkeypatch.setattr(lv, "PILEUP_ROWS", 0)
     capped = locus_view_data("PolyG5177+", locus, "S")
-    assert capped["pileup"]["rows"] == []
-    assert capped["pileup"]["n_rows"] == full["pileup"]["n_rows"]
-    assert capped["pileup"]["reads_not_drawn"] == locus.n_reads
+    assert _all_rows(capped) == []
+    assert _section_sum(capped, "n_rows") == _section_sum(full, "n_rows")
+    assert _section_sum(capped, "reads_not_drawn") == locus.n_reads
 
 
 def test_a_side_with_no_position(tmp_path):
@@ -153,8 +163,8 @@ def test_a_side_with_no_position(tmp_path):
     assert view["flanks"]["downstream"]["status"] == "no_reference_position"
     assert view["flanking"]["dn"] == {"start": -1, "width": 0, "counts": [], "snv": []}
     assert view["pileup"]["dn"] == []
-    assert all(r["dn"] == "" for r in view["pileup"]["rows"])
-    assert sum(r["reads"] for r in view["pileup"]["rows"]) == view["counters"]["n_reads"] > 0
+    assert all(r["dn"] == "" for r in _all_rows(view))
+    assert sum(r["reads"] for r in _all_rows(view)) == view["counters"]["n_reads"] > 0
 
 
 def test_a_locus_with_no_reference_window(tmp_path):
@@ -165,7 +175,7 @@ def test_a_locus_with_no_reference_window(tmp_path):
 
     _, panel = _panel(tmp_path, INVARIANT, edit=no_window)
     view = locus_view_data("PolyG151+", panel.loci["PolyG151+"], "S")
-    assert view["flanks"] is None and view["tracts"] == [] and view["pileup"]["rows"] == []
+    assert view["flanks"] is None and view["tracts"] == [] and _all_rows(view) == []
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +228,7 @@ def test_with_phasing_the_snv_columns_and_label_rows(tmp_path):
     assert _drawn(view) == dict(want)
     # The cell at the SNV is each read's own base: "." where it has none.
     at_snv = view["pileup"]["up"].index(snv_cols[0])
-    assert {(r["label"], r["up"][at_snv]) for r in view["pileup"]["rows"]} == \
+    assert {(r["label"], r["up"][at_snv]) for r in _all_rows(view)} == \
         {("hap_major", "C"), ("hap_minor", "G"), ("unk", ".")}
 
 
@@ -297,9 +307,9 @@ def test_the_server_serves_the_page_the_list_and_one_locus(server):
     assert listing["samples"][0]["phasing"] is not None and listing["samples"][1]["phasing"] is None
     with_phasing = json.loads(_get(server + "/locus?sample=0&locus=L1")[1])
     without = json.loads(_get(server + "/locus?sample=1&locus=L1")[1])
-    assert {r["label"] for r in with_phasing["pileup"]["rows"]} == \
+    assert {r["label"] for r in _all_rows(with_phasing)} == \
         {"hap_major", "hap_minor", "unk"}
-    assert {r["label"] for r in without["pileup"]["rows"]} == {None}
+    assert {r["label"] for r in _all_rows(without)} == {None}
 
 
 def test_an_unknown_sample_or_locus_is_404(server):
@@ -318,3 +328,114 @@ def test_the_near_setting_changes_the_columns(server):
     assert up_columns("near=2") == [4, 6, 7]
     assert up_columns("near=0") == [4]
     assert up_columns("") == list(range(2, 8))
+
+
+# ---------------------------------------------------------------------------
+# Haplotype sections, headers, marks and per-label counts
+# ---------------------------------------------------------------------------
+
+
+def _phased_view(tmp_path, **kwargs):
+    db, out = _snv_panel(tmp_path)
+    phasing = lv.PhasingIndex.read(out)
+    locus = ExtractedPanel.load_db(db).loci["L1"]
+    labels = pd.read_csv(out / "haplotype_calls.tsv", sep="\t", dtype=str)
+    return locus, list(labels.phase_label), locus_view_data("L1", locus, "S", phasing=phasing,
+                                                            **kwargs)
+
+
+def test_sections_come_in_label_order_each_with_its_own_cap(tmp_path, monkeypatch):
+    locus, labels, full = _phased_view(tmp_path)
+    sections = full["pileup"]["sections"]
+    assert [s["label"] for s in sections] == ["hap_major", "hap_minor", "unk"]
+    reads = Counter()
+    for label, n in zip(labels, locus.count, strict=True):
+        reads[label] += int(n)
+    assert [s["reads"] for s in sections] == [reads[x] for x in lv.PHASE_LABELS]
+    assert all(r["label"] == s["label"] for s in sections for r in s["rows"])
+    monkeypatch.setattr(lv, "PILEUP_ROWS", 1)
+    capped = locus_view_data("L1", locus, "S", phasing=lv.PhasingIndex.read(
+        tmp_path / "M_phasing"))
+    for s, f in zip(capped["pileup"]["sections"], sections, strict=True):
+        assert s["rows"] == f["rows"][:1] and s["n_rows"] == f["n_rows"]
+        assert s["reads_not_drawn"] == s["reads"] - s["rows"][0]["reads"]
+
+
+def test_tract_and_largest_run_counts_by_label(tmp_path):
+    locus, labels, view = _phased_view(tmp_path)
+    by_tract, by_run = {}, {}
+    for seq, label, n in zip(locus.seq, labels, locus.count, strict=True):
+        k = lv.PHASE_LABELS.index(label)
+        by_tract.setdefault(str(seq), [0, 0, 0])[k] += int(n)
+        by_run.setdefault(max(parse_run_lengths(str(seq))), [0, 0, 0])[k] += int(n)
+    assert {t: v for (t, _, _), v in zip(view["tracts"], view["tract_labels"], strict=True)} == \
+        by_tract
+    assert dict(map(tuple, ((k, tuple(v)) for k, v in view["largest_run_labels"]))) == \
+        {k: tuple(v) for k, v in by_run.items()}
+
+
+def test_without_phasing_there_is_one_section_and_no_label_counts(tmp_path):
+    db, _ = _snv_panel(tmp_path)
+    view = locus_view_data("L1", ExtractedPanel.load_db(db).loci["L1"], "S")
+    assert [s["label"] for s in view["pileup"]["sections"]] == [None]
+    assert view["tract_labels"] is None and view["largest_run_labels"] is None
+    assert all("differs" not in r for r in _all_rows(view))
+
+
+def test_the_header_bases_are_the_haplotype_bases(tmp_path):
+    """At upstream index 1 the T is the less common allele, but it goes with
+    the anchor's major base C, so the phasing makes T the major haplotype's
+    base there; the column carries hap_major_base T."""
+    from tests.test_phasing_tables import _make_locus, _make_provenance
+
+    strings = ["ATAACAAT|TTTTTTTT", "A.AACAAT|TTTTTTTT", "AAAAGAAT|TTTTTTTT"]
+    counts = [20, 50, 30]
+    locus = _make_locus(flanking_strings=strings, counts=counts, seqs=["GGGGGG"] * 100,
+                        up_width=8, dn_width=8)
+    db = tmp_path / "flip.panel.db"
+    ExtractedPanel(loci={"L1": locus}, n_alleles=8, provenance=_make_provenance()).save_db(db)
+    out = tmp_path / "flip_phasing"
+    cli.main(["phase", "--panel-db", str(db), "--out-dir", str(out)])
+    view = locus_view_data("L1", ExtractedPanel.load_db(db).loci["L1"], "S", near=0,
+                           phasing=lv.PhasingIndex.read(out))
+    snv = {c["index"]: c["snv"] for c in view["pileup"]["up"]}
+    assert (snv[1]["allele_major"], snv[1]["allele_minor"]) == ("A", "T")
+    assert (snv[1]["hap_major_base"], snv[1]["hap_minor_base"]) == ("T", "A")
+    assert snv[4]["is_anchor"] and snv[4]["hap_major_base"] == "C"
+    page = (Path(lv.__file__).parent / "locus_view.html").read_text()
+    assert "phased?v.hap_major_base:v.allele_major" in page
+
+
+def test_the_mark_is_at_exactly_the_cells_that_differ_from_the_label_haplotype(tmp_path):
+    """A hand-made phasing result: phased SNVs at upstream indices 1 (major A,
+    minor T) and 4 (major C, minor G), and one dropped SNV at index 6."""
+    from tests.test_phasing_tables import _make_locus
+
+    strings = ["AAAACAAT|", "ATAACAAT|", "AAAAGAAT|", "A.AAGACT|", "AAAACAAT|"]
+    labels = ["hap_major", "hap_major", "hap_minor", "hap_minor", "unk"]
+    locus = _make_locus(flanking_strings=strings, counts=[1] * 5, seqs=["GGGGGG"] * 5,
+                        up_width=8, dn_width=0)
+
+    def snv(i, major, minor, status="phased"):
+        return {"segment": "up", "string_index": i, "ref_pos": 1000 + i,
+                "allele_major": major, "allele_minor": minor, "vaf_minor": 0.4,
+                "coverage": 5, "status": status, "is_anchor": i == 4,
+                "hap_major_base": major if status == "phased" else "",
+                "hap_minor_base": minor if status == "phased" else ""}
+
+    phasing = lv.PhasingIndex(
+        "hand", {"L1": [snv(1, "A", "T"), snv(4, "C", "G"),
+                        snv(6, "A", "C", "dropped_low_linkage")]},
+        {"L1": {}}, {"L1": np.array([lv.PHASE_LABELS.index(x) for x in labels],
+                                    dtype=np.uint8)}, {})
+    view = locus_view_data("L1", locus, "S", near=0, phasing=phasing)
+    columns = [c["index"] for c in view["pileup"]["up"]]
+    assert columns == [1, 4, 6]
+    marks = {(r["label"], r["up"]): r.get("differs") for r in _all_rows(view)}
+    assert marks == {
+        ("hap_major", "AC" + "A"): {"up": [], "dn": []},     # no difference
+        ("hap_major", "TC" + "A"): {"up": [0], "dn": []},    # T at index 1: the minor base
+        ("hap_minor", "AG" + "A"): {"up": [0], "dn": []},    # A at index 1: the major base
+        ("hap_minor", ".G" + "C"): {"up": [], "dn": []},     # empty cell, dropped SNV: no mark
+        ("unk", "AC" + "A"): None,                           # unk rows are never marked
+    }

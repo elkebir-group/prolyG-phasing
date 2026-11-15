@@ -67,6 +67,13 @@ canvas{display:block}
 .tip{position:fixed;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.18);max-width:min(90vw,640px);z-index:20}
 .tip .mono{word-break:break-all}
 .note{color:var(--muted);font-size:12px;max-width:95ch}
+:root{--hmajor:#0072B2;--hminor:#E69F00;--hunk:#9a9a9a}
+.help{display:inline-block;width:15px;height:15px;line-height:15px;border-radius:50%;text-align:center;font-size:10px;background:var(--chip);color:var(--muted);cursor:help;text-transform:none;letter-spacing:0;vertical-align:1px}
+.sec{margin-top:10px}
+.rowband{position:absolute;left:0;pointer-events:none;outline:2px solid var(--fg);background:rgba(127,127,127,.12);border-radius:2px}
+.zoomreset{font:inherit;font-size:11px;padding:0 8px;border:1px solid var(--line);border-radius:4px;background:var(--panel);color:var(--fg);cursor:pointer}
+.zoomreset:disabled{opacity:.4;cursor:default} .sec h3{font-size:12px;margin:0 0 4px;font-weight:600;display:flex;gap:8px;align-items:center}
+.sec h3 i{display:inline-block;width:10px;height:10px;border-radius:2px}
 #loading{color:var(--muted)}
 </style>
 <header>
@@ -159,7 +166,7 @@ function renderList(){
 }
 async function renderDetail(){
   const el=$("#detail");el.textContent="";
-  if(!current){el.innerHTML=`<div class="card"><p class="note">Pick a locus in the list. Every sequence is on the G strand: at a "-" locus the read bases are reverse-complemented and reference coordinates fall from left to right.</p></div>`;return}
+  if(!current){el.innerHTML=`<div class="card"><p class="note">Pick a locus in the list. All sequence is on the G strand.</p></div>`;return}
   if(!info(current)){el.innerHTML=`<div class="card"><p class="note">${esc(current.locus)} is not in the panel of ${esc(LIST.samples[sample].sample)}.</p></div>`;return}
   const want=current,ws=sample;
   const q=new URLSearchParams({sample,locus:current.locus,near:$("#near").value});
@@ -198,7 +205,7 @@ function headCard(r){
     <div><b>Dropped, share of the alignments over the locus</b>${drops.filter(([,f])=>k[f]).map(([l,f])=>`${l} ${share(k[f])}`).join(" · ")||"none"}</div>
    </div>`;
   const ph=r.phasing;
-  if(!ph)c.innerHTML+=`<p class="note">No phasing result was given for this sample: the pile-up rows group by tract only.</p>`;
+  if(!ph)c.innerHTML+=`<p class="note">No phasing result given for this sample.</p>`;
   else if(ph.summary){const m=ph.summary;c.innerHTML+=`<div class="kv">
     <div><b>Haplotype profiles</b><span class="mono">major ${esc(m.hap_major_profile||"–")} · minor ${esc(m.hap_minor_profile||"–")}</span></div>
     <div><b>SNVs</b>${fmt(+m.n_snvs_phased)} phased · ${fmt(+m.n_snvs_dropped_low_linkage)} dropped (low linkage)</div>
@@ -216,136 +223,211 @@ function refCard(r){
     band+=cell("",`background:${z};height:6px;opacity:.75`);
     idx+=cell(i%5===0?`<span style="font-size:9px;color:var(--muted)">${i}</span>`:"")}
   const line=x=>`<div style="white-space:nowrap;height:16px">${x}</div>`;
-  c.innerHTML=`<h2>Reference on the G strand</h2><div class="scroll"><div class="refstrip">${line(band)+line(bases)+line(idx)}</div></div>
-   <div class="legend"><span><i style="background:var(--flank)"></i>flanks (10 bases, from the matched normal's reads)</span><span><i style="background:var(--tract)"></i>reference tract</span>
-   ${t?"":"<span>No reference tract: a flank has no reference position.</span>"}</div>
-   <p class="note">The panel holds no reference bases outside the flanks.</p>`;
+  c.innerHTML=`<h2>Reference on the G strand${helpMark("The flanks are the matched normal's flank bases. The panel holds no reference bases outside the flanks.")}</h2><div class="scroll"><div class="refstrip">${line(band)+line(bases)+line(idx)}</div></div>
+   <div class="legend"><span><i style="background:var(--flank)"></i>flanks</span><span><i style="background:var(--tract)"></i>reference tract</span>
+   ${t?"":"<span>No reference tract: a flank has no reference position.</span>"}</div>`;
   return c;
 }
 function tractSeq(s){return s.split("").map(b=>b==="G"?b:`<span style="color:${baseColor(b)};font-weight:600">${b}</span>`).join("")||"(empty)"}
 function tractCard(r){
   const c=document.createElement("div");c.className="card";const total=r.counters.n_reads;const max=Math.max(1,...r.tracts.map(x=>x[1]));
-  c.innerHTML=`<h2>Tracts</h2><div class="note">${fmt(total)} reads, ${fmt(r.n_tracts)} distinct tracts${r.tract_reads_not_shown?`; ${fmt(r.n_tracts-r.tracts.length)} tracts with ${fmt(r.tract_reads_not_shown)} reads not listed`:""}. Molecules: distinct read families (MI).</div>
-   <div class="scroll" style="max-height:420px;overflow:auto"><table><thead><tr><th class="num">Reads</th><th class="num">Molecules</th><th class="num">Share</th><th></th><th>Tract</th></tr></thead><tbody>${r.tracts.map(([s,n,m])=>`<tr><td class="num">${fmt(n)}</td><td class="num">${fmt(m)}</td><td class="num">${pct(n/total)}</td>
+  const L=r.tract_labels,lab=["hap_major","hap_minor","unk"];
+  const head=L?lab.map(l=>`<th class="num" style="color:var(${LABEL_COLOR[l]})">${LABEL_NAME[l]}</th>`).join(""):"";
+  c.innerHTML=`<h2>Tracts${helpMark("Molecules: distinct read families (MI)."+(L?" Major, minor, unk: reads by phase label.":""))}</h2><div class="note">${fmt(total)} reads, ${fmt(r.n_tracts)} tracts${r.tract_reads_not_shown?` (${fmt(r.n_tracts-r.tracts.length)} tracts, ${fmt(r.tract_reads_not_shown)} reads not listed)`:""}.</div>
+   <div class="scroll" style="max-height:420px;overflow:auto"><table><thead><tr><th class="num">Reads</th>${head}<th class="num">Molecules</th><th class="num">Share</th><th></th><th>Tract</th></tr></thead><tbody>${r.tracts.map(([s,n,m],i)=>`<tr><td class="num">${fmt(n)}</td>${L?L[i].map((v,k)=>`<td class="num" style="color:var(${LABEL_COLOR[lab[k]]})">${fmt(v)}</td>`).join(""):""}<td class="num">${fmt(m)}</td><td class="num">${pct(n/total)}</td>
    <td><span style="display:inline-block;height:8px;width:${Math.round(60*n/max)}px;background:var(--accent);border-radius:2px"></span></td>
    <td class="mono">${tractSeq(s)}</td></tr>`).join("")}</tbody></table></div>`;
   return c;
 }
 function histCard(r){
   const c=document.createElement("div");c.className="card";
-  c.innerHTML=`<h2>Largest G run per read, share of reads</h2>`;
+  c.innerHTML=`<h2>Largest G run per read, share of reads${r.largest_run_labels?helpMark("Bars stack the reads by phase label; hover a bar for the three counts."):""}</h2>`;
   if(!r.largest_run.length){c.innerHTML+=`<p class="note">No reads.</p>`;return c}
   const h=Object.fromEntries(r.largest_run),ks=r.largest_run.map(x=>x[0]);const lo=Math.min(...ks,0),hi=Math.max(...ks,1);
   const tot=r.largest_run.reduce((a,x)=>a+x[1],0)||1;const ymax=Math.max(...ks.map(k=>h[k]/tot),0.01);
+  const L=r.largest_run_labels?Object.fromEntries(r.largest_run_labels):null,lab=["hap_major","hap_minor","unk"];
   const W=460,H=190,pl=36,pb=26,bw=(W-pl-8)/(hi-lo+1);
   let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px" role="img" aria-label="Largest G run histogram">`;
   for(const t of [0,0.25,0.5,0.75,1]){const v=t*ymax,y=H-pb-(H-pb-8)*t;s+=`<line x1="${pl}" x2="${W-4}" y1="${y}" y2="${y}" stroke="var(--line)"/><text x="${pl-4}" y="${y+3}" font-size="9" text-anchor="end" fill="var(--muted)">${(100*v).toFixed(0)}%</text>`}
-  for(let k=lo;k<=hi;k++){const x=pl+(k-lo)*bw,a=(h[k]||0)/tot,hh=(H-pb-8)*a/ymax;
-    s+=`<rect x="${x+1}" y="${H-pb-hh}" width="${Math.max(1,bw-2)}" height="${hh}" fill="var(--accent)"><title>largest G run ${k}: ${fmt(h[k]||0)} reads (${pct(a)})</title></rect>`;
+  const hgt=v=>(H-pb-8)*v/tot/ymax;
+  for(let k=lo;k<=hi;k++){const x=pl+(k-lo)*bw,n=h[k]||0;
+    if(L){const parts=L[k]||[0,0,0];let y=H-pb;
+      const title=`<title>largest G run ${k}: ${fmt(n)} reads (${pct(n/tot)}) · major ${fmt(parts[0])} · minor ${fmt(parts[1])} · unk ${fmt(parts[2])}</title>`;
+      s+=`<g>${title}`;parts.forEach((v,i)=>{const hh=hgt(v);y-=hh;if(v)s+=`<rect x="${x+1}" y="${y}" width="${Math.max(1,bw-2)}" height="${hh}" fill="var(${LABEL_COLOR[lab[i]]})"/>`});s+=`</g>`}
+    else{const hh=hgt(n);s+=`<rect x="${x+1}" y="${H-pb-hh}" width="${Math.max(1,bw-2)}" height="${hh}" fill="var(--accent)"><title>largest G run ${k}: ${fmt(n)} reads (${pct(n/tot)})</title></rect>`}
     if((k-lo)%Math.ceil((hi-lo+1)/14)===0)s+=`<text x="${x+bw/2}" y="${H-pb+12}" font-size="9" text-anchor="middle" fill="var(--muted)">${k}</text>`}
   s+=`<text x="${(W+pl)/2}" y="${H-2}" font-size="10" text-anchor="middle" fill="var(--muted)">largest G run</text></svg>`;
-  c.innerHTML+=s;return c;
+  c.innerHTML+=s;
+  if(L){const totals=[0,0,0];for(const [,v] of r.largest_run_labels)v.forEach((x,i)=>totals[i]+=x);
+    c.innerHTML+=`<div class="legend">${lab.map((l,i)=>`<span><i style="background:var(${LABEL_COLOR[l]})"></i>${LABEL_NAME[l].toLowerCase()} ${fmt(totals[i])} reads</span>`).join("")}</div>`}
+  return c;
 }
 function cellsText(cnt){const B=LIST.flanking_bases;return cnt?B.split("").map((b,k)=>cnt[k]?`${b} ${fmt(cnt[k])}`:"").filter(Boolean).join(" · ")||"no read base":""}
 function snvStatus(v){return v.status==="phased"?(v.is_anchor?"phased, anchor":"phased"):v.status==="dropped_low_linkage"?"dropped, low linkage":v.status}
+// A small "?" next to a card title; its hover holds the explanation.
+function helpMark(text){return ` <span class="help" title="${esc(text)}">?</span>`}
+const LABEL_COLOR={hap_major:"--hmajor",hap_minor:"--hminor",unk:"--hunk"};
+const LABEL_NAME={hap_major:"Major",hap_minor:"Minor",unk:"Unk"};
+function profileText(r,label){
+  const field=label==="hap_major"?"hap_major_base":"hap_minor_base";
+  const ph=r.phasing.snvs.filter(v=>v.status==="phased").sort((a,b)=>a.ref_pos-b.ref_pos);
+  return ph.map(v=>`${esc(v[field])} at ${fmt(v.ref_pos)}${v.is_anchor?" (anchor)":""}`).join(", ")||"no phased SNV"}
+function sectionHeading(r,S){
+  if(!S.label)return "";
+  const sw=`<i style="background:var(${LABEL_COLOR[S.label]})"></i>`;
+  if(S.label==="unk")return `<h3>${sw}Unk: these reads have no label (no phased SNV covered, or a tied vote) · ${fmt(S.reads)} reads</h3>`;
+  return `<h3>${sw}${LABEL_NAME[S.label]} haplotype: ${profileText(r,S.label)} · ${fmt(S.reads)} reads</h3>`}
 function pileCard(r){
   const c=document.createElement("div");c.className="card";const P=r.pileup;
   const snvCols=[...P.up,...P.dn].filter(x=>x.snv);
-  const how=r.phasing?`Columns: the ${r.near} flanking bases next to each flank and one column per SNV of the phasing result (${snvCols.length} here; header: the two bases and the status).`
-    :`Columns: the ${r.near} flanking bases next to each flank. No phasing result was given for this sample.`;
-  c.innerHTML=`<h2>Pile-up</h2>
-   <div class="note">G strand. ${how} A row is the reads that share one tract${r.phasing?", one phase label (major, minor or unk)":""} and the same own base at every shown column, drawn once with their read count. An empty cell means the reads have no base there (a gap, a clip, or a base below the quality limit). Hover a column for its position and the base counts of all reads. A short mark stands for the positions skipped between two columns. The flank columns show the panel's flank, not each read's bases. The upstream flank sits in fixed columns; the tract is left-justified and padded (a line) to the longest tract drawn.
-   ${fmt(P.n_rows)} rows${P.reads_not_drawn?`; ${fmt(P.reads_not_drawn)} reads in rows not drawn (the ${fmt(P.rows.length)} rows with the most reads are drawn)`:""}.</div>
-   <div class="scroll" id="pilehost"></div>
-   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank</span><span><i style="background:var(--tract)"></i>tract</span><span><i style="background:var(--warn)"></i>SNV of the phasing result</span><span>empty cell: no read base</span></div>`;
-  queueMicrotask(()=>drawPile(r));return c;
+  const dropped=r.phasing?r.phasing.snvs.filter(v=>v.status!=="phased").sort((a,b)=>a.ref_pos-b.ref_pos):[];
+  const help=(r.phasing?"Columns: the bases next to each flank, and one column per SNV of the phasing result. A phased SNV's header shows the major haplotype's base over the minor haplotype's base; a dropped SNV's header shows its two alleles. Major: the phasing code's name for the haplotype with the more common base at the anchor SNV; not maternal or paternal, and not the longer allele. Framed cell: the base differs from its row's haplotype base at that phased SNV. ":"Columns: the bases next to each flank. ")+"The flank columns show the panel's flank, not each read's bases. The tract is left-justified and padded with a line. A short mark between columns stands for skipped positions. Hover a column for its position and base counts.";
+  const secs=P.sections.map((S,k)=>`<div class="sec">${sectionHeading(r,S)}<div class="note">${fmt(S.n_rows)} rows, ${fmt(S.rows.length)} drawn${S.reads_not_drawn?` (${fmt(S.reads_not_drawn)} reads not drawn)`:""}.</div><div class="scroll" id="pilehost${k}"></div></div>`).join("");
+  c.innerHTML=`<h2>Pile-up${helpMark(help)}</h2>
+   <div class="note">Each row: reads with the same tract${r.phasing?", phase label":""} and bases at the shown columns. Empty cell: no base.${r.phasing?"":" No phasing result given for this sample."}</div>
+   ${dropped.length?`<div class="note">Dropped SNVs, not in the profile: ${dropped.map(v=>`${fmt(v.ref_pos)} ${esc(v.allele_major)}/${esc(v.allele_minor)}`).join(", ")}.</div>`:""}
+   ${secs}
+   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--tract)"></i>tract</span><span><i style="background:var(--warn)"></i>phased SNV</span><span><i style="background:var(--muted)"></i>dropped SNV</span>${r.phasing?`<span><i style="background:var(--hmajor)"></i>major</span><span><i style="background:var(--hminor)"></i>minor</span><span><i style="background:var(--hunk)"></i>unk</span><span><i style="background:transparent;outline:2px solid var(--fg)"></i>differs from its haplotype</span>`:""}<span><i style="background:var(--flank);opacity:.45"></i>panel's flank</span><span>— tract padding</span><span>▮ skipped positions</span></div>`;
+  queueMicrotask(()=>{const T=Math.max(1,...P.sections.flatMap(S=>S.rows.map(x=>x.tract.length)));
+    P.sections.forEach((S,k)=>drawPile(r,S,$("#pilehost"+k),T))});
+  return c;
 }
 function layoutSide(cols,upstream){
   // Column slots with a gap slot where flanking indices are not adjacent.
   const out=[];cols.forEach((c,k)=>{if(k>0&&Math.abs(c.index-cols[k-1].index)>1)out.push({gap:true});out.push({col:c,k})});return out}
-function drawPile(r){
-  const host=$("#pilehost");if(!host)return;
+function drawPile(r,S,host,T){
+  if(!host||!S.rows.length)return;
   const P=r.pileup,up=r.flanks.upstream.bases,dn=r.flanks.downstream.bases;
-  const T=Math.max(1,...P.rows.map(x=>x.tract.length));
   const U=layoutSide(P.up,true),D=layoutSide(P.dn,false);
   const slots=[...U.map(x=>({side:"up",...x})),...[...up].map((b,i)=>({flank:"up",b,i})),
     ...Array.from({length:T},(_,i)=>({tract:i})),...[...dn].map((b,i)=>({flank:"dn",b,i})),...D.map(x=>({side:"dn",...x}))];
-  const width=slots.length,LABW=90,avail=Math.max(300,host.clientWidth-LABW-4);
+  const STRIPE=S.label?8:0;
+  const width=slots.length,LABW=90,avail=Math.max(300,host.clientWidth-LABW-STRIPE-4);
   const CW=Math.max(5,Math.min(12,Math.floor(avail/width))),RH=Math.max(8,Math.min(11,CW)),HEAD=44;
-  const H=HEAD+P.rows.length*RH+6,W=width*CW+LABW;
+  const H=HEAD+S.rows.length*RH+6,W=width*CW+LABW+STRIPE;
   const dpr=window.devicePixelRatio||1;const cv=document.createElement("canvas");cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+"px";cv.style.height=H+"px";
   const g=cv.getContext("2d");g.scale(dpr,dpr);const font=`${Math.min(10,CW)}px ${css("--mono")}`;g.font=font;
-  slots.forEach((sl,j)=>{g.textAlign="center";const x=j*CW+CW/2;
-    if(sl.gap){g.fillStyle=css("--muted");g.fillRect(j*CW+CW/2-1,30,2,8);return}
-    if(sl.flank||sl.tract!=null){g.fillStyle=sl.tract!=null?css("--tract"):css("--flank");g.globalAlpha=.75;g.fillRect(j*CW,4,CW-1,5);g.globalAlpha=1;
+  const X=j=>STRIPE+j*CW;
+  slots.forEach((sl,j)=>{g.textAlign="center";const x=X(j)+CW/2;
+    if(sl.gap){g.fillStyle=css("--muted");g.fillRect(x-1,30,2,8);return}
+    if(sl.flank||sl.tract!=null){g.fillStyle=sl.tract!=null?css("--tract"):css("--flank");g.globalAlpha=.75;g.fillRect(X(j),4,CW-1,5);g.globalAlpha=1;
       g.fillStyle=css("--fg");g.fillText(sl.flank?sl.b:(r.reference_tract[sl.tract]||""),x,38);return}
-    const c=sl.col;
-    if(c.snv){g.fillStyle=c.snv.status==="phased"?css("--warn"):css("--muted");g.fillRect(j*CW,4,CW-1,5);g.fillStyle=css("--fg");
-      g.fillText(c.snv.allele_major,x,22);g.fillText(c.snv.allele_minor,x,38)}
-    else{g.fillStyle=css("--muted");g.fillRect(j*CW+CW/2-1,34,2,4)}});
+    const v=sl.col.snv;
+    if(v){const phased=v.status==="phased";g.fillStyle=phased?css("--warn"):css("--muted");g.fillRect(X(j),4,CW-1,5);g.fillStyle=css("--fg");
+      g.fillText(phased?v.hap_major_base:v.allele_major,x,22);g.fillText(phased?v.hap_minor_base:v.allele_minor,x,38)}
+    else{g.fillStyle=css("--muted");g.fillRect(x-1,34,2,4)}});
   let y=HEAD;
-  for(const row of P.rows){
+  for(const row of S.rows){
+    if(STRIPE){g.fillStyle=css(LABEL_COLOR[row.label]);g.fillRect(0,y,STRIPE-2,RH-1)}
+    const differs={up:new Set(row.differs?row.differs.up:[]),dn:new Set(row.differs?row.differs.dn:[])};
     slots.forEach((sl,j)=>{let ch="",faded=false;
       if(sl.gap)return;
       if(sl.flank){ch=sl.b;faded=true}
       else if(sl.tract!=null){ch=row.tract[sl.tract]||" "}
       else ch=row[sl.side][sl.k];
       if(ch===""||ch===".")return;
-      if(ch===" "){g.fillStyle=css("--fg");g.fillRect(j*CW,y+RH/2-1,CW,2);return}
-      g.globalAlpha=faded?.45:1;g.fillStyle=baseColor(ch);g.fillRect(j*CW,y,CW-1,RH-1);g.globalAlpha=1});
+      if(ch===" "){g.fillStyle=css("--fg");g.fillRect(X(j),y+RH/2-1,CW,2);return}
+      g.globalAlpha=faded?.45:1;g.fillStyle=baseColor(ch);g.fillRect(X(j),y,CW-1,RH-1);g.globalAlpha=1;
+      if(sl.side&&differs[sl.side].has(sl.k)){g.strokeStyle=css("--fg");g.lineWidth=1.5;g.strokeRect(X(j)+0.75,y+0.75,CW-2.5,RH-2.5)}});
     g.fillStyle=css("--muted");g.textAlign="left";g.font=font;
-    g.fillText(fmt(row.reads)+(row.label?" "+row.label.replace("hap_",""):""),width*CW+6,y+RH-2);y+=RH}
-  host.textContent="";host.appendChild(cv);
+    g.fillText(fmt(row.reads),X(width)+6,y+RH-2);y+=RH}
+  // The row under the mouse gets an outline across the whole row, over the canvas.
+  const wrap=document.createElement("div");wrap.style.cssText=`position:relative;width:${W}px`;
+  const band=document.createElement("div");band.className="rowband";band.hidden=true;
+  wrap.appendChild(cv);wrap.appendChild(band);host.textContent="";host.appendChild(wrap);
   const tip=$("#tip");
-  cv.onmousemove=e=>{const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
+  cv.onmousemove=e=>{const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left-STRIPE,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
+    const kk=Math.floor((yy-HEAD)/RH),onRow=yy>=HEAD&&kk>=0&&kk<S.rows.length;
+    band.hidden=!onRow;if(onRow){band.style.top=(HEAD+kk*RH-1)+"px";band.style.height=(RH+1)+"px";band.style.width=W+"px"}
+    if(onRow&&(j<0||j>=width)){const row=S.rows[kk];tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";
+      tip.innerHTML=`<div class="mono">${fmt(row.reads)} reads${row.label?` · ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;return}
     if(j<0||j>=width){tip.hidden=true;return}
     const sl=slots[j];let html="";
     if(sl.gap)html="<b>skipped flanking positions</b>";
     else if(sl.flank)html=`<b>${sl.flank==="up"?"upstream":"downstream"} flank, base ${sl.i+1}</b> (the panel's flank)`;
     else if(sl.tract!=null)html=`<b>tract, position ${sl.tract+1}</b>`;
-    else{const c=sl.col;html=`<b>reference ${fmt(c.position)}</b> · ${sl.side==="up"?"upstream":"downstream"}, ${sl.side==="up"?r.flanking.up.width-c.index:c.index+1} from the flank${c.snv?` · SNV ${esc(c.snv.allele_major)}/${esc(c.snv.allele_minor)}, minor ${pct(c.snv.vaf_minor)} of ${fmt(c.snv.coverage)} families, ${snvStatus(c.snv)}${c.snv.status==="phased"?`; major haplotype ${esc(c.snv.hap_major_base)}, minor ${esc(c.snv.hap_minor_base)}`:""}`:""}<div>all reads: ${cellsText(c.counts)}</div>`}
+    else{const c=sl.col,v=c.snv;html=`<b>reference ${fmt(c.position)}</b> · ${sl.side==="up"?"upstream":"downstream"}, ${sl.side==="up"?r.flanking.up.width-c.index:c.index+1} from the flank`;
+      if(v)html+=v.status==="phased"?`<div>phased SNV${v.is_anchor?", anchor":""}: major haplotype ${esc(v.hap_major_base)}, minor haplotype ${esc(v.hap_minor_base)}; alleles ${esc(v.allele_major)}/${esc(v.allele_minor)}, minor allele ${pct(v.vaf_minor)} of ${fmt(v.coverage)} families</div>`
+        :`<div>dropped SNV (low linkage): no haplotype bases; the header shows its alleles ${esc(v.allele_major)}/${esc(v.allele_minor)}, minor allele ${pct(v.vaf_minor)} of ${fmt(v.coverage)} families</div>`;
+      html+=`<div>all reads: ${cellsText(c.counts)}</div>`}
     const k=Math.floor((yy-HEAD)/RH);
-    if(yy>=HEAD&&k<P.rows.length){const row=P.rows[k];
-      html+=`<div class="mono">${fmt(row.reads)} reads${row.label?` · label ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;
-      if(sl.side){const ch=row[sl.side][sl.k];html+=`<div>this row's reads: ${ch==="."?"no base here":esc(ch)}</div>`}}
+    if(yy>=HEAD&&k<S.rows.length){const row=S.rows[k];
+      html+=`<div class="mono">${fmt(row.reads)} reads${row.label?` · ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;
+      if(sl.side){const ch=row[sl.side][sl.k];html+=`<div>this row's reads: ${ch==="."?"no base here":esc(ch)}${row.differs&&row.differs[sl.side].includes(sl.k)?" (differs from the row's haplotype base)":""}</div>`}}
     tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";tip.innerHTML=html};
-  cv.onmouseleave=()=>tip.hidden=true;
+  cv.onmouseleave=()=>{tip.hidden=true;band.hidden=true};
 }
 function flankingCard(r){
   const c=document.createElement("div");c.className="card";
-  c.innerHTML=`<h2>Flanking base counts</h2>
-   <div class="note">Every flanking position of each side, in reference columns, over the kept reads: coverage (top) and the share of each base (bottom). ${r.phasing?"A position is marked where the phasing result has an SNV; these are the SNV columns of the pile-up.":"No phasing result was given for this sample, so no position is marked."} Reference coordinate on hover.</div>
+  c.innerHTML=`<h2>Flanking base counts${helpMark("Every flanking position of each side, in reference columns. Each side zooms on its own: drag over a range or turn the mouse wheel to zoom; when zoomed in, drag to pan and shift-drag to zoom further. Reset returns to the full width. At high zoom the ticks show reference coordinates and wide columns show each base count. Marks: the SNVs of the phasing result. Hover for the position and the counts.")}</h2>
+   <div class="note">Coverage (top) and base shares (bottom) of the kept reads.</div>
    <div id="flankhost"></div><div class="note" id="flanklist"></div>
-   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--bN)"></i>N</span><span><i style="background:var(--warn)"></i>SNV of the phasing result</span></div>`;
+   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--bN)"></i>N</span>${r.phasing?`<span><i style="background:var(--warn)"></i>SNV of the phasing result</span>`:""}</div>`;
   queueMicrotask(()=>drawFlanking(r));return c;
 }
 function drawFlanking(r){
-  const host=$("#flankhost");if(!host)return;const F=r.flanking,orient=r.ref_orientation,B=LIST.flanking_bases;
-  const sides=[["upstream",F.up],["downstream",F.dn]];
-  const GAP=24,total=F.up.width+F.dn.width,avail=Math.max(300,host.clientWidth-4);
-  const cw=Math.max(1,Math.min(8,(avail-GAP)/Math.max(1,total)));
-  const CH=40,SH=40,H=CH+SH+14,W=total*cw+GAP;
-  let s=`<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="Flanking base counts">`;
-  const marked=[],sideNotes=[];let x0=0;const cols=[];
-  let maxCov=1;for(const [,S] of sides)for(const cnt of S.counts)maxCov=Math.max(maxCov,cnt.reduce((a,b)=>a+b,0));
-  for(const [name,S] of sides){
-    S.counts.forEach((cnt,i)=>{const cov=cnt.reduce((a,b)=>a+b,0),x=x0+i*cw,at=coord(orient,S.start,i);
-      cols.push({x,w:cw,name,i,at,cnt,cov});
-      if(!cov)return;
-      const h=(CH-4)*cov/maxCov;s+=`<rect x="${x}" y="${CH-h}" width="${cw}" height="${h}" fill="var(--muted)"/>`;
-      let yy=CH+4;const sorted=cnt.map((v,k)=>[v,k]).sort((a,b)=>b[0]-a[0]);
-      for(const [v,k] of sorted){if(!v)continue;const hh=SH*v/cov;s+=`<rect x="${x}" y="${yy}" width="${cw}" height="${hh}" fill="${baseColor(B[k])}"/>`;yy+=hh}
-      if(S.snv.includes(i)){marked.push({name,at,cnt,cov});s+=`<rect x="${x}" y="${CH+SH+6}" width="${Math.max(cw,2)}" height="6" fill="var(--warn)"/>`}});
-    sideNotes.push(`${name}: ${fmt(S.width)} positions${S.width?`, reference ${fmt(S.start)}–${fmt(coord(orient,S.start,S.width-1))} from left to right`:", no flanking bases"}`);
-    x0+=S.width*cw+GAP}
-  s+=`</svg>`;host.innerHTML=`<div class="scroll">${s}</div><div class="note">${sideNotes.join(" · ")}. The gap between the two blocks stands for the flanks and the tract.</div>`;
+  const host=$("#flankhost");if(!host)return;const F=r.flanking,B=LIST.flanking_bases;
+  host.textContent="";const marked=[];
+  let maxCov=1;for(const S of [F.up,F.dn])for(const cnt of S.counts)maxCov=Math.max(maxCov,cnt.reduce((a,b)=>a+b,0));
+  for(const [name,S] of [["upstream",F.up],["downstream",F.dn]]){
+    const box=document.createElement("div");box.className="sec";
+    const head=document.createElement("h3");
+    head.innerHTML=`${name} · ${fmt(S.width)} positions${S.width?`, ${fmt(S.start)}–${fmt(coord(r.ref_orientation,S.start,S.width-1))}`:", no flanking bases"} `;
+    box.appendChild(head);host.appendChild(box);
+    S.counts.forEach((cnt,i)=>{if(S.snv.includes(i)){const cov=cnt.reduce((a,b)=>a+b,0);marked.push({name,at:coord(r.ref_orientation,S.start,i),cnt,cov})}});
+    if(!S.width)continue;
+    const reset=document.createElement("button");reset.textContent="reset";reset.className="zoomreset";head.appendChild(reset);
+    const cv=document.createElement("canvas");cv.style.cursor="crosshair";box.appendChild(cv);
+    zoomSide(r,name,S,cv,reset,maxCov,B);
+  }
   $("#flanklist").innerHTML=marked.length?"Marked positions: "+marked.map(m=>`${m.name} ${fmt(m.at)}: `+B.split("").map((b,k)=>m.cnt[k]?`${b} ${pct(m.cnt[k]/m.cov)}`:"").filter(Boolean).join(" ")).join(" · "):(r.phasing?"The phasing result has no SNV at this locus.":"");
-  const svg=host.querySelector("svg"),tip=$("#tip");
-  svg.onmousemove=e=>{const rc=svg.getBoundingClientRect(),xx=(e.clientX-rc.left)*W/rc.width;const col=cols.find(o=>xx>=o.x&&xx<o.x+o.w);
-    if(!col){tip.hidden=true;return}
+}
+function zoomSide(r,name,S,cv,reset,maxCov,B){
+  // The view is the index range [lo, hi) of this side's positions. Zoom and
+  // pan change only the view; the counts come from the locus data.
+  const n=S.width,orient=r.ref_orientation,tip=$("#tip");
+  const W=Math.max(300,cv.parentElement.clientWidth-4),CH=40,SH=40,MH=8,AX=16,TXT=5*10+4;
+  let lo=0,hi=n,drag=null;
+  const dpr=window.devicePixelRatio||1;
+  function draw(){
+    const cw=W/(hi-lo),showText=cw>=30,H=CH+SH+MH+AX+(showText?TXT:0)+4;
+    cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+"px";cv.style.height=H+"px";
+    const g=cv.getContext("2d");g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);
+    const first=Math.floor(lo),last=Math.min(n,Math.ceil(hi));
+    for(let i=first;i<last;i++){const cnt=S.counts[i],cov=cnt.reduce((a,b)=>a+b,0),x=(i-lo)*cw,w=Math.max(cw-(cw>4?1:0),0.5);
+      if(cov){const h=(CH-4)*cov/maxCov;g.fillStyle=css("--muted");g.fillRect(x,CH-h,w,h);
+        let y=CH+2;cnt.map((v,k)=>[v,k]).sort((a,b)=>b[0]-a[0]).forEach(([v,k])=>{if(!v)return;const hh=SH*v/cov;g.fillStyle=baseColor(B[k]);g.fillRect(x,y,w,hh);y+=hh})}
+      if(S.snv.includes(i)){g.fillStyle=css("--warn");g.fillRect(x,CH+SH+3,Math.max(w,2),MH-2)}
+      if(showText&&cov){g.fillStyle=css("--fg");g.font=`10px ${css("--mono")}`;g.textAlign="center";
+        let k2=0;cnt.forEach((v,k)=>{if(v){g.fillText(`${B[k]}${v}`,x+cw/2,CH+SH+MH+AX+12+10*k2);k2++}})}}
+    // Reference coordinate ticks.
+    const span=hi-lo,steps=[1,2,5,10,20,50,100,200,500,1000];const step=steps.find(t=>span/t<=10)||1000;
+    g.fillStyle=css("--muted");g.font=`9px ${css("--mono")}`;g.textAlign="center";
+    for(let i=Math.ceil(lo/step)*step;i<hi;i+=step){const x=(i-lo+0.5)*cw;g.fillRect(x,CH+SH+MH,1,4);g.fillText(fmt(coord(orient,S.start,i)),x,CH+SH+MH+13)}
+    if(drag&&drag.select){g.fillStyle="rgba(15,110,140,.18)";const a=Math.min(drag.x0,drag.x1),b=Math.max(drag.x0,drag.x1);g.fillRect(a,0,b-a,CH+SH+MH)}
+    reset.disabled=lo===0&&hi===n;
+  }
+  const at=x=>lo+x/W*(hi-lo);
+  const clamp=()=>{const span=Math.max(3,Math.min(n,hi-lo));if(lo<0){lo=0}if(lo+span>n){lo=n-span}hi=lo+span;lo=Math.max(0,lo)};
+  cv.onwheel=e=>{e.preventDefault();const rc=cv.getBoundingClientRect(),x=e.clientX-rc.left,c=at(x),f=e.deltaY<0?0.8:1.25;
+    lo=c-(c-lo)*f;hi=c+(hi-c)*f;clamp();draw()};
+  cv.onmousedown=e=>{const rc=cv.getBoundingClientRect(),x=e.clientX-rc.left;
+    const zoomed=lo>0||hi<n;drag={x0:x,x1:x,select:!zoomed||e.shiftKey,lo0:lo,hi0:hi}};
+  window.addEventListener("mousemove",e=>{if(!drag)return;const rc=cv.getBoundingClientRect();drag.x1=e.clientX-rc.left;
+    if(!drag.select){const d=(drag.x1-drag.x0)/W*(drag.hi0-drag.lo0);lo=drag.lo0-d;hi=drag.hi0-d;clamp()}draw()});
+  window.addEventListener("mouseup",()=>{if(!drag)return;
+    if(drag.select&&Math.abs(drag.x1-drag.x0)>4){const a=at(Math.min(drag.x0,drag.x1)),b=at(Math.max(drag.x0,drag.x1));lo=a;hi=b;clamp()}
+    drag=null;draw()});
+  reset.onclick=()=>{lo=0;hi=n;draw()};
+  cv.onmousemove=e=>{if(drag)return;const rc=cv.getBoundingClientRect(),i=Math.floor(at(e.clientX-rc.left));
+    if(i<0||i>=n){tip.hidden=true;return}
+    const cnt=S.counts[i],cov=cnt.reduce((a,b)=>a+b,0);
     tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-320))+"px";tip.style.top=(e.clientY+12)+"px";
-    tip.innerHTML=`<b>reference ${fmt(col.at)}</b> · ${col.name}, ${col.name==="upstream"?r.flanking.up.width-col.i:col.i+1} from the flank<div>${fmt(col.cov)} reads: `+B.split("").map((b,k)=>col.cnt[k]?`${b} ${fmt(col.cnt[k])} (${pct(col.cnt[k]/col.cov)})`:"").filter(Boolean).join(" · ")+`</div>`};
-  svg.onmouseleave=()=>tip.hidden=true;
+    tip.innerHTML=`<b>reference ${fmt(coord(orient,S.start,i))}</b> · ${name}, ${name==="upstream"?n-i:i+1} from the flank${S.snv.includes(i)?" · SNV of the phasing result":""}<div>${fmt(cov)} reads: `+B.split("").map((b,k)=>cnt[k]?`${b} ${fmt(cnt[k])} (${pct(cnt[k]/cov)})`:"").filter(Boolean).join(" · ")+`</div>`};
+  cv.onmouseleave=()=>{tip.hidden=true};
+  draw();
+  // Exposed for a headless check: zoom to a reference range.
+  cv.zoomTo=(a,b)=>{lo=a;hi=b;clamp();draw()};
 }
 function counterCard(r){
   const c=document.createElement("div");c.className="card";
