@@ -439,3 +439,21 @@ def test_the_mark_is_at_exactly_the_cells_that_differ_from_the_label_haplotype(t
         ("hap_minor", ".G" + "C"): {"up": [], "dn": []},     # empty cell, dropped SNV: no mark
         ("unk", "AC" + "A"): None,                           # unk rows are never marked
     }
+
+
+def test_largest_run_shares_are_per_label_hand_counts_over_label_totals(tmp_path):
+    locus, labels, view = _phased_view(tmp_path)
+    counts, totals = {}, Counter()
+    for seq, label, n in zip(locus.seq, labels, locus.count, strict=True):
+        run = max(parse_run_lengths(str(seq)))
+        counts.setdefault(label, Counter())[run] += int(n)
+        totals[label] += int(n)
+    runs = sorted({run for c in counts.values() for run in c})
+    for label in lv.PHASE_LABELS:
+        want = [[run, counts[label][run] / totals[label]] for run in runs] if totals[label] \
+            else []
+        got = view["largest_run_shares"][label]
+        assert [k for k, _ in got] == [k for k, _ in want]
+        assert [v for _, v in got] == pytest.approx([v for _, v in want])
+        if want:
+            assert sum(v for _, v in view["largest_run_shares"][label]) == pytest.approx(1.0)

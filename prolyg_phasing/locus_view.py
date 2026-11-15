@@ -294,6 +294,10 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
         `PHASE_LABELS` order.
     largest_run_labels : list or None
         With phasing, ``[largest G run, reads by phase label]``.
+    largest_run_shares : dict or None
+        With phasing, per phase label, ``[largest G run, share]``: the
+        label's reads at that run over the label's reads (empty for a label
+        with no reads).
     """
     counters = {f.name: int(getattr(locus, f.name))
                 for f in dataclasses.fields(locus)
@@ -385,7 +389,7 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
                          "reads_not_drawn": int(key_reads[key_order[PILEUP_ROWS:]].sum())})
 
     # Reads per tract and per largest G run, by phase label.
-    tract_labels = largest_labels = None
+    tract_labels = largest_labels = largest_shares = None
     if phasing is not None:
         by_label = np.zeros((len(tracts), len(PHASE_LABELS)), dtype=np.int64)
         np.add.at(by_label, (tract_of_row, row_label), count)
@@ -395,6 +399,11 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
             run = max(parse_run_lengths(str(tract)))
             runs[run] = runs.get(run, 0) + by_label[i]
         largest_labels = [[k, v.tolist()] for k, v in sorted(runs.items())]
+        totals = by_label.sum(axis=0)
+        largest_shares = {
+            label: ([[k, float(v[i]) / float(totals[i])] for k, v in sorted(runs.items())]
+                    if totals[i] else [])
+            for i, label in enumerate(PHASE_LABELS)}
 
     flanks = None
     if locus.upstream_flank is not None:
@@ -415,6 +424,7 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
         "tract_reads_not_shown": int(tract_reads[order[TRACT_ROWS:]].sum()),
         "largest_run": [[k, v] for k, v in sorted(largest.items())],
         "largest_run_labels": largest_labels,
+        "largest_run_shares": largest_shares,
         "near": near,
         "phasing": None if phasing is None else {
             "summary": phasing.summary.get(locus_id), "snvs": snvs},

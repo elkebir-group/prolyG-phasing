@@ -241,25 +241,30 @@ function tractCard(r){
 }
 function histCard(r){
   const c=document.createElement("div");c.className="card";
-  c.innerHTML=`<h2>Largest G run per read, share of reads${r.largest_run_labels?helpMark("Bars stack the reads by phase label; hover a bar for the three counts."):""}</h2>`;
+  const SH=r.largest_run_shares;
+  c.innerHTML=`<h2>Largest G run per read, share of reads${SH?helpMark("One histogram per phase label: each shows the share of that label's reads at each largest G run, on one x axis and one y scale."):""}</h2>`;
   if(!r.largest_run.length){c.innerHTML+=`<p class="note">No reads.</p>`;return c}
-  const h=Object.fromEntries(r.largest_run),ks=r.largest_run.map(x=>x[0]);const lo=Math.min(...ks,0),hi=Math.max(...ks,1);
-  const tot=r.largest_run.reduce((a,x)=>a+x[1],0)||1;const ymax=Math.max(...ks.map(k=>h[k]/tot),0.01);
-  const L=r.largest_run_labels?Object.fromEntries(r.largest_run_labels):null,lab=["hap_major","hap_minor","unk"];
-  const W=460,H=190,pl=36,pb=26,bw=(W-pl-8)/(hi-lo+1);
-  let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px" role="img" aria-label="Largest G run histogram">`;
-  for(const t of [0,0.25,0.5,0.75,1]){const v=t*ymax,y=H-pb-(H-pb-8)*t;s+=`<line x1="${pl}" x2="${W-4}" y1="${y}" y2="${y}" stroke="var(--line)"/><text x="${pl-4}" y="${y+3}" font-size="9" text-anchor="end" fill="var(--muted)">${(100*v).toFixed(0)}%</text>`}
-  const hgt=v=>(H-pb-8)*v/tot/ymax;
-  for(let k=lo;k<=hi;k++){const x=pl+(k-lo)*bw,n=h[k]||0;
-    if(L){const parts=L[k]||[0,0,0];let y=H-pb;
-      const title=`<title>largest G run ${k}: ${fmt(n)} reads (${pct(n/tot)}) · major ${fmt(parts[0])} · minor ${fmt(parts[1])} · unk ${fmt(parts[2])}</title>`;
-      s+=`<g>${title}`;parts.forEach((v,i)=>{const hh=hgt(v);y-=hh;if(v)s+=`<rect x="${x+1}" y="${y}" width="${Math.max(1,bw-2)}" height="${hh}" fill="var(${LABEL_COLOR[lab[i]]})"/>`});s+=`</g>`}
-    else{const hh=hgt(n);s+=`<rect x="${x+1}" y="${H-pb-hh}" width="${Math.max(1,bw-2)}" height="${hh}" fill="var(--accent)"><title>largest G run ${k}: ${fmt(n)} reads (${pct(n/tot)})</title></rect>`}
-    if((k-lo)%Math.ceil((hi-lo+1)/14)===0)s+=`<text x="${x+bw/2}" y="${H-pb+12}" font-size="9" text-anchor="middle" fill="var(--muted)">${k}</text>`}
-  s+=`<text x="${(W+pl)/2}" y="${H-2}" font-size="10" text-anchor="middle" fill="var(--muted)">largest G run</text></svg>`;
-  c.innerHTML+=s;
-  if(L){const totals=[0,0,0];for(const [,v] of r.largest_run_labels)v.forEach((x,i)=>totals[i]+=x);
-    c.innerHTML+=`<div class="legend">${lab.map((l,i)=>`<span><i style="background:var(${LABEL_COLOR[l]})"></i>${LABEL_NAME[l].toLowerCase()} ${fmt(totals[i])} reads</span>`).join("")}</div>`}
+  const ks=r.largest_run.map(x=>x[0]);const lo=Math.min(...ks,0),hi=Math.max(...ks,1);
+  const W=460,pl=36,bw=(W-pl-8)/(hi-lo+1);
+  const axis=(y)=>{let s="";for(let k=lo;k<=hi;k++){const x=pl+(k-lo)*bw;
+    if((k-lo)%Math.ceil((hi-lo+1)/14)===0)s+=`<text x="${x+bw/2}" y="${y}" font-size="9" text-anchor="middle" fill="var(--muted)">${k}</text>`}return s};
+  const panel=(rows,ymax,H,color,tipOf)=>{let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img">`;
+    const pb=14,top=4;
+    for(const t of [0,0.5,1]){const v=t*ymax,y=H-pb-(H-pb-top)*t;s+=`<line x1="${pl}" x2="${W-4}" y1="${y}" y2="${y}" stroke="var(--line)"/><text x="${pl-4}" y="${y+3}" font-size="9" text-anchor="end" fill="var(--muted)">${(100*v).toFixed(0)}%</text>`}
+    for(const [k,v,n] of rows){if(!v)continue;const x=pl+(k-lo)*bw,hh=(H-pb-top)*v/ymax;
+      s+=`<rect x="${x+1}" y="${H-pb-hh}" width="${Math.max(1,bw-2)}" height="${hh}" fill="${color}"><title>${tipOf(k,v,n)}</title></rect>`}
+    return s+axis(H-2)+`</svg>`};
+  if(!SH){const tot=r.largest_run.reduce((a,x)=>a+x[1],0)||1;const rows=r.largest_run.map(([k,n])=>[k,n/tot,n]);
+    const ymax=Math.max(...rows.map(x=>x[1]),0.01);
+    c.innerHTML+=panel(rows,ymax,190,"var(--accent)",(k,v,n)=>`largest G run ${k}: ${fmt(n)} reads (${pct(v)})`)+`<div class="note" style="text-align:center">largest G run</div>`;return c}
+  const lab=["hap_major","hap_minor","unk"];
+  const counts=Object.fromEntries(r.largest_run_labels);
+  const totals=lab.map((_,i)=>r.largest_run_labels.reduce((a,[,v])=>a+v[i],0));
+  const ymax=Math.max(0.01,...lab.flatMap(l=>SH[l].map(x=>x[1])));
+  lab.forEach((l,i)=>{const rows=SH[l].map(([k,v])=>[k,v,(counts[k]||[0,0,0])[i]]);
+    c.innerHTML+=`<div class="sec" style="margin-top:4px"><h3><i style="background:var(${LABEL_COLOR[l]})"></i>${LABEL_NAME[l].toLowerCase()} · ${fmt(totals[i])} reads</h3>`+
+      panel(rows,ymax,78,`var(${LABEL_COLOR[l]})`,(k,v,n)=>`${LABEL_NAME[l].toLowerCase()}, largest G run ${k}: ${fmt(n)} reads (${pct(v)} of ${LABEL_NAME[l].toLowerCase()})`)+`</div>`});
+  c.innerHTML+=`<div class="note" style="text-align:center">largest G run</div>`;
   return c;
 }
 function cellsText(cnt){const B=LIST.flanking_bases;return cnt?B.split("").map((b,k)=>cnt[k]?`${b} ${fmt(cnt[k])}`:"").filter(Boolean).join(" · ")||"no read base":""}
