@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import prolyg_phasing.cli as cli
 import prolyg_phasing.locus_view as lv
 from prolyg_phasing.io._flank_placement import FlankRecord
 from prolyg_phasing.io.bam import extract_panel
@@ -78,6 +79,8 @@ def test_tracts_and_base_counts_match_the_panel_rows(tmp_path, case):
         assert sum(r["reads"] for r in view["pileup"]["rows"]) == locus.n_reads
 
 
+
+
 @pytest.mark.parametrize("orientation", ORIENTATIONS)
 def test_column_coordinates_on_each_strand(tmp_path, orientation):
     """The nearest flanking base sits one reference base past each flank's outer
@@ -87,41 +90,55 @@ def test_column_coordinates_on_each_strand(tmp_path, orientation):
     view = locus_view_data(name, panel.loci[name], "S")
     step = 1 if orientation == "+" else -1
     up_cols, dn_cols = view["pileup"]["up"], view["pileup"]["dn"]
-    assert [c["index"] for c in up_cols][-1] == view["flanking"]["up"]["width"] - 1
+    assert [c["index"] for c in up_cols] == list(range(
+        view["flanking"]["up"]["width"] - lv.NEAR_BASES, view["flanking"]["up"]["width"]))
     assert up_cols[-1]["position"] == view["flanks"]["upstream"]["outer_position"] - step
     assert dn_cols[0]["position"] == view["flanks"]["downstream"]["outer_position"] + step
     assert up_cols[-1]["position"] == ref_pos_at_offset(
         orientation, view["flanking"]["up"]["start"], up_cols[-1]["index"])
 
 
-def test_both_strands_give_one_pileup(tmp_path):
+def test_without_phasing_rows_group_by_tract(tmp_path):
     _, panel = _panel(tmp_path, MOVED)
+    for name in ("PolyG5177+", "PolyG5177-"):
+        view = locus_view_data(name, panel.loci[name], "S", near=2)
+        assert view["phasing"] is None
+        assert len(view["pileup"]["up"]) == len(view["pileup"]["dn"]) == 2
+        assert [(r["tract"], r["reads"], r["label"]) for r in view["pileup"]["rows"]] == \
+            [(t, n, None) for t, n, _ in view["tracts"]]
+        assert view["flanking"]["up"]["snv"] == view["flanking"]["dn"]["snv"] == []
     plus = locus_view_data("PolyG5177+", panel.loci["PolyG5177+"], "S")
     minus = locus_view_data("PolyG5177-", panel.loci["PolyG5177-"], "S")
-    assert plus["tracts"] == minus["tracts"]
     assert plus["pileup"]["rows"] == minus["pileup"]["rows"]
 
 
-def test_a_locus_with_no_heterozygous_column_has_one_row_per_tract(tmp_path):
-    _, panel = _panel(tmp_path, MOVED)
-    view = locus_view_data("PolyG5177+", panel.loci["PolyG5177+"], "S", het_limit=0.5)
-    assert not any(c["het"] for c in view["pileup"]["up"] + view["pileup"]["dn"])
-    assert [r["tract"] for r in view["pileup"]["rows"]] == [t for t, _, _ in view["tracts"]]
-    assert [r["reads"] for r in view["pileup"]["rows"]] == [n for _, n, _ in view["tracts"]]
-
-
-def test_the_rows_past_the_caps_are_counted(tmp_path, monkeypatch):
-    """With no limit, every covered flanking position is a heterozygous column,
-    so the reads split into several rows; one row is kept and the rest counted."""
+def test_a_cell_is_the_majority_of_the_rows_reads_and_never_invented(tmp_path):
     _, panel = _panel(tmp_path, MOVED)
     locus = panel.loci["PolyG5177+"]
-    full = locus_view_data("PolyG5177+", locus, "S", het_limit=0.0)
-    assert full["pileup"]["n_rows"] == len(full["pileup"]["rows"]) >= 2
-    monkeypatch.setattr(lv, "PILEUP_ROWS", 1)
-    capped = locus_view_data("PolyG5177+", locus, "S", het_limit=0.0)
-    assert capped["pileup"]["rows"] == full["pileup"]["rows"][:1]
-    assert capped["pileup"]["rows"][0]["reads"] + capped["pileup"]["reads_not_drawn"] == \
-        locus.n_reads
+    view = locus_view_data("PolyG5177+", locus, "S")
+    rows = list(_rows(locus))
+    for row in view["pileup"]["rows"]:
+        mine = [r for r in rows if r[0] == row["tract"]]
+        for k, col in enumerate(view["pileup"]["up"]):
+            want = Counter()
+            for r in mine:
+                if r[1][col["index"]] != ".":
+                    want[r[1][col["index"]]] += r[4]
+            base, counts = row["up"][k]
+            assert counts == [want[b] for b in lv.FLANKING_BASES]
+            assert base == (max(want, key=lambda b: (want[b], -lv.FLANKING_BASES.index(b)))
+                            if want else "")
+
+
+def test_the_rows_past_the_cap_are_counted(tmp_path, monkeypatch):
+    _, panel = _panel(tmp_path, MOVED)
+    locus = panel.loci["PolyG5177+"]
+    full = locus_view_data("PolyG5177+", locus, "S")
+    monkeypatch.setattr(lv, "PILEUP_ROWS", 0)
+    capped = locus_view_data("PolyG5177+", locus, "S")
+    assert capped["pileup"]["rows"] == []
+    assert capped["pileup"]["n_rows"] == full["pileup"]["n_rows"]
+    assert capped["pileup"]["reads_not_drawn"] == locus.n_reads
 
 
 def test_a_side_with_no_position(tmp_path):
@@ -131,7 +148,7 @@ def test_a_side_with_no_position(tmp_path):
     _, panel = _panel(tmp_path, case, records=records)
     view = locus_view_data("PolyG151-", panel.loci["PolyG151-"], "S")
     assert view["flanks"]["downstream"]["status"] == "no_reference_position"
-    assert view["flanking"]["dn"] == {"start": -1, "width": 0, "counts": [], "het": []}
+    assert view["flanking"]["dn"] == {"start": -1, "width": 0, "counts": [], "snv": []}
     assert view["pileup"]["dn"] == []
     assert all(r["dn"] == [] for r in view["pileup"]["rows"])
     assert sum(r["reads"] for r in view["pileup"]["rows"]) == view["counters"]["n_reads"] > 0
@@ -149,57 +166,81 @@ def test_a_locus_with_no_reference_window(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Heterozygous columns and the grouping rule
+# With the saved phasing result
 # ---------------------------------------------------------------------------
 
-
-def test_heterozygous_positions_use_the_second_base_share():
-    counts = np.array([[80, 0, 20, 0, 0],    # second base 20 %: heterozygous
-                       [81, 0, 19, 0, 0],    # 19 %: not
-                       [0, 0, 0, 0, 0],      # no coverage
-                       [40, 30, 30, 0, 0]])  # second 30 %
-    assert lv.heterozygous(counts, 0.2).tolist() == [True, False, False, True]
+# One SNV at upstream index 4: C in 70 families, G in 30, no base in 10.
+SNV_STRINGS = ["AAAACAAT|TTTTTTTT", "AAAAGAAT|TTTTTTTT", "AAAA.AAT|TTTTTTTT"]
+SNV_COUNTS = [70, 30, 10]
 
 
-def test_columns_are_the_near_bases_and_the_heterozygous_positions():
-    het = np.zeros(20, dtype=bool)
-    het[[2, 18]] = True
-    assert lv._columns(20, het, 3, upstream=True) == [2, 17, 18, 19]
-    assert lv._columns(20, het, 3, upstream=False) == [0, 1, 2, 18]
-    assert lv._columns(2, np.zeros(2, dtype=bool), 6, upstream=True) == [0, 1]
+def _snv_panel(tmp_path, *, mi_prefix="M"):
+    """A panel with one heterozygous flanking SNV, and the phase output for it,
+    made by the `phase` command."""
+    from tests.test_phasing_tables import _make_locus, _make_provenance
+
+    n = sum(SNV_COUNTS)
+    seqs = ["GGGGGG" if i % 3 else "GGGGGGG" for i in range(n)]
+    locus = _make_locus(flanking_strings=SNV_STRINGS, counts=SNV_COUNTS, seqs=seqs,
+                        up_width=8, dn_width=8)
+    locus.mi = np.asarray([f"{mi_prefix}{i}" for i in range(n)], dtype=object)
+    db = tmp_path / f"{mi_prefix}.panel.db"
+    ExtractedPanel(loci={"L1": locus}, n_alleles=8, provenance=_make_provenance()).save_db(db)
+    out = tmp_path / f"{mi_prefix}_phasing"
+    cli.main(["phase", "--panel-db", str(db), "--out-dir", str(out)])
+    return db, out
 
 
-def _group(items, near_cols=0):
-    """`items`: (tract, het bases text, reads); near columns all empty."""
-    tract = np.array([t for t, _, _ in items], dtype=object)
-    het = np.array([[ord(c) for c in h] for _, h, _ in items], dtype=np.uint8)
-    near = np.full((len(items), near_cols), ord("."), dtype=np.uint8)
-    reads = np.array([n for _, _, n in items], dtype=np.int64)
-    groups = lv._pileup_groups(tract, het, near, reads)
-    return {(g["tract"], g["het"].decode()): (g["reads"], g["joined"]) for g in groups}
+def test_with_phasing_the_snv_columns_and_label_rows(tmp_path):
+    db, out = _snv_panel(tmp_path)
+    phasing = lv.PhasingIndex.read(out)
+    panel = ExtractedPanel.load_db(db)
+    phasing.check(panel, db)
+    view = locus_view_data("L1", panel.loci["L1"], "S", near=2, phasing=phasing)
+
+    snv_cols = [c for c in view["pileup"]["up"] if "snv" in c]
+    assert [c["index"] for c in view["pileup"]["up"]] == [4, 6, 7]
+    assert [(c["index"], c["snv"]["status"], c["snv"]["allele_major"],
+             c["snv"]["allele_minor"], c["snv"]["is_anchor"]) for c in snv_cols] == \
+        [(4, "phased", "C", "G", True)]
+    assert view["flanking"]["up"]["snv"] == [4]
+    assert view["phasing"]["summary"]["reads_major"] == "70"
+
+    labels = pd.read_csv(out / "haplotype_calls.tsv", sep="\t", dtype=str)
+    label_of = dict(zip(labels.mi, labels.phase_label, strict=True))
+    locus = panel.loci["L1"]
+    want = Counter()
+    for mi, seq, n in zip(locus.mi, locus.seq, locus.count, strict=True):
+        want[(str(seq), label_of[str(mi)])] += int(n)
+    rows = view["pileup"]["rows"]
+    assert {(r["tract"], r["label"]): r["reads"] for r in rows} == dict(want)
+    at_snv = view["pileup"]["up"].index(snv_cols[0])
+    for r in rows:
+        base, counts = r["up"][at_snv]
+        expected = {"hap_major": "C", "hap_minor": "G", "unk": ""}[r["label"]]
+        assert base == expected
+        if r["label"] == "unk":
+            assert counts == [0] * len(lv.FLANKING_BASES)
 
 
-def test_a_read_with_an_empty_cell_joins_the_one_group_it_matches():
-    assert _group([("GGG", "AC", 10), ("GGG", "TC", 5), ("GGG", "A.", 2)]) == \
-        {("GGG", "AC"): (12, 2), ("GGG", "TC"): (5, 0)}
+def test_the_label_join_uses_mi_and_strand(tmp_path):
+    db, out = _snv_panel(tmp_path)
+    phasing = lv.PhasingIndex.read(out)
+    locus = ExtractedPanel.load_db(db).loci["L1"]
+    labels = pd.read_csv(out / "haplotype_calls.tsv", sep="\t", dtype=str)
+    got = phasing.labels_of("L1", locus.mi, locus.strand)
+    want = {(m, s): lab for m, s, lab in zip(labels.mi, labels.strand, labels.phase_label,
+                                             strict=True)}
+    assert [lv.PHASE_LABELS[g] for g in got] == \
+        [want[(str(m), str(s))] for m, s in zip(locus.mi, locus.strand, strict=True)]
 
 
-def test_of_two_matching_groups_the_read_joins_the_larger():
-    assert _group([("GGG", "AC", 10), ("GGG", "AT", 30), ("GGG", "A.", 2)]) == \
-        {("GGG", "AC"): (10, 0), ("GGG", "AT"): (32, 2)}
-
-
-def test_a_read_that_matches_no_group_forms_its_own():
-    """No group has its tract, or its bases disagree: it forms a group, shared by
-    reads of the same pattern."""
-    assert _group([("GGG", "AC", 10), ("GGGG", "A.", 2), ("GGG", "T.", 1),
-                   ("GGG", "T.", 3)]) == \
-        {("GGG", "AC"): (10, 0), ("GGGG", "A."): (2, 2), ("GGG", "T."): (4, 4)}
-
-
-def test_with_no_heterozygous_column_each_tract_is_a_group():
-    assert _group([("GGG", "", 4), ("GGG", "", 1), ("GG", "", 2)]) == \
-        {("GGG", ""): (5, 0), ("GG", ""): (2, 0)}
+def test_a_stale_pair_is_refused(tmp_path):
+    db, _ = _snv_panel(tmp_path)
+    _, other = _snv_panel(tmp_path, mi_prefix="X")
+    with pytest.raises(ValueError, match=r"X_phasing does not belong to the panel .*M\.panel"
+                                         r"\.db: the read families differ at L1"):
+        lv.make_server([(db, other)], 0)
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +250,8 @@ def test_with_no_heterozygous_column_each_tract_is_a_group():
 
 @pytest.fixture
 def server(tmp_path):
-    db, _ = _panel(tmp_path, MOVED)
-    srv = lv.make_server([db, db], 0)
+    db, out = _snv_panel(tmp_path)
+    srv = lv.make_server([(db, out), (db, None)], 0)
     thread = threading.Thread(target=srv.serve_forever, daemon=True)
     thread.start()
     yield f"http://127.0.0.1:{srv.server_address[1]}"
@@ -226,33 +267,31 @@ def _get(url):
 
 def test_the_server_serves_the_page_the_list_and_one_locus(server):
     status, page = _get(server + "/")
-    assert status == 200 and b"/locus" not in page.split(b"<script")[0]
-    status, body = _get(server + "/loci")
-    listing = json.loads(body)
-    assert [e["locus"] for e in listing["loci"]] == ["PolyG5177+", "PolyG5177-"]
-    assert listing["loci"][0]["samples"][0]["n_reads"] == 5
-    assert listing["loci"][0]["samples"][1]["status"] == "recovered"
-    status, body = _get(server + "/locus?sample=1&locus=PolyG5177-")
-    data = json.loads(body)
-    assert data["locus"] == "PolyG5177-" and data["counters"]["n_reads"] == 5
+    assert status == 200 and b"<html" in page
+    listing = json.loads(_get(server + "/loci")[1])
+    assert [e["locus"] for e in listing["loci"]] == ["L1"]
+    assert [s["n_snvs"] for s in listing["loci"][0]["samples"]] == [1, None]
+    assert listing["samples"][0]["phasing"] is not None and listing["samples"][1]["phasing"] is None
+    with_phasing = json.loads(_get(server + "/locus?sample=0&locus=L1")[1])
+    without = json.loads(_get(server + "/locus?sample=1&locus=L1")[1])
+    assert {r["label"] for r in with_phasing["pileup"]["rows"]} == \
+        {"hap_major", "hap_minor", "unk"}
+    assert {r["label"] for r in without["pileup"]["rows"]} == {None}
 
 
 def test_an_unknown_sample_or_locus_is_404(server):
-    for query in ("sample=0&locus=PolyG9", "sample=5&locus=PolyG5177+"):
+    for query in ("sample=0&locus=L9", "sample=5&locus=L1"):
         with pytest.raises(urllib.error.HTTPError) as err:
             _get(server + "/locus?" + query)
         assert err.value.code == 404
         assert b"No locus" in err.value.read()
 
 
-def test_a_settings_change_changes_the_columns(server):
-    def columns(query):
-        data = json.loads(_get(server + "/locus?sample=0&locus=PolyG5177%2B&" + query)[1])
-        return data["pileup"]["up"] + data["pileup"]["dn"]
+def test_the_near_setting_changes_the_columns(server):
+    def up_columns(query):
+        data = json.loads(_get(server + "/locus?sample=0&locus=L1&" + query)[1])
+        return [c["index"] for c in data["pileup"]["up"]]
 
-    strict = columns("het=0.5")
-    assert len(strict) == 2 * lv.NEAR_BASES and not any(c["het"] for c in strict)
-    assert len(columns("het=0.5&near=2")) == 4
-    default = columns("")
-    assert sum(c["het"] for c in default) > 0
-    assert sum(c["het"] for c in columns("het=0")) > sum(c["het"] for c in default)
+    assert up_columns("near=2") == [4, 6, 7]
+    assert up_columns("near=0") == [4]
+    assert up_columns("") == list(range(2, 8))

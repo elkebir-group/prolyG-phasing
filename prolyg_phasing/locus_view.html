@@ -74,7 +74,6 @@ canvas{display:block}
   <h1>PolyG Locus Reads <small>from panel.db · G strand</small></h1>
   <div class="seg" role="group" aria-label="Sample" id="samples"></div>
   <input type="search" id="q" placeholder="Find locus, e.g. PolyG4320" aria-label="Find locus">
-  <label class="note">heterozygous limit <input type="number" id="het" min="0.05" max="0.5" step="0.05" style="width:5em"></label>
   <label class="note">bases next to each flank <input type="number" id="near" min="0" max="50" step="1" style="width:4em"></label>
 </header>
 <p id="loading">Loading the locus list…</p>
@@ -104,8 +103,8 @@ function coord(orient,start,i){return orient==="-"?start-i:start+i}
 async function load(){
   LIST=await (await fetch("loci")).json();
   $("#loading").hidden=true; $("#app").hidden=false;
-  $("#het").value=LIST.het_limit; $("#near").value=LIST.near;
-  for(const id of ["het","near"])$("#"+id).addEventListener("change",renderDetail);
+  $("#near").value=LIST.near;
+  $("#near").addEventListener("change",renderDetail);
   LIST.samples.forEach((s,k)=>{const b=document.createElement("button");b.textContent=s.sample;
     b.onclick=()=>{sample=k;route()};$("#samples").appendChild(b)});
   const F=[["all","All"],["noflank","No flank"],["noposition","Side with no position"],["noreads","No reads"]];
@@ -156,7 +155,7 @@ async function renderDetail(){
   if(!current){el.innerHTML=`<div class="card"><p class="note">Pick a locus in the list. Every sequence is on the G strand: at a "-" locus the read bases are reverse-complemented and reference coordinates fall from left to right.</p></div>`;return}
   if(!info(current)){el.innerHTML=`<div class="card"><p class="note">${esc(current.locus)} is not in the panel of ${esc(LIST.samples[sample].sample)}.</p></div>`;return}
   const want=current,ws=sample;
-  const q=new URLSearchParams({sample,locus:current.locus,het:$("#het").value,near:$("#near").value});
+  const q=new URLSearchParams({sample,locus:current.locus,near:$("#near").value});
   const resp=await fetch("locus?"+q);
   if(want!==current||ws!==sample)return;
   if(!resp.ok){el.innerHTML=`<div class="card"><p class="note">${esc(await resp.text())}</p></div>`;return}
@@ -191,6 +190,12 @@ function headCard(r){
     <div><b>Alignments over the locus</b>${fmt(o)} · ${fmt(k.n_alignments_placed)} placed (${pct(o?k.n_alignments_placed/o:NaN)})</div>
     <div><b>Dropped, share of the alignments over the locus</b>${drops.filter(([,f])=>k[f]).map(([l,f])=>`${l} ${share(k[f])}`).join(" · ")||"none"}</div>
    </div>`;
+  const ph=r.phasing;
+  if(!ph)c.innerHTML+=`<p class="note">No phasing result was given for this sample: the pile-up rows group by tract only.</p>`;
+  else if(ph.summary){const m=ph.summary;c.innerHTML+=`<div class="kv">
+    <div><b>Haplotype profiles</b><span class="mono">major ${esc(m.hap_major_profile||"–")} · minor ${esc(m.hap_minor_profile||"–")}</span></div>
+    <div><b>SNVs</b>${fmt(+m.n_snvs_phased)} phased · ${fmt(+m.n_snvs_dropped_low_linkage)} dropped (low linkage)</div>
+    <div><b>Reads by phase label</b>major ${fmt(+m.reads_major)} · minor ${fmt(+m.reads_minor)} · unk ${fmt(+m.reads_unk)}</div></div>`}
   if(!r.flanks)c.innerHTML+=`<p class="note">This locus has no flank in this sample, so it has no reads.</p>`;
   return c;
 }
@@ -235,15 +240,17 @@ function histCard(r){
   c.innerHTML+=s;return c;
 }
 function cellsText(cnt){const B=LIST.flanking_bases;return cnt?B.split("").map((b,k)=>cnt[k]?`${b} ${fmt(cnt[k])}`:"").filter(Boolean).join(" · ")||"no read base":""}
+function snvStatus(v){return v.status==="phased"?(v.is_anchor?"phased, anchor":"phased"):v.status==="dropped_low_linkage"?"dropped, low linkage":v.status}
 function pileCard(r){
-  const c=document.createElement("div");c.className="card";const P=r.pileup,S=r.settings;
-  const nHet=P.up.filter(x=>x.het).length+P.dn.filter(x=>x.het).length;
+  const c=document.createElement("div");c.className="card";const P=r.pileup;
+  const snvCols=[...P.up,...P.dn].filter(x=>x.snv);
+  const how=r.phasing?`Columns: the ${r.near} flanking bases next to each flank and one column per SNV of the phasing result (${snvCols.length} here; header: the two bases and the status). A row is a group of reads with one tract and one phase label (major, minor or unk, from the read family's label).`
+    :`Columns: the ${r.near} flanking bases next to each flank. No phasing result was given for this sample, so a row is a group of reads with one tract.`;
   c.innerHTML=`<h2>Pile-up</h2>
-   <div class="note">G strand. On each side the columns are the ${S.near} flanking bases next to the flank and every heterozygous flanking position: one where the second most common base has at least ${pct(S.het_limit)} of the covered reads (${nHet} here). A short mark stands for the positions skipped between two columns. The flank columns show the panel's flank, not each read's bases. The upstream flank sits in fixed columns; the tract is left-justified and padded (a line) to the longest tract drawn.
-   A row is a group of reads with one tract and one set of bases at the heterozygous columns. A read with no base at a heterozygous column joins the group with its tract and its other bases (the largest, if more than one); the second number on the right counts these reads. At the other columns a row shows the most common base of its reads, and an empty cell where none of them has a base (a gap, a clip, or a base below the quality limit).
+   <div class="note">G strand. ${how} At each column a row shows the most common base of its reads, and an empty cell where none of its reads has a base there (a gap, a clip, or a base below the quality limit); hover for the counts. A short mark stands for the positions skipped between two columns. The flank columns show the panel's flank, not each read's bases. The upstream flank sits in fixed columns; the tract is left-justified and padded (a line) to the longest tract drawn.
    ${fmt(P.n_rows)} rows${P.reads_not_drawn?`; ${fmt(P.reads_not_drawn)} reads in rows not drawn (the ${fmt(P.rows.length)} rows with the most reads are drawn)`:""}.</div>
    <div class="scroll" id="pilehost"></div>
-   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank</span><span><i style="background:var(--tract)"></i>tract</span><span><i style="background:var(--warn)"></i>heterozygous column</span><span>empty cell: no read base</span></div>`;
+   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank</span><span><i style="background:var(--tract)"></i>tract</span><span><i style="background:var(--warn)"></i>SNV of the phasing result</span><span>empty cell: no read base</span></div>`;
   queueMicrotask(()=>drawPile(r));return c;
 }
 function layoutSide(cols,upstream){
@@ -266,8 +273,8 @@ function drawPile(r){
     if(sl.flank||sl.tract!=null){g.fillStyle=sl.tract!=null?css("--tract"):css("--flank");g.globalAlpha=.75;g.fillRect(j*CW,4,CW-1,5);g.globalAlpha=1;
       g.fillStyle=css("--fg");g.fillText(sl.flank?sl.b:(r.reference_tract[sl.tract]||""),x,38);return}
     const c=sl.col;
-    if(c.het){g.fillStyle=css("--warn");g.fillRect(j*CW,4,CW-1,5);g.fillStyle=css("--fg");
-      g.fillText(c.bases[0][0],x,22);g.fillText(c.bases[1][0],x,38)}
+    if(c.snv){g.fillStyle=c.snv.status==="phased"?css("--warn"):css("--muted");g.fillRect(j*CW,4,CW-1,5);g.fillStyle=css("--fg");
+      g.fillText(c.snv.allele_major,x,22);g.fillText(c.snv.allele_minor,x,38)}
     else{g.fillStyle=css("--muted");g.fillText(c.majority,x,38)}});
   let y=HEAD;
   for(const row of P.rows){
@@ -280,7 +287,7 @@ function drawPile(r){
       if(ch===" "){g.fillStyle=css("--fg");g.fillRect(j*CW,y+RH/2-1,CW,2);return}
       g.globalAlpha=faded?.45:1;g.fillStyle=baseColor(ch);g.fillRect(j*CW,y,CW-1,RH-1);g.globalAlpha=1});
     g.fillStyle=css("--muted");g.textAlign="left";g.font=font;
-    g.fillText(fmt(row.reads)+(row.joined?` (${fmt(row.joined)})`:""),width*CW+6,y+RH-2);y+=RH}
+    g.fillText(fmt(row.reads)+(row.label?" "+row.label.replace("hap_",""):""),width*CW+6,y+RH-2);y+=RH}
   host.textContent="";host.appendChild(cv);
   const tip=$("#tip");
   cv.onmousemove=e=>{const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
@@ -289,20 +296,20 @@ function drawPile(r){
     if(sl.gap)html="<b>skipped flanking positions</b>";
     else if(sl.flank)html=`<b>${sl.flank==="up"?"upstream":"downstream"} flank, base ${sl.i+1}</b> (the panel's flank)`;
     else if(sl.tract!=null)html=`<b>tract, position ${sl.tract+1}</b>`;
-    else{const c=sl.col;html=`<b>reference ${fmt(c.position)}</b> · ${sl.side==="up"?"upstream":"downstream"}, ${sl.side==="up"?r.flanking.up.width-c.index:c.index+1} from the flank${c.het?` · heterozygous: ${c.bases.map(([b,f])=>`${b} ${pct(f)}`).join(", ")}`:""}<div>all reads: ${cellsText(c.counts)}</div>`}
+    else{const c=sl.col;html=`<b>reference ${fmt(c.position)}</b> · ${sl.side==="up"?"upstream":"downstream"}, ${sl.side==="up"?r.flanking.up.width-c.index:c.index+1} from the flank${c.snv?` · SNV ${esc(c.snv.allele_major)}/${esc(c.snv.allele_minor)}, minor ${pct(c.snv.vaf_minor)} of ${fmt(c.snv.coverage)} families, ${snvStatus(c.snv)}${c.snv.status==="phased"?`; major haplotype ${esc(c.snv.hap_major_base)}, minor ${esc(c.snv.hap_minor_base)}`:""}`:""}<div>all reads: ${cellsText(c.counts)}</div>`}
     const k=Math.floor((yy-HEAD)/RH);
     if(yy>=HEAD&&k<P.rows.length){const row=P.rows[k];
-      html+=`<div class="mono">${fmt(row.reads)} reads${row.joined?`, ${fmt(row.joined)} joined with empty cells`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;
-      if(sl.side){const cell=row[sl.side][sl.k];html+=`<div>this row: ${cell[1]?cellsText(cell[1]):(cell[0]||"no base")}</div>`}}
+      html+=`<div class="mono">${fmt(row.reads)} reads${row.label?` · label ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;
+      if(sl.side){const cell=row[sl.side][sl.k];html+=`<div>this row: ${cellsText(cell[1])}</div>`}}
     tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";tip.innerHTML=html};
   cv.onmouseleave=()=>tip.hidden=true;
 }
 function flankingCard(r){
   const c=document.createElement("div");c.className="card";
   c.innerHTML=`<h2>Flanking base counts</h2>
-   <div class="note">Every flanking position of each side, in reference columns, over the kept reads: coverage (top) and the share of each base (bottom). A position is marked where the second most common base has at least ${pct(r.settings.het_limit)} of the covered reads, as at a heterozygous SNV; these positions are the heterozygous columns of the pile-up. Reference coordinate on hover.</div>
+   <div class="note">Every flanking position of each side, in reference columns, over the kept reads: coverage (top) and the share of each base (bottom). ${r.phasing?"A position is marked where the phasing result has an SNV; these are the SNV columns of the pile-up.":"No phasing result was given for this sample, so no position is marked."} Reference coordinate on hover.</div>
    <div id="flankhost"></div><div class="note" id="flanklist"></div>
-   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--bN)"></i>N</span><span><i style="background:var(--warn)"></i>heterozygous position</span></div>`;
+   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--bN)"></i>N</span><span><i style="background:var(--warn)"></i>SNV of the phasing result</span></div>`;
   queueMicrotask(()=>drawFlanking(r));return c;
 }
 function drawFlanking(r){
@@ -321,11 +328,11 @@ function drawFlanking(r){
       const h=(CH-4)*cov/maxCov;s+=`<rect x="${x}" y="${CH-h}" width="${cw}" height="${h}" fill="var(--muted)"/>`;
       let yy=CH+4;const sorted=cnt.map((v,k)=>[v,k]).sort((a,b)=>b[0]-a[0]);
       for(const [v,k] of sorted){if(!v)continue;const hh=SH*v/cov;s+=`<rect x="${x}" y="${yy}" width="${cw}" height="${hh}" fill="${baseColor(B[k])}"/>`;yy+=hh}
-      if(S.het[i]){marked.push({name,at,cnt,cov});s+=`<rect x="${x}" y="${CH+SH+6}" width="${Math.max(cw,2)}" height="6" fill="var(--warn)"/>`}});
+      if(S.snv.includes(i)){marked.push({name,at,cnt,cov});s+=`<rect x="${x}" y="${CH+SH+6}" width="${Math.max(cw,2)}" height="6" fill="var(--warn)"/>`}});
     sideNotes.push(`${name}: ${fmt(S.width)} positions${S.width?`, reference ${fmt(S.start)}–${fmt(coord(orient,S.start,S.width-1))} from left to right`:", no flanking bases"}`);
     x0+=S.width*cw+GAP}
   s+=`</svg>`;host.innerHTML=`<div class="scroll">${s}</div><div class="note">${sideNotes.join(" · ")}. The gap between the two blocks stands for the flanks and the tract.</div>`;
-  $("#flanklist").innerHTML=marked.length?"Marked positions: "+marked.map(m=>`${m.name} ${fmt(m.at)}: `+B.split("").map((b,k)=>m.cnt[k]?`${b} ${pct(m.cnt[k]/m.cov)}`:"").filter(Boolean).join(" ")).join(" · "):"No heterozygous position.";
+  $("#flanklist").innerHTML=marked.length?"Marked positions: "+marked.map(m=>`${m.name} ${fmt(m.at)}: `+B.split("").map((b,k)=>m.cnt[k]?`${b} ${pct(m.cnt[k]/m.cov)}`:"").filter(Boolean).join(" ")).join(" · "):(r.phasing?"The phasing result has no SNV at this locus.":"");
   const svg=host.querySelector("svg"),tip=$("#tip");
   svg.onmousemove=e=>{const rc=svg.getBoundingClientRect(),xx=(e.clientX-rc.left)*W/rc.width;const col=cols.find(o=>xx>=o.x&&xx<o.x+o.w);
     if(!col){tip.hidden=true;return}

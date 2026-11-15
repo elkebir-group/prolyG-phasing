@@ -162,11 +162,17 @@ normal and its tumors). It is an HTTP server bound to 127.0.0.1; it reads
 the panels on request, not the BAMs, and writes no files. Each panel is a
 sample tab, named by the file stem of the BAM its provenance names.
 
+Each --panel may name, after the panel, the --out-dir of "prolyg-phasing
+phase" for that panel. The viewer then reads snv_calls.tsv,
+haplotype_calls.tsv and locus_summary.tsv (not phasing.pkl): the pile-up
+shows a column per SNV and splits its rows by the read family's phase
+label. At start it checks that the phasing result belongs to the panel
+(the same read families at every locus) and stops if it does not.
+
 Per locus and sample the page shows the flanks and the reference tract on
 the G strand, the tracts with their read and molecule counts, the largest G
-run per read, a pile-up of the tracts with the bases next to each flank and
-the heterozygous flanking positions, the base counts over the full flanking
-width of each side, and every per-locus counter.
+run per read, the pile-up, the base counts over the full flanking width of
+each side, and every per-locus counter.
 
 On a remote machine, reach the page through an ssh tunnel from your own
 computer: ssh -N -L <port>:localhost:<port> <host>, then open
@@ -174,16 +180,24 @@ http://localhost:<port>/. Stop the server with Ctrl-C."""
 
 
 def _add_view_loci_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--panel", required=True, type=Path, action="append",
-                   help="A panel.db of the donor. Repeat for each sample.")
+    p.add_argument("--panel", required=True, type=Path, action="append", nargs="+",
+                   metavar=("PANEL_DB", "PHASING_DIR"),
+                   help="A panel.db of the donor, and optionally the phasing output "
+                        "directory for it. Repeat for each sample.")
     p.add_argument("--port", type=int, default=8765,
                    help="The port on 127.0.0.1 to serve the page on.")
 
 
 def _run_view_loci(args: argparse.Namespace) -> None:
-    server = make_server(args.panel, args.port)
+    pairs = []
+    for values in args.panel:
+        if len(values) > 2:
+            raise SystemExit(f"--panel takes a panel.db and at most one phasing directory, "
+                             f"not {len(values)} paths")
+        pairs.append((values[0], values[1] if len(values) == 2 else None))
+    server = make_server(pairs, args.port)
     port = server.server_address[1]
-    print(f"Serving {len(args.panel)} panels at http://localhost:{port}/ "
+    print(f"Serving {len(pairs)} panels at http://localhost:{port}/ "
           f"(remote: ssh -N -L {port}:localhost:{port} <host>). Ctrl-C stops.", flush=True)
     try:
         server.serve_forever()
