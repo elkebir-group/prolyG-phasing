@@ -366,7 +366,7 @@ def test_no_pair_reaches_a_positive_objective():
 
 def _locus_flanks(records, name="L") -> fc.LocusFlanks:
     pair = fc.FlankPair("ACTTCAGCAT", "CAAATTTTAT", 41, (("ACTTCAGCAT", "CAAATTTTAT"),),
-                        30, 25, placement=None)
+                        30, 25)
     positions = tuple(fc.FlankPosition(r, 20, 18) if r.has_position
                       else fc.FlankPosition(r, 0, 0) for r in records)
     return fc.LocusFlanks(name, "+", pair, positions, 30)
@@ -651,7 +651,7 @@ def _locus_reads(reads: list[str], coords: list[list[int]], bed: tuple[int, int]
 
 
 def _vote(loc: fc.LocusReads):
-    return fc.flank_records_from_alignments(loc, fc.solve_flank_pair(loc.reads, loc.marks))
+    return fc.flank_records_from_alignments(loc, *fc.solve_and_place(loc.reads, loc.marks))
 
 
 _READ = "TTACCAGTCA" + "ACTTCAGCAT" + "G" * 12 + "CAAATTTTAT" + "ACCAGTCATT"
@@ -669,16 +669,14 @@ def test_a_flank_range_against_the_polyg_direction_is_an_invariant_error():
     """No real alignment maps two read bases out of order."""
     pair = fc.solve_flank_pair([_READ], slow.marks([_READ]))
     assert (pair.upstream, pair.downstream) == ("ACTTCAGCAT", "CAAATTTTAT")
-    loc = _locus_reads([_READ], [_coords_with(120, 119)])
     with pytest.raises(RuntimeError, match="L: the upstream flank ACTTCAGCAT runs from"):
-        fc.flank_records_from_alignments(loc, pair)
+        _vote(_locus_reads([_READ], [_coords_with(120, 119)]))
 
 
 def test_a_flank_base_without_a_coordinate_leaves_no_position():
-    pair = fc.solve_flank_pair([_READ], slow.marks([_READ]))
     coords = list(range(100, 100 + len(_READ)))
     coords[41] = -1  # the downstream outer base is soft-clipped
-    up, dn = fc.flank_records_from_alignments(_locus_reads([_READ], [coords]), pair)
+    up, dn = _vote(_locus_reads([_READ], [coords]))
     assert up.record.ref_positions == tuple(range(110, 120))
     assert (up.n_reads_positioned, up.n_reads_at_position) == (1, 1)
     assert dn == fc.FlankPosition(FlankRecord("CAAATTTTAT", (), 0), 0, 0)

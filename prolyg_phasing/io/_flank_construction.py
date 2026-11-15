@@ -591,8 +591,6 @@ class FlankPair:
         The reads, with repeats.
     n_reads_placed : int
         The reads with at least one placement under the pair, of any value.
-    placement : FlankPlacement
-        Each input read's placement under the pair, in input order.
     """
 
     upstream: str
@@ -601,11 +599,18 @@ class FlankPair:
     optimal_pairs: tuple[tuple[str, str], ...]
     n_reads: int
     n_reads_placed: int
-    placement: FlankPlacement = dataclasses.field(compare=False, repr=False)
 
 
 def solve_flank_pair(reads: Sequence[str], marks: Sequence[Marks]) -> FlankPair | None:
-    """The pair of flanks that maximizes F over `reads` (polyG orientation, upper-case).
+    """The pair of flanks that maximizes F over `reads`; see :func:`solve_and_place`."""
+    solved = solve_and_place(reads, marks)
+    return None if solved is None else solved[0]
+
+
+def solve_and_place(reads: Sequence[str], marks: Sequence[Marks]
+                    ) -> tuple[FlankPair, FlankPlacement] | None:
+    """The optimal flank pair over `reads` (polyG orientation, upper-case), and
+    each read's placement under it, in input order.
 
     `marks` gives each read's marked bases. Returns None when no pair
     reaches F > 0. Raises RuntimeError when the extraction's placement of
@@ -636,8 +641,9 @@ def solve_flank_pair(reads: Sequence[str], marks: Sequence[Marks]) -> FlankPair 
     if total != best:
         raise RuntimeError(f"the placement of the optimal pair ({upstream}, {downstream}) "
                            f"gives F = {total} half units, the search {best}")
-    return FlankPair(upstream, downstream, best, tuple(optimal), int(weights.sum()),
-                     int(weights[placement.placed].sum()), placement.take(inverse))
+    pair = FlankPair(upstream, downstream, best, tuple(optimal), int(weights.sum()),
+                     int(weights[placement.placed].sum()))
+    return pair, placement.take(inverse)
 
 
 # ---------------------------------------------------------------------------
@@ -730,12 +736,13 @@ class FlankPosition:
     n_reads_at_position: int
 
 
-def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
+def flank_records_from_alignments(loc: LocusReads, pair: FlankPair, placement: FlankPlacement
                                   ) -> tuple[FlankPosition, FlankPosition]:
     """The upstream and downstream flank positions of a solved pair, from the alignments.
 
     The kept reads are those whose best placement under the pair has a
-    value of at least 0 (`pair.placement`). In each one, the flank
+    value of at least 0 (`placement`, from :func:`solve_and_place`). In
+    each one, the flank
     occupies the read bases from its outer base to its run-side base at
     the best placement
     (:func:`~prolyg_phasing.io._flank_placement.flank_outer_bases`). The
@@ -757,7 +764,6 @@ def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
     pair from one read always runs toward the G run and spans at least two
     bases; RuntimeError if the chosen pair does not.
     """
-    placement = pair.placement
     up_outer, dn_outer = flank_outer_bases(loc.reads, placement, pair.upstream,
                                            pair.downstream)
     kept = np.flatnonzero(placement.kept)
@@ -835,11 +841,12 @@ def solve_locus(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
     loc = locus_reads(bam, name, chrom, bed_start, bed_end)
     if loc is None:
         return None
-    pair = solve_flank_pair(loc.reads, loc.marks)
-    if pair is None:
+    solved = solve_and_place(loc.reads, loc.marks)
+    if solved is None:
         return LocusFlanks(name, loc.ref_orientation, None, None, len(loc.reads))
+    pair, placement = solved
     return LocusFlanks(name, loc.ref_orientation, pair,
-                       flank_records_from_alignments(loc, pair), len(loc.reads))
+                       flank_records_from_alignments(loc, pair, placement), len(loc.reads))
 
 
 # ---------------------------------------------------------------------------
