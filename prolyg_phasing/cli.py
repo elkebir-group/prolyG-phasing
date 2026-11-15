@@ -114,7 +114,7 @@ occurs exactly at a tract edge in at least one read. The table adds, per
 locus, the objective, the reads, the reads placed, and the number of
 tied optimal pairs. The read filters are the extraction's defaults. Loci
 run in parallel; the worker count comes from the free cores and memory
-of this machine.
+of this machine, or from --workers.
 
 Each BED locus side gets a row. A locus whose reference window no read
 rebuilds has the status ref_window_unrecoverable on both sides and no
@@ -141,10 +141,21 @@ def _add_build_flanks_args(p: argparse.ArgumentParser) -> None:
                     help="Sample name to write into the outputs. Required when "
                          "the BAM has no read-group SM; when it has one, it "
                          "must equal it.")
+    p.add_argument("--workers", type=_positive_int, default=None,
+                    help="Worker processes. Without it, the count comes from the "
+                         "free cores and memory of this machine.")
+
+
+def _positive_int(text: str) -> int:
+    """An integer of at least 1, for an argparse type."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, not {value}")
+    return value
 
 
 def _run_build_flanks(args: argparse.Namespace) -> None:
-    n_workers = worker_count()
+    n_workers = worker_count() if args.workers is None else args.workers
     result = build_flanks(args.bam, args.bed, n_workers=n_workers, sample=args.sample)
     path = write_flank_table(result, args.out_prefix)
     print(f"{result.sample}: {len(result.records)} loci with flanks; {n_workers} workers; "
@@ -330,7 +341,8 @@ def _run_ref_phase(args: argparse.Namespace) -> None:
     )
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The `prolyg-phasing` argument parser, with every subcommand."""
     p = argparse.ArgumentParser(
         prog="prolyg-phasing",
         description="Read/family interrupter-pattern and flanking-SNV "
@@ -378,7 +390,11 @@ def main(argv: list[str] | None = None) -> None:
     _add_ref_phase_args(ref_phase_p)
     ref_phase_p.set_defaults(func=_run_ref_phase)
 
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
     args.func(args)
 
 
