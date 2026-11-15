@@ -73,7 +73,7 @@ canvas{display:block}
 .lab-unk{background:transparent!important;border:1.5px solid var(--muted)}
 .help{display:inline-block;width:15px;height:15px;line-height:15px;border-radius:50%;text-align:center;font-size:10px;background:var(--chip);color:var(--muted);cursor:help;text-transform:none;letter-spacing:0;vertical-align:1px}
 .sec{margin-top:10px}
-.rowband{position:absolute;left:0;pointer-events:none;outline:2px solid var(--fg);background:rgba(127,127,127,.12);border-radius:2px}
+.rowband{position:absolute;left:0;box-sizing:border-box;pointer-events:none;border:2px solid var(--fg);background:none;border-radius:2px}
 .zoomreset{font:inherit;font-size:11px;padding:0 8px;border:1px solid var(--line);border-radius:4px;background:var(--panel);color:var(--fg);cursor:pointer}
 .zoomreset:disabled{opacity:.4;cursor:default} .sec h3{font-size:12px;margin:0 0 4px;font-weight:600;display:flex;gap:8px;align-items:center}
 .sec h3 i{display:inline-block;width:10px;height:10px;border-radius:2px}
@@ -377,7 +377,10 @@ function drawPile(r,S,host,T){
   const tip=$("#tip");
   cv.onmousemove=e=>{if(HELP.open)return;const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left-STRIPE-LEFT,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
     const kk=Math.floor((yy-HEAD)/RH),onRow=yy>=HEAD&&kk>=0&&kk<S.rows.length;
-    band.hidden=!onRow;if(onRow){band.style.top=(HEAD+kk*RH-1)+"px";band.style.height=(RH+1)+"px";band.style.width=W+"px"}
+    // The outline sits inside the canvas (its border is inside its box), has
+    // no fill, and ends just past the row's read count.
+    band.hidden=!onRow;if(onRow){g.font=font;const end=X(width)+6+g.measureText(fmt(S.rows[kk].reads)).width+4;
+      band.style.top=(HEAD+kk*RH-2)+"px";band.style.height=(RH+3)+"px";band.style.width=Math.min(W,end)+"px"}
     if(onRow&&(j<0||j>=width)){const row=S.rows[kk];tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";
       tip.innerHTML=`<div class="mono">${fmt(row.reads)} reads${row.label?` · ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;return}
     if(j<0||j>=width){tip.hidden=true;return}
