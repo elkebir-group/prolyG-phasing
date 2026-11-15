@@ -43,6 +43,7 @@ from tests._hand_built_reads import (
     LOCI,
     ReadCase,
     _sub,
+    bed_interval,
     chromosome,
     downstream_flank,
     placements,
@@ -122,15 +123,20 @@ def _reads_from(hap: str, n: int, rl: int = 100, jitter: int = 15) -> list[str]:
     return out
 
 
+def _counted(reads: list[str]) -> list[tuple[str, frozenset[int], int]]:
+    """Distinct reads with every base marked, and their counts, for the slow reference."""
+    return [(s, slow.every_base(s), reads.count(s)) for s in sorted(set(reads))]
+
+
 def _check(reads: list[str], u: str, v: str, tracts: set[str]) -> fc.FlankPair:
     """The expected pair is optimal, F equals the slow reference, and every
     optimal pair gives the expected tracts."""
-    pair = fc.solve_flank_pair(reads)
-    counted = sorted({s: reads.count(s) for s in reads}.items())
+    pair = fc.solve_flank_pair(reads, slow.marks_matrix(reads))
+    counted = _counted(reads)
     assert (u, v) in pair.optimal_pairs
     assert pair.objective_half_units == slow.objective(counted, u, v)[0]
     for pu, pv in pair.optimal_pairs:
-        got = place_polyg_reads(reads, pu, pv)
+        got = place_polyg_reads(reads, pu, pv, slow.marks_matrix(reads))
         assert set(got.tracts[got.kept]) == tracts, (pu, pv)
     return pair
 
@@ -159,7 +165,7 @@ def test_the_g_run_beats_an_empty_tract():
     hap = LEFT + UP + "G" * 12 + DN + RIGHT
     reads = _reads_from(hap, 50)
     pair = _check(reads, UP, DN, {"G" * 12})
-    counted = sorted({s: reads.count(s) for s in reads}.items())
+    counted = _counted(reads)
     far_u, far_v = LEFT[30:40], LEFT[40:50]
     if far_u[-1] != "G" and far_v[0] != "G":
         assert slow.objective(counted, far_u, far_v)[0] < pair.objective_half_units
@@ -182,9 +188,9 @@ def test_a_run_ending_in_a_non_g_error_is_not_placed_at_the_old_edge():
     clean = _reads_from(LEFT + UP + "G" * 10 + DN + RIGHT, 30, jitter=3)
     error = _reads_from(LEFT + UP + "G" * 9 + "T" + DN + RIGHT, 30, jitter=3)
     reads = clean + error
-    counted = sorted({s: reads.count(s) for s in reads}.items())
+    counted = _counted(reads)
     assert slow.objective(counted, UP, DN) == (30 * 20, 30)
-    pair = fc.solve_flank_pair(reads)
+    pair = fc.solve_flank_pair(reads, slow.marks_matrix(reads))
     for pu, pv in pair.optimal_pairs:
         assert slow.objective(counted, pu, pv)[0] == pair.objective_half_units
 
@@ -207,7 +213,7 @@ def test_reads_with_a_negative_value_add_zero():
     decoy = (_background(30) + "ACTTCAGCTT" + "G" + "ACTTACATCATTACCATACA" + "G"
              + "CAAATTTAAT" + _background(40))
     reads = _reads_from(hap, 60, jitter=3) + [decoy] * 40
-    assert slow.best_placement(decoy, UP, DN)[0] == -80
+    assert slow.best_placement(decoy, UP, DN, slow.every_base(decoy))[0] == -80
     pair = _check(reads, UP, DN, {"G" * 10})
     assert pair.objective_half_units == 1200
     assert pair.n_reads_placed == 100
@@ -219,7 +225,8 @@ def test_a_non_g_base_and_three_g_next_to_the_run_join_the_tract():
                        (LEFT + UP + "GGGA" + "G" * 10 + DN + RIGHT, "GGGA" + "G" * 10)):
         reads = _reads_from(hap, 60)
         pair = _check(reads, UP, DN, {tract})
-        search = fc._LocusSearch(sorted(set(reads)), [1] * len(set(reads)))
+        distinct = sorted(set(reads))
+        search = fc._LocusSearch(distinct, slow.marks_matrix(distinct), [1] * len(distinct))
         us = [decode(int(c)) for c in search.u.candidates]
         vs = [decode(int(c))[::-1] for c in search.v.candidates]
         assert not any(u[-4:-1] == "GGG" for u in us)
@@ -261,11 +268,68 @@ def test_search_matches_a_brute_force_search_on_random_read_sets():
     n_checked = 0
     for _ in range(25):
         reads = _random_read_set(rng)
-        counted = sorted({s: reads.count(s) for s in reads}.items())
+        counted = _counted(reads)
         us, vs = slow.candidates(counted)
         values = {(u, v): slow.objective(counted, u, v)[0] for u in us for v in vs}
         best = max(values.values(), default=0)
-        pair = fc.solve_flank_pair(reads)
+        pair = fc.solve_flank_pair(reads, slow.marks_matrix(reads))
+        if best <= 0:
+            assert pair is None
+            continue
+        n_checked += 1
+        assert pair.objective_half_units == best
+        assert set(pair.optimal_pairs) == {p for p, f in values.items() if f == best}
+        assert pair.n_reads_placed == slow.objective(counted, pair.upstream,
+                                                     pair.downstream)[1]
+    assert n_checked >= 20
+
+
+def _two_run_read_set(rng: random.Random) -> tuple[list[str], list[frozenset[int]]]:
+    """Reads that hold two G runs, each between its own flanks, and their marks.
+
+    The second run lies in the reads' later half. A read's marks are an
+    interval around its first run, around its second run, a short random
+    interval, or nothing, so the same string can carry different marks.
+    """
+    run1 = "G" * rng.randint(5, 9)
+    run2 = "G" * rng.randint(5, 9)
+    hap = (_background(8) + UP + run1 + DN + _background(6) + "TTACCAGTCA" + run2
+           + "CCATACAATC" + _background(8))
+    start2 = hap.index("TTACCAGTCA") + 10
+    reads, marks = [], []
+    for _ in range(rng.randint(4, 8)):
+        s = list(hap)
+        for _ in range(rng.randint(0, 1)):
+            s[rng.randrange(len(s))] = rng.choice("ACGT")
+        read = "".join(s)
+        choice = rng.random()
+        if choice < 0.4:
+            m = range(len(_background(8)) + 10, len(_background(8)) + 10 + len(run1))
+        elif choice < 0.7:
+            m = range(start2, start2 + len(run2))
+        elif choice < 0.9:
+            lo = rng.randrange(len(read) - 3)
+            m = range(lo, lo + 3)
+        else:
+            m = range(0)
+        reads.append(read)
+        marks.append(frozenset(m))
+    return reads, marks
+
+
+def test_search_matches_a_brute_force_search_with_marks():
+    """The marks choose which G run, if any, a read's placement may surround."""
+    rng = random.Random(29)
+    n_checked = 0
+    for _ in range(25):
+        reads, marks = _two_run_read_set(rng)
+        keys = sorted(set(zip(reads, marks, strict=True)), key=lambda k: (k[0], sorted(k[1])))
+        counted = [(r, m, sum(1 for x in zip(reads, marks, strict=True) if x == (r, m)))
+                   for r, m in keys]
+        us, vs = slow.candidates(counted)
+        values = {(u, v): slow.objective(counted, u, v)[0] for u in us for v in vs}
+        best = max(values.values(), default=0)
+        pair = fc.solve_flank_pair(reads, slow.marks_matrix(reads, marks))
         if best <= 0:
             assert pair is None
             continue
@@ -278,8 +342,9 @@ def test_search_matches_a_brute_force_search_on_random_read_sets():
 
 
 def test_no_pair_reaches_a_positive_objective():
-    assert fc.solve_flank_pair(["ACTACTACTACTACTACTACT"] * 5) is None
-    assert fc.solve_flank_pair([]) is None
+    reads = ["ACTACTACTACTACTACTACT"] * 5
+    assert fc.solve_flank_pair(reads, slow.marks_matrix(reads)) is None
+    assert fc.solve_flank_pair([], slow.marks_matrix([])) is None
 
 
 # ---------------------------------------------------------------------------
@@ -429,8 +494,9 @@ def test_build_flanks_end_to_end(tmp_path):
         # The flanks place the variant reads with their true tuple.
         records = [r for r in pysam.AlignmentFile(str(bam_path)).fetch(
             f"PolyG5177_{'plus' if o == '+' else 'minus'}") if r.query_name.startswith("m0_")]
-        out = place_flanks([r.query_sequence for r in records], upstream=up, downstream=dn,
-                           ref_orientation=o)
+        bed_start, bed_end = bed_interval(locus, o)
+        out = place_flanks(records, upstream=up, downstream=dn, ref_orientation=o,
+                           bed_start=bed_start, bed_end=bed_end)
         assert {run_tuple(t) for t in out.tracts} == {(13,)}
 
     path = fc.write_flank_table(result, tmp_path / "normal")
@@ -536,7 +602,7 @@ def _locus_reads(reads: list[str], coords: list[list[int]]) -> fc.LocusReads:
     matrix = np.full((len(reads), width), -1, dtype=np.int64)
     for row, c in enumerate(coords):
         matrix[row, :len(c)] = c
-    return fc.LocusReads("L", "+", 0, "", 0, 0, reads, matrix)
+    return fc.LocusReads("L", "+", 0, "", 0, 0, reads, matrix, 0, 1 << 30)
 
 
 _READ = "TTACCAGTCA" + "ACTTCAGCAT" + "G" * 12 + "CAAATTTTAT" + "ACCAGTCATT"
@@ -552,7 +618,7 @@ def _coords_with(outer: int, run: int) -> list[int]:
 
 def test_a_flank_range_against_the_polyg_direction_is_an_invariant_error():
     """No real alignment maps two read bases out of order."""
-    pair = fc.solve_flank_pair([_READ])
+    pair = fc.solve_flank_pair([_READ], slow.marks_matrix([_READ]))
     assert (pair.upstream, pair.downstream) == ("ACTTCAGCAT", "CAAATTTTAT")
     loc = _locus_reads([_READ], [_coords_with(120, 119)])
     with pytest.raises(RuntimeError, match="L: the upstream flank ACTTCAGCAT runs from"):
@@ -560,7 +626,7 @@ def test_a_flank_range_against_the_polyg_direction_is_an_invariant_error():
 
 
 def test_a_flank_base_without_a_coordinate_leaves_no_record():
-    pair = fc.solve_flank_pair([_READ])
+    pair = fc.solve_flank_pair([_READ], slow.marks_matrix([_READ]))
     coords = list(range(100, 100 + len(_READ)))
     coords[41] = -1  # the downstream outer base is soft-clipped
     up, dn = fc.flank_records_from_alignments(_locus_reads([_READ], [coords]), pair)
@@ -575,7 +641,7 @@ def test_the_pair_vote_differs_from_two_separate_votes():
     give (110, 119) and 2 give (112, 121)."""
     rows = ([_coords_with(110, 119)] * 3 + [_coords_with(112, 121)] * 2
             + [_coords_with(112, -1)] * 2 + [_coords_with(-1, 121)] * 2)
-    pair = fc.solve_flank_pair([_READ])
+    pair = fc.solve_flank_pair([_READ], slow.marks_matrix([_READ]))
     up, _ = fc.flank_records_from_alignments(_locus_reads([_READ] * len(rows), rows), pair)
     assert up.record.ref_positions == tuple(range(110, 120))
     assert (up.n_reads_positioned, up.n_reads_at_position) == (5, 3)

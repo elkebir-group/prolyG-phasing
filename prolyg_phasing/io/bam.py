@@ -11,7 +11,8 @@ Every locus needs its two flanks from the matched normal's flank table
    reference position the flank table records, lies in it.
 2. **Extraction** — fetch overlapping alignments, apply the read filters
    (MAPQ, SA, TLEN, MI), cut each read's tract between its best placement
-   of the two flanks (`_flank_placement.place_flanks`), group by
+   of the two flanks (`_flank_placement.place_flanks`; the tract must hold
+   a read base aligned inside the BED interval), group by
    `query_name` for pair collapse, merge or drop pair disagreements, and
    emit per-(MI, strand, seq) read counts.
 
@@ -200,18 +201,22 @@ def locus_geometry(
 
 
 def place_locus_flanks(alignments: Sequence[pysam.AlignedSegment],
-                       geometry: LocusGeometry) -> FlankPlacement:
+                       geometry: LocusGeometry, bed_start: int, bed_end: int
+                       ) -> FlankPlacement:
     """Each alignment's tract under the locus's two flanks; one entry per alignment.
 
     This is the per-read decision of the extraction: the tract and the
-    drop reasons (see :func:`place_flanks`). It reads only the read
-    sequence.
+    drop reasons (see :func:`place_flanks`). The tract edges come from the
+    read sequence; the alignment marks the read bases inside the BED
+    interval ``[bed_start, bed_end)``, and the tract must hold one.
     """
     return place_flanks(
-        [r.query_sequence for r in alignments],
+        alignments,
         upstream=geometry.upstream,
         downstream=geometry.downstream,
         ref_orientation=geometry.ref_orientation,
+        bed_start=bed_start,
+        bed_end=bed_end,
     )
 
 
@@ -592,6 +597,7 @@ def new_locus_qc() -> dict[str, int]:
         "n_alignments_drop_upstream_flank_not_placed": 0,
         "n_alignments_drop_downstream_flank_not_placed": 0,
         "n_alignments_drop_no_placement": 0,
+        "n_alignments_drop_no_bed_base": 0,
         "n_alignments_drop_negative_value": 0,
         "n_read_pairs": 0,
         "n_read_pairs_drop_disagree": 0,
@@ -605,9 +611,12 @@ def _count_flank_drops(placement: FlankPlacement, qc: dict) -> None:
     ``n_alignments_placed`` counts the reads with at least one placement,
     of any value. A read with no match of a flank adds to that side's
     ``flank_not_placed`` counter; a read with no match on both sides adds
-    to both. A read with both matches adds to ``no_placement`` when it has
-    no placement, and to ``negative_value`` when its best value is
-    negative. ``n_alignments_drop_flank`` counts each dropped read once.
+    to both. A read with both matches adds to exactly one of these, or is
+    kept: ``no_placement`` when no upstream match ends before a downstream
+    match starts; ``no_bed_base`` when such pairs exist but none holds a
+    base aligned inside the BED interval; ``negative_value`` when its best
+    value is negative. ``n_alignments_drop_flank`` counts each dropped read
+    once.
     """
     qc["n_alignments_placed"] += int(placement.placed.sum())
     qc["n_alignments_drop_flank"] += int((~placement.kept).sum())
@@ -616,6 +625,7 @@ def _count_flank_drops(placement: FlankPlacement, qc: dict) -> None:
     qc["n_alignments_drop_downstream_flank_not_placed"] += int(
         (~placement.downstream_matched).sum())
     qc["n_alignments_drop_no_placement"] += int(placement.no_placement.sum())
+    qc["n_alignments_drop_no_bed_base"] += int(placement.no_bed_base.sum())
     qc["n_alignments_drop_negative_value"] += int(placement.negative_value.sum())
 
 
@@ -671,7 +681,7 @@ def _extract_locus(
         if bed_overlap:
             bed_alignments.append(r)
 
-    placement = place_locus_flanks(bed_alignments, geometry)
+    placement = place_locus_flanks(bed_alignments, geometry, bed_start, bed_end)
     _count_flank_drops(placement, qc)
     # Read back as Python lists: the pass below indexes them one read at
     # a time, and unboxing a numpy scalar per read costs more than the

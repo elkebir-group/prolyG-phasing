@@ -4,12 +4,37 @@ It shares no code with the library. It compares substrings directly, one
 read and one position at a time. All values are in half units: a tract G
 scores +2, any other base -4, a substitution costs 2, and a gap of g bases
 costs 3 + g. A match allows one substitution, or one gap of 1 or 2 bases
-between two inner flank bases, never both.
+between two inner flank bases, never both. A placement needs a marked read
+base strictly between its two edges; `marked` is the set of marked read
+positions in polyG orientation.
 """
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 MAX_GAP = 2
+
+
+def every_base(read: str) -> frozenset[int]:
+    """Every position of the read: the marks of a read that lies inside the BED interval."""
+    return frozenset(range(len(read)))
+
+
+def marks_matrix(reads: list[str], marked: list[Collection[int]] | None = None):
+    """The library's form of the marks: one bool row per read, as wide as the
+    longest read. With `marked` None, every base is marked."""
+    import numpy as np
+
+    out = np.zeros((len(reads), max(map(len, reads), default=0)), dtype=bool)
+    for row, read in enumerate(reads):
+        for i in (every_base(read) if marked is None else marked[row]):
+            out[row, i] = True
+    return out
+
+
+def _holds_mark(marked: Collection[int], a: int, b: int) -> bool:
+    return any(a < i < b for i in marked)
 
 
 def _mismatches_up_to_one(s: str, x: str) -> int | None:
@@ -77,7 +102,8 @@ def score(tract: str) -> int:
     return sum(2 if ch == "G" else -4 for ch in tract)
 
 
-def best_placement(read: str, u: str, v: str) -> tuple[int, int, int] | None:
+def best_placement(read: str, u: str, v: str, marked: Collection[int]
+                   ) -> tuple[int, int, int] | None:
     """(value, a, b) of the read's best placement, or None.
 
     Of placements with the top value, the largest a wins, then the
@@ -87,7 +113,7 @@ def best_placement(read: str, u: str, v: str) -> tuple[int, int, int] | None:
     ups, downs = u_positions(read, u), v_positions(read, v)
     for a in sorted(ups, reverse=True):
         for b in sorted(downs):
-            if b <= a:
+            if b <= a or not _holds_mark(marked, a, b):
                 continue
             val = score(read[a + 1:b]) - ups[a] - downs[b]
             if best is None or val > best[0]:
@@ -95,11 +121,12 @@ def best_placement(read: str, u: str, v: str) -> tuple[int, int, int] | None:
     return best
 
 
-def objective(reads: list[tuple[str, int]], u: str, v: str) -> tuple[int, int]:
-    """F in half units, and the reads with a placement. `reads` is (string, count)."""
+def objective(reads: list[tuple[str, Collection[int], int]], u: str, v: str
+              ) -> tuple[int, int]:
+    """F in half units, and the reads with a placement. `reads` is (string, marked, count)."""
     total, placed = 0, 0
-    for read, count in reads:
-        p = best_placement(read, u, v)
+    for read, marked, count in reads:
+        p = best_placement(read, u, v, marked)
         if p is None:
             continue
         total += count * max(0, p[0])
@@ -107,23 +134,28 @@ def objective(reads: list[tuple[str, int]], u: str, v: str) -> tuple[int, int]:
     return total, placed
 
 
-def candidates(reads: list[tuple[str, int]]) -> tuple[set[str], set[str]]:
-    """Every 10-base A/C/G/T string at a tract edge of some read, by the constraints.
+def candidates(reads: list[tuple[str, Collection[int], int]]) -> tuple[set[str], set[str]]:
+    """Every 10-base A/C/G/T string at a tract edge of a placement, by the constraints.
 
-    A ``u`` ends at an edge base and does not end with three G and then its
-    last base; a ``v`` starts at an edge base and does not start with its
-    first base and then three G.
+    A ``u`` ends at an upstream edge ``a`` and does not end with three G and
+    then its last base; a ``v`` starts at a downstream edge ``b`` and does
+    not start with its first base and then three G. The edge must face an
+    edge on the other side, with room for a match there (8 bases) and a
+    marked base in between.
     """
     us, vs = set(), set()
-    for read, _ in reads:
-        for a in range(9, len(read) - 1):
+    for read, marked, _ in reads:
+        n = len(read)
+        ups = [a for a in range(n - 1) if read[a] != "G" and read[a + 1] == "G"]
+        downs = [b for b in range(1, n) if read[b] != "G" and read[b - 1] == "G"]
+        for a in ups:
             u = read[a - 9:a + 1]
-            if (read[a] != "G" and read[a + 1] == "G" and set(u) <= set("ACGT")
-                    and u[-4:-1] != "GGG"):
+            if (a >= 9 and set(u) <= set("ACGT") and u[-4:-1] != "GGG"
+                    and any(b <= n - 8 and _holds_mark(marked, a, b) for b in downs)):
                 us.add(u)
-        for b in range(1, len(read) - 9):
+        for b in downs:
             v = read[b:b + 10]
-            if (read[b] != "G" and read[b - 1] == "G" and set(v) <= set("ACGT")
-                    and v[1:4] != "GGG"):
+            if (b <= n - 10 and set(v) <= set("ACGT") and v[1:4] != "GGG"
+                    and any(a >= 7 and _holds_mark(marked, a, b) for a in ups)):
                 vs.add(v)
     return us, vs

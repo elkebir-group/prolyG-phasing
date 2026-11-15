@@ -3,10 +3,15 @@
 A locus has one flank on each side of the repeat: a 10-base string ``u``
 upstream and ``v`` downstream, in polyG orientation. The matched normal's
 reads choose the pair (see :mod:`prolyg_phasing.io._flank_construction`).
-This module states what the pair does to one read. The tract depends only
-on the read sequence, not on the alignment. The search for the pair and
-the extraction use this one definition. The alignments give only the
-reference coordinates of each flank (`FlankRecord.ref_positions`).
+This module states what the pair does to one read. The search for the pair
+and the extraction use this one definition. The alignment does two things
+only: it marks the read bases inside the locus's BED interval, and it gives
+the reference coordinates of each flank (`FlankRecord.ref_positions`). It
+never sets a tract edge.
+
+**Marks.** A read base is marked when its alignment aligns it (CIGAR M, =
+or X) to a reference position inside the BED interval ``[bed_start,
+bed_end)``. A base in an insertion or a soft clip is never marked.
 
 **Match.** A flank matches a read substring if the substring differs from
 it by nothing, by one substitution, or by one gap of 1 or 2 bases. A gap
@@ -18,8 +23,9 @@ flank base.
 **Placement.** A match of ``u`` whose substring ends at read position
 ``a``, and a match of ``v`` whose substring starts at a later position
 ``b``, where ``read[a]`` and ``read[b]`` are not G and ``read[a + 1]`` and
-``read[b - 1]`` are G. The tract is ``read[a + 1:b]``; it starts and ends
-with G. Only positions with that shape are tract edges, so a match is
+``read[b - 1]`` are G, and a marked base ``i`` lies between them: ``a < i <
+b``. The tract is ``read[a + 1:b]``; it starts and ends with G and holds a
+marked base. Only positions with that shape are tract edges, so a match is
 looked for only there. The search covers the whole read.
 
 **Value.** All values are in half units, so every value is an integer. A
@@ -34,7 +40,7 @@ the largest ``a`` and, among those, the smallest ``b``. A piece that does
 not raise the value does not join the tract. At a flank of a repeated
 unit such as TGG, each extra GGT adds 0, so this rule keeps those copies
 in the flank. A read with no placement, or whose best value is negative,
-is dropped and counted.
+is dropped and counted (see :class:`FlankPlacement` for the reasons).
 """
 
 from __future__ import annotations
@@ -286,8 +292,36 @@ class BestPlacements:
     downstream_start: np.ndarray
 
 
+def mark_bounds(marks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The nearest marked base after and before each read position.
+
+    Parameters
+    ----------
+    marks : ndarray of bool, shape (n_reads, width)
+
+    Returns
+    -------
+    next_mark : ndarray of int64
+        ``next_mark[r, j]`` is the smallest marked ``i > j``, else `width`.
+    last_mark : ndarray of int64
+        ``last_mark[r, j]`` is the largest marked ``i < j``, else -1.
+
+    A marked base lies strictly between ``a`` and ``b`` exactly when
+    ``next_mark[a] < b``, and exactly when ``a < last_mark[b]``.
+    """
+    n, width = marks.shape
+    col = np.arange(width, dtype=np.int64)[None, :]
+    at_or_after = np.minimum.accumulate(np.where(marks, col, width)[:, ::-1], axis=1)[:, ::-1]
+    next_mark = np.full((n, width), width, dtype=np.int64)
+    next_mark[:, :-1] = at_or_after[:, 1:]
+    at_or_before = np.maximum.accumulate(np.where(marks, col, -1), axis=1)
+    last_mark = np.full((n, width), -1, dtype=np.int64)
+    last_mark[:, 1:] = at_or_before[:, :-1]
+    return next_mark, last_mark
+
+
 def best_placements(scores: np.ndarray, upstream: Sequence[np.ndarray],
-                    downstream: Sequence[np.ndarray]) -> BestPlacements:
+                    downstream: Sequence[np.ndarray], marks: np.ndarray) -> BestPlacements:
     """Each read's highest-value placement, from the match lists of two flanks.
 
     Parameters
@@ -297,15 +331,19 @@ def best_placements(scores: np.ndarray, upstream: Sequence[np.ndarray],
     upstream, downstream : sequence of ndarray
         ``(r, a, cost)`` and ``(r, b, cost)`` as :func:`flank_matches`
         returns them. A position may repeat; its lowest cost counts.
+    marks : ndarray of bool, shape (n_reads, width)
+        The marked bases of each read.
 
     Notes
     -----
     With ``open_cost[a] = scores[a + 1] + cost_u(a)`` and
     ``close_value[b] = scores[b] - cost_v(b)``, the value of ``(a, b)`` is
-    ``close_value[b] - open_cost[a]``. The best value is the largest
-    ``close_value[b]`` minus the smallest ``open_cost[a]`` with ``a < b``.
-    Among the placements with that value, the largest ``a`` wins, and then
-    the smallest ``b``: the shortest tract.
+    ``close_value[b] - open_cost[a]``. The pair is a placement when a
+    marked base lies between them: ``a < last_mark[b]``, or equally
+    ``b > next_mark[a]`` (:func:`mark_bounds`). The best value is the
+    largest ``close_value[b]`` minus the smallest ``open_cost[a]`` with
+    ``a < last_mark[b]``. Among the placements with that value, the
+    largest ``a`` wins, and then the smallest ``b``: the shortest tract.
     """
     n_reads, width = scores.shape[0], scores.shape[1] - 1
     placed = np.zeros(n_reads, dtype=bool)
@@ -324,11 +362,17 @@ def best_placements(scores: np.ndarray, upstream: Sequence[np.ndarray],
         np.minimum.at(open_cost, (ru[mu] - lo, au[mu]), scores[ru[mu], au[mu] + 1] + cu[mu])
         close_value = np.full((hi - lo, width), -_FAR, dtype=np.int64)
         np.maximum.at(close_value, (rv[mv] - lo, bv[mv]), scores[rv[mv], bv[mv]] - cv[mv])
-        # The smallest open cost before each b, and the largest close value after each a.
-        before = np.full_like(open_cost, _FAR)
-        before[:, 1:] = np.minimum.accumulate(open_cost, axis=1)[:, :-1]
-        after = np.full_like(close_value, -_FAR)
-        after[:, :-1] = np.maximum.accumulate(close_value[:, ::-1], axis=1)[:, ::-1][:, 1:]
+        next_mark, last_mark = mark_bounds(marks[lo:hi])
+        # The smallest open cost at an a before the last mark before each b:
+        # prefix[:, j] is the smallest open cost at a < j.
+        prefix = np.full((hi - lo, width + 1), _FAR, dtype=np.int64)
+        prefix[:, 1:] = np.minimum.accumulate(open_cost, axis=1)
+        before = np.take_along_axis(prefix, np.maximum(last_mark, 0), axis=1)
+        # The largest close value at a b past the next mark after each a:
+        # suffix[:, j] is the largest close value at b >= j.
+        suffix = np.full((hi - lo, width + 2), -_FAR, dtype=np.int64)
+        suffix[:, :width] = np.maximum.accumulate(close_value[:, ::-1], axis=1)[:, ::-1]
+        after = np.take_along_axis(suffix, next_mark + 1, axis=1)
         ok_b = (close_value > -_FAR) & (before < _FAR)
         has = ok_b.any(axis=1)
         if not has.any():
@@ -337,8 +381,9 @@ def best_placements(scores: np.ndarray, upstream: Sequence[np.ndarray],
         ok_a = (open_cost < _FAR) & (after > -_FAR) & (after - open_cost == best[:, None])
         a = width - 1 - ok_a[:, ::-1].argmax(axis=1)
         open_at_a = open_cost[np.arange(hi - lo), a]
+        mark_after_a = next_mark[np.arange(hi - lo), a]
         cols = np.arange(width)[None, :]
-        ok_ab = ((cols > a[:, None]) & (close_value > -_FAR)
+        ok_ab = ((cols > mark_after_a[:, None]) & (close_value > -_FAR)
                  & (close_value - open_at_a[:, None] == best[:, None]))
         b = ok_ab.argmax(axis=1)
         rows = np.arange(lo, hi)[has]
@@ -542,10 +587,21 @@ class FlankPlacement:
     upstream_matched, downstream_matched : ndarray of bool
         The flank matches the read at some tract edge.
     no_placement : ndarray of bool
-        Both flanks match the read, but no placement exists: no upstream
-        match ends before a downstream match starts.
+        Both flanks match the read, but no upstream match ends before a
+        downstream match starts.
+    no_bed_base : ndarray of bool
+        Both flanks match the read and an upstream match ends before a
+        downstream match starts, but no such pair holds a marked base
+        between them.
     negative_value : ndarray of bool
         The read's best placement has a negative value.
+
+    Notes
+    -----
+    The drop reasons of a read come in this order. A flank with no match
+    gives its side's reason; when neither flank matches, the read has both
+    side reasons and no other. A read whose two flanks match has exactly
+    one of `no_placement`, `no_bed_base`, `negative_value`, or is kept.
     value : ndarray of int64
         The best value in half units; 0 where the read has no placement.
     upstream_run_side, downstream_run_side : ndarray of int64
@@ -560,39 +616,71 @@ class FlankPlacement:
     upstream_matched: np.ndarray
     downstream_matched: np.ndarray
     no_placement: np.ndarray
+    no_bed_base: np.ndarray
     negative_value: np.ndarray
     value: np.ndarray
     upstream_run_side: np.ndarray
     downstream_run_side: np.ndarray
 
 
-def place_polyg_reads(reads: Sequence[str], upstream: str, downstream: str
-                      ) -> FlankPlacement:
+def distinct_reads(reads: Sequence[str], marks: np.ndarray
+                   ) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """The distinct (read, marks) pairs, in sorted order, and each read's index among them.
+
+    Two reads are the same when their strings and their marks over the
+    read's length agree. Returns the distinct strings, their marks as a
+    bool matrix as wide as the longest read, and the inverse index.
+    """
+    longest = max(map(len, reads), default=0)
+    width = max(longest, 1)
+    if marks.ndim != 2 or marks.shape[0] != len(reads) or marks.shape[1] < longest:
+        raise ValueError("marks must hold one row per read, as wide as the longest read")
+    keys = [(s, np.packbits(marks[i, :len(s)]).tobytes()) for i, s in enumerate(reads)]
+    order = {key: i for i, key in enumerate(sorted(set(keys)))}
+    inverse = np.fromiter((order[key] for key in keys), dtype=np.int64, count=len(keys))
+    first = np.zeros(len(order), dtype=np.int64)
+    first[inverse[::-1]] = np.arange(len(keys))[::-1]
+    strings = [reads[i] for i in first]
+    out = np.zeros((len(order), width), dtype=bool)
+    for j, i in enumerate(first):
+        out[j, :len(reads[i])] = marks[i, :len(reads[i])]
+    return strings, out, inverse
+
+
+def place_polyg_reads(reads: Sequence[str], upstream: str, downstream: str,
+                      marks: np.ndarray) -> FlankPlacement:
     """Each read's tract under the flanks `upstream` and `downstream`.
 
-    Reads are in polyG orientation and upper-case. A read string is placed
-    once, however often it occurs.
+    Reads are in polyG orientation and upper-case. `marks` holds one row
+    per read, in polyG read order, at least as wide as the longest read:
+    True at a marked base (see the module docstring). A distinct (read,
+    marks) pair is placed once, however often it occurs.
     """
     n = len(reads)
     tracts = np.full(n, None, dtype=object)
     if not n:
         no = np.zeros(0, dtype=bool)
         z = np.zeros(0, dtype=np.int64)
-        return FlankPlacement(tracts, no, no, no, no, no, no, z, z, z)
-    distinct, inverse = np.unique(np.asarray(reads, dtype=object), return_inverse=True)
-    distinct = list(distinct)
-    inverse = inverse.ravel()
+        return FlankPlacement(tracts, no, no, no, no, no, no, no, z, z, z)
+    distinct, distinct_marks, inverse = distinct_reads(reads, marks)
     up, dn = flank_matches(distinct, upstream, downstream)
-    best = best_placements(tract_scores(code_matrix(distinct)[0]), up, dn)
+    best = best_placements(tract_scores(code_matrix(distinct)[0]), up, dn, distinct_marks)
     up_any = np.zeros(len(distinct), dtype=bool)
     dn_any = np.zeros(len(distinct), dtype=bool)
     up_any[up[0]] = True
     dn_any[dn[0]] = True
+    # An upstream match before a downstream match, marked base or not.
+    first_up = np.full(len(distinct), _FAR, dtype=np.int64)
+    np.minimum.at(first_up, up[0], up[1])
+    last_dn = np.full(len(distinct), -1, dtype=np.int64)
+    np.maximum.at(last_dn, dn[0], dn[1])
+    ordered = (first_up < last_dn)[inverse]
 
     placed = best.placed[inverse]
     value = best.value[inverse]
     upstream_matched = up_any[inverse]
     downstream_matched = dn_any[inverse]
+    both = upstream_matched & downstream_matched
     negative = placed & (value < 0)
     kept = placed & ~negative
     a = best.upstream_end[inverse]
@@ -605,7 +693,8 @@ def place_polyg_reads(reads: Sequence[str], upstream: str, downstream: str
         placed=placed,
         upstream_matched=upstream_matched,
         downstream_matched=downstream_matched,
-        no_placement=upstream_matched & downstream_matched & ~placed,
+        no_placement=both & ~ordered,
+        no_bed_base=both & ordered & ~placed,
         negative_value=negative,
         value=value,
         upstream_run_side=a,
@@ -613,21 +702,53 @@ def place_polyg_reads(reads: Sequence[str], upstream: str, downstream: str
     )
 
 
-def place_flanks(read_seqs: Sequence[str], *, upstream: FlankRecord,
-                 downstream: FlankRecord, ref_orientation: str) -> FlankPlacement:
-    """Each read's tract under one locus's two flanks.
+def polyg_reference_coordinates(alignments: Sequence, ref_orientation: str) -> np.ndarray:
+    """The reference coordinate of each read base, in polyG read order.
+
+    Returns an int64 array of shape (n_reads, longest read). Only aligned
+    read bases (CIGAR M, = or X) get a coordinate; every other entry is -1.
+    At a "-" locus polyG index ``i`` is query index ``len - 1 - i``.
+    `alignments` are `pysam.AlignedSegment` records.
+    """
+    lengths = [len(r.query_sequence) for r in alignments]
+    out = np.full((len(alignments), max(lengths, default=0) or 1), -1, dtype=np.int64)
+    for row, (r, n) in enumerate(zip(alignments, lengths, strict=True)):
+        pairs = np.asarray(r.get_aligned_pairs(matches_only=True), dtype=np.int64)
+        if pairs.size == 0:
+            continue
+        query = pairs[:, 0] if ref_orientation == "+" else n - 1 - pairs[:, 0]
+        out[row, query] = pairs[:, 1]
+    return out
+
+
+def bed_marks(ref_coords: np.ndarray, bed_start: int, bed_end: int) -> np.ndarray:
+    """The marked bases: those aligned to a reference position in ``[bed_start, bed_end)``.
+
+    `ref_coords` is :func:`polyg_reference_coordinates` of the reads.
+    """
+    return (ref_coords >= bed_start) & (ref_coords < bed_end)
+
+
+def place_flanks(alignments: Sequence, *, upstream: FlankRecord, downstream: FlankRecord,
+                 ref_orientation: str, bed_start: int, bed_end: int) -> FlankPlacement:
+    """Each alignment's tract under one locus's two flanks.
 
     Parameters
     ----------
-    read_seqs : sequence of str
-        Read sequences as stored in the BAM (reference orientation).
+    alignments : sequence of pysam.AlignedSegment
+        The reads, with sequences as stored in the BAM (reference
+        orientation).
     upstream, downstream : FlankRecord
         The two flanks of the locus.
     ref_orientation : str
         "+" if the repeat reads as Gs on the reference, "-" otherwise.
+    bed_start, bed_end : int
+        The locus's BED interval; it sets the marked bases.
     """
-    return place_polyg_reads(polyg_reads(read_seqs, ref_orientation), upstream.bases,
-                             downstream.bases)
+    reads = polyg_reads([r.query_sequence for r in alignments], ref_orientation)
+    marks = bed_marks(polyg_reference_coordinates(alignments, ref_orientation),
+                      bed_start, bed_end)
+    return place_polyg_reads(reads, upstream.bases, downstream.bases, marks)
 
 
 # ---------------------------------------------------------------------------

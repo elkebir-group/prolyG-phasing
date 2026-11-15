@@ -5,18 +5,25 @@ maximizes, over the matched normal's reads,
 
     F(u, v) = sum over reads of max(0, the value of the read's best placement),
 
-where the match, the placement and the value are those of
-:mod:`prolyg_phasing.io._flank_placement`. A read with no placement, or
-whose best value is negative, adds 0. The constraints:
+where the match, the marks, the placement and the value are those of
+:mod:`prolyg_phasing.io._flank_placement`: a placement holds a read base
+that the aligner aligns inside the BED interval. A read with no placement,
+or whose best value is negative, adds 0. The constraints:
 
 - The last base of ``u`` and the first base of ``v`` are not G.
 - ``u`` does not end with three G and then its last base; ``v`` does not
   start with its first base and then three G. Joining such a piece to the
   tract raises each read's value, so the tract must not stop in front of it.
 - Each of ``u`` and ``v`` is a candidate: it occurs exactly at a tract edge
-  in at least one read. A ``u`` candidate is the 10 bases that end at a
-  non-G base followed by a G; a ``v`` candidate is the 10 bases that start
-  at a non-G base preceded by a G.
+  of a placement in at least one read. A ``u`` candidate is the 10 bases
+  that end at an upstream tract edge ``a`` (a non-G base followed by a G)
+  for which the read has a downstream tract edge ``b`` (a non-G base
+  preceded by a G) with room for a downstream match (at least 8 bases from
+  ``b`` to the read end) and a marked base between ``a`` and ``b``. A ``v``
+  candidate is the same on the other side: the 10 bases that start at a
+  downstream tract edge with an upstream tract edge before it, at least 8
+  bases from the read start, and a marked base between them. Only these
+  edges can hold a flank of a placement.
 
 **The search is exact over the candidates.** All values are integers in
 half units. The downstream side runs the upstream code on per-read
@@ -24,16 +31,20 @@ reversed reads with reversed strings: ``v`` matches read ``r`` at start
 ``b`` exactly when ``reverse(v)`` matches ``reverse(r)`` at end
 ``len(r) - 1 - b``.
 
-1. **Index.** Per side, the 12-base window that ends at each tract edge is
-   stored once per distinct window, with the read positions that show it.
+1. **Index.** Per side, the 12-base window that ends at each tract edge
+   that can hold a flank of a placement (as for the candidates) is stored
+   once per distinct window, with the read positions that show it. No
+   other edge is part of a placement, so dropping them changes no value.
    Every candidate's matches to the distinct windows, with their lowest
    cost, come from listing each window's neighbors under the match rule.
 2. **Bounds.** ``M[r, a]`` is the best tract score that starts after edge
-   ``a`` of read ``r``. A candidate's position bound sums ``max(0, M -
+   ``a`` of read ``r`` and ends at a downstream tract edge past the first
+   marked base after ``a``. A candidate's position bound sums ``max(0, M -
    cost)`` over its matched positions, weighted by read count. Its
    per-read bound takes the largest such term per read. A pair's joint
    bound sums, per read, the smaller of its two per-read bounds. Each
-   bound is at least F of every pair it covers.
+   bound is at least F of every pair it covers: each covers every
+   placement the reads allow, and more.
 3. **Search.** A first best value comes from the 40 candidates per side
    with the highest position bound. Then every pair whose bounds reach the
    current best is evaluated exactly. All pairs that reach the optimum are
@@ -57,7 +68,6 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from collections import Counter
 from collections.abc import Iterator, Sequence
 from multiprocessing import Pool
 from pathlib import Path
@@ -81,13 +91,16 @@ from prolyg_phasing.io._flank_placement import (
     FlankRecord,
     G,
     N,
+    bed_marks,
     code_matrix,
     decode,
+    distinct_reads,
     edge_windows,
     flank_outer_bases,
+    mark_bounds,
     place_polyg_reads,
     polyg_reads,
-    tract_edges,
+    polyg_reference_coordinates,
     tract_scores,
 )
 from prolyg_phasing.io.bam import (
@@ -186,6 +199,12 @@ def _split_lists(n: int, k: np.ndarray, r: np.ndarray, p: np.ndarray, c: np.ndar
             for i in range(n)]
 
 
+def _reverse_rows(marks: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """Each row of `marks` reversed within its read's length; False past it."""
+    index = lengths[:, None] - 1 - np.arange(marks.shape[1])[None, :]
+    return np.where(index >= 0, np.take_along_axis(marks, np.maximum(index, 0), axis=1), False)
+
+
 class _ReadSide:
     """The reads of one side: forward for ``u``, reversed per read for ``v``.
 
@@ -200,8 +219,11 @@ class _ReadSide:
         :func:`tract_scores` of `mat`.
     best_tract : ndarray of int64
         ``M[r, a]``: the best tract score from edge ``a`` to a closing edge
-        with room for a downstream match, at least 0; 0 where ``a`` is not
-        an edge.
+        with room for a downstream match and a marked base in between, at
+        least 0; 0 where ``a`` is not an edge.
+    usable : ndarray of bool
+        The edges that can hold this side's flank in a placement: an
+        opening edge with such a closing edge after it.
     windows : ndarray
         The distinct 12-base edge windows.
     candidates : ndarray of int64
@@ -210,8 +232,10 @@ class _ReadSide:
         Each candidate's position-summed bound.
     """
 
-    def __init__(self, strings: Sequence[str], weights: np.ndarray, *, reverse: bool):
+    def __init__(self, strings: Sequence[str], marks: np.ndarray, weights: np.ndarray, *,
+                 reverse: bool):
         self.mat, self.lengths = code_matrix(strings, reverse=reverse)
+        self.marks = _reverse_rows(marks, self.lengths) if reverse else marks
         self.n_reads, self.width = self.mat.shape
         if self.n_reads >= 1 << 24 or self.width >= 256:
             raise ValueError("a locus holds fewer than 2^24 distinct reads of at most "
@@ -230,16 +254,19 @@ class _ReadSide:
         next_g[:, :-1] = is_g[:, 1:]
         col = np.arange(width)[None, :]
         closing = (~is_g) & (mat != PAD) & prev_g & (col <= lengths[:, None] - MIN_MATCH_LEN)
-        best_close = np.maximum.accumulate(
+        # best_close[:, j]: the best closing score at a closing edge >= j.
+        best_close = np.full((self.n_reads, width + 1), _NEG, dtype=np.int64)
+        best_close[:, :width] = np.maximum.accumulate(
             np.where(closing, self.scores[:, :width], _NEG)[:, ::-1], axis=1)[:, ::-1]
-        bound = np.zeros((self.n_reads, width), dtype=np.int64)
-        bound[:, :-1] = best_close[:, 1:] - self.scores[:, 1:width]
-        bound = np.maximum(bound, 0)
+        next_mark, _ = mark_bounds(self.marks)
+        gate = np.take_along_axis(best_close, np.minimum(next_mark + 1, width), axis=1)
+        bound = np.maximum(gate - self.scores[:, 1:], 0)
         opening = (~is_g) & next_g & (col >= MIN_MATCH_LEN - 1) & (col < lengths[:, None])
+        self.usable = opening & (gate > _NEG)
         self.best_tract = np.where(opening, bound, 0)
 
     def _index(self) -> None:
-        r, a = tract_edges(self.mat)
+        r, a = np.nonzero(self.usable)
         windows = edge_windows(self.mat, r, a)
         _, first, inverse = np.unique(windows.astype(np.int64) @ WINDOW_PLACE_VALUES,
                                       return_index=True, return_inverse=True)
@@ -327,11 +354,12 @@ class _ReadSide:
 class _LocusSearch:
     """The two sides of one locus, and F over pairs of their match lists."""
 
-    def __init__(self, strings: Sequence[str], weights: Sequence[int]):
+    def __init__(self, strings: Sequence[str], marks: np.ndarray, weights: Sequence[int]):
         self.strings = list(strings)
         self.weights = np.asarray(weights, dtype=np.int64)
-        self.u = _ReadSide(self.strings, self.weights, reverse=False)
-        self.v = _ReadSide(self.strings, self.weights, reverse=True)
+        self.u = _ReadSide(self.strings, marks, self.weights, reverse=False)
+        self.v = _ReadSide(self.strings, marks, self.weights, reverse=True)
+        self.last_mark = mark_bounds(marks)[1]
         self.n_reads = self.u.n_reads
         self.lengths = self.u.lengths
         self.scores = self.u.scores
@@ -363,7 +391,8 @@ class _LocusSearch:
         """F(u, v) for one ``u`` match list against several ``v`` match lists.
 
         Per read: max(0, max over ``b`` of ``scores[b] - cost_v(b) -
-        min{scores[a + 1] + cost_u(a) : a < b}``).
+        min{scores[a + 1] + cost_u(a) : a < last_mark[b]}``), so that a
+        marked base lies between ``a`` and ``b``.
         """
         out = np.zeros(len(vls), dtype=np.int64)
         ru, au, cu = (np.asarray(t, np.int64) for t in ul)
@@ -384,7 +413,8 @@ class _LocusSearch:
         lv = lut[rv]
         keep = lv >= 0
         vid, rv, bv, cv, lv = vid[keep], rv[keep], bv[keep], cv[keep], lv[keep]
-        pm = prefix_min[lv, bv]
+        gate = self.last_mark[rv, bv]
+        pm = np.where(gate >= 0, prefix_min[lv, np.maximum(gate, 0)], far)
         keep = pm < far // 2
         vid, rv, bv, cv, pm = vid[keep], rv[keep], bv[keep], cv[keep], pm[keep]
         if not len(vid):
@@ -562,19 +592,20 @@ class FlankPair:
     n_reads_placed: int
 
 
-def solve_flank_pair(reads: Sequence[str]) -> FlankPair | None:
+def solve_flank_pair(reads: Sequence[str], marks: np.ndarray) -> FlankPair | None:
     """The pair of flanks that maximizes F over `reads` (polyG orientation, upper-case).
 
-    Returns None when no pair reaches F > 0. Raises RuntimeError when the
-    extraction's placement of the optimal pair does not give the optimum:
-    the search and the placement would then disagree on a read's tract.
+    `marks` holds one row per read, in polyG read order, at least as wide
+    as the longest read: True at a marked base. Returns None when no pair
+    reaches F > 0. Raises RuntimeError when the extraction's placement of
+    the optimal pair does not give the optimum: the search and the
+    placement would then disagree on a read's tract.
     """
-    counts = Counter(reads)
-    if not counts:
+    if not len(reads):
         return None
-    strings = sorted(counts)
-    weights = np.array([counts[s] for s in strings], dtype=np.int64)
-    search = _LocusSearch(strings, weights)
+    strings, distinct_marks, inverse = distinct_reads(reads, marks)
+    weights = np.bincount(inverse, minlength=len(strings)).astype(np.int64)
+    search = _LocusSearch(strings, distinct_marks, weights)
     if not len(search.u.candidates) or not len(search.v.candidates):
         return None
     ub_u, ub_v = search.u.position_bound, search.v.position_bound
@@ -589,7 +620,7 @@ def solve_flank_pair(reads: Sequence[str]) -> FlankPair | None:
     optimal = sorted((decode(int(search.u.candidates[i])),
                       decode(int(search.v.candidates[j]))[::-1]) for i, j in pairs)
     upstream, downstream = optimal[0]
-    placement = place_polyg_reads(strings, upstream, downstream)
+    placement = place_polyg_reads(strings, upstream, downstream, distinct_marks)
     total = int((weights * np.maximum(placement.value, 0)).sum())
     if total != best:
         raise RuntimeError(f"the placement of the optimal pair ({upstream}, {downstream}) "
@@ -612,7 +643,8 @@ class LocusReads:
     interval's window indices in polyG orientation. ``ref_coords[r, i]`` is
     the reference coordinate that the alignment of read ``r`` gives to its
     base at polyG index ``i``; -1 where that base is soft-clipped, in an
-    insertion, or past the read.
+    insertion, or past the read. `bed_start` and `bed_end` are the BED
+    interval.
     """
 
     name: str
@@ -623,25 +655,13 @@ class LocusReads:
     repeat_end: int
     reads: list[str]
     ref_coords: np.ndarray
+    bed_start: int
+    bed_end: int
 
-
-def polyg_reference_coordinates(alignments: Sequence[pysam.AlignedSegment],
-                                ref_orientation: str) -> np.ndarray:
-    """The reference coordinate of each read base, in polyG read order.
-
-    Returns an int64 array of shape (n_reads, longest read). Only aligned
-    read bases (CIGAR M, = or X) get a coordinate; every other entry is -1.
-    At a "-" locus polyG index ``i`` is query index ``len - 1 - i``.
-    """
-    lengths = [len(r.query_sequence) for r in alignments]
-    out = np.full((len(alignments), max(lengths, default=0) or 1), -1, dtype=np.int64)
-    for row, (r, n) in enumerate(zip(alignments, lengths, strict=True)):
-        pairs = np.asarray(r.get_aligned_pairs(matches_only=True), dtype=np.int64)
-        if pairs.size == 0:
-            continue
-        query = pairs[:, 0] if ref_orientation == "+" else n - 1 - pairs[:, 0]
-        out[row, query] = pairs[:, 1]
-    return out
+    @property
+    def marks(self) -> np.ndarray:
+        """The marked bases of each read: aligned inside the BED interval."""
+        return bed_marks(self.ref_coords, self.bed_start, self.bed_end)
 
 
 def locus_reads(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
@@ -667,7 +687,8 @@ def locus_reads(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
     reads = polyg_reads([r.query_sequence for r in records], anchors.ref_orientation)
     return LocusReads(name, anchors.ref_orientation, window_start, polyg_window,
                       REF_WINDOW_PAD, REF_WINDOW_PAD + bed_end - bed_start, reads,
-                      polyg_reference_coordinates(records, anchors.ref_orientation))
+                      polyg_reference_coordinates(records, anchors.ref_orientation),
+                      bed_start, bed_end)
 
 
 def modal_pair(outer: np.ndarray, run: np.ndarray, toward_run: int
@@ -733,7 +754,7 @@ def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
     read always runs toward the G run and spans at least two bases. Raises
     RuntimeError if the chosen pair does not.
     """
-    placement = place_polyg_reads(loc.reads, pair.upstream, pair.downstream)
+    placement = place_polyg_reads(loc.reads, pair.upstream, pair.downstream, loc.marks)
     up_outer, dn_outer = flank_outer_bases(loc.reads, placement, pair.upstream,
                                            pair.downstream)
     kept = np.flatnonzero(placement.kept)
@@ -798,7 +819,7 @@ def solve_locus(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
     loc = locus_reads(bam, name, chrom, bed_start, bed_end)
     if loc is None:
         return None
-    pair = solve_flank_pair(loc.reads)
+    pair = solve_flank_pair(loc.reads, loc.marks)
     if pair is None:
         none = FlankPosition(None, 0, 0)
         return LocusFlanks(name, loc.ref_orientation, None, (none, none))

@@ -49,7 +49,7 @@ from prolyg_phasing.io.format import format_pattern
 
 # Version of the saved-panel layout and extraction rules. `load_db` rejects
 # a panel written under any other version.
-EXTRACTION_SCHEMA_VERSION = "3"
+EXTRACTION_SCHEMA_VERSION = "4"
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -132,7 +132,10 @@ class ExtractedLocus:
     # placement, of any value. A read dropped by the flank placement counts
     # once in `n_alignments_drop_flank`. It also counts once per side with
     # no match of that side's flank, or, with both matches, once in
-    # `n_alignments_drop_no_placement` or `n_alignments_drop_negative_value`.
+    # `n_alignments_drop_no_placement` (no upstream match before a
+    # downstream match), `n_alignments_drop_no_bed_base` (no such pair holds
+    # a base aligned inside the BED interval) or
+    # `n_alignments_drop_negative_value`.
     n_alignments_overlap_locus: int
     n_alignments_drop_mapq: int
     n_alignments_drop_sa: int
@@ -142,6 +145,7 @@ class ExtractedLocus:
     n_alignments_drop_upstream_flank_not_placed: int
     n_alignments_drop_downstream_flank_not_placed: int
     n_alignments_drop_no_placement: int
+    n_alignments_drop_no_bed_base: int
     n_alignments_drop_negative_value: int
     n_read_pairs: int
     n_read_pairs_drop_disagree: int
@@ -524,13 +528,14 @@ def majority_pattern_by_family(
 
 
 # The flank-placement counters: the placed reads, the dropped total, one
-# drop per side with no flank match, and the two per-read drops.
+# drop per side with no flank match, and the three per-read drops.
 _FLANK_DROP_COLUMNS = (
     "n_alignments_placed",
     "n_alignments_drop_flank",
     "n_alignments_drop_upstream_flank_not_placed",
     "n_alignments_drop_downstream_flank_not_placed",
     "n_alignments_drop_no_placement",
+    "n_alignments_drop_no_bed_base",
     "n_alignments_drop_negative_value",
 )
 

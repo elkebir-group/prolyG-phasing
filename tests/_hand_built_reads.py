@@ -502,6 +502,14 @@ def chromosome(locus: LocusSequence, orientation: str) -> str:
     return "A" * CHROM_PAD + body + "A" * CHROM_PAD
 
 
+def bed_interval(locus: LocusSequence, orientation: str) -> tuple[int, int]:
+    """The BED interval of the locus on its synthetic chromosome: the reference tract."""
+    start = CHROM_PAD + len(locus.upstream)
+    if orientation == "-":
+        start = len(chromosome(locus, orientation)) - start - len(locus.tract)
+    return start, start + len(locus.tract)
+
+
 def md_tag(read: str, ref: str, ref_start: int, cigar) -> str:
     """MD tag of a gapped alignment. Insertions and soft clips do not appear in MD."""
     parts: list[str] = []

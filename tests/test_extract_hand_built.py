@@ -202,6 +202,7 @@ def test_both_sides_count_when_both_fail(tmp_path):
         assert locus.n_alignments_drop_upstream_flank_not_placed == 1
         assert locus.n_alignments_drop_downstream_flank_not_placed == 1
         assert locus.n_alignments_drop_no_placement == 0
+        assert locus.n_alignments_drop_no_bed_base == 0
         assert locus.n_alignments_drop_negative_value == 0
 
 

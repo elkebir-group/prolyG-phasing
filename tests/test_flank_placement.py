@@ -41,6 +41,7 @@ from tests._hand_built_reads import (
     G,
     ReadCase,
     all_records,
+    bed_interval,
     build_cases,
     chromosome,
     placements,
@@ -55,7 +56,7 @@ STUTTER_CASES = run_stutter_with_flank_error_cases()
 ALL_CASES = CASES + STUTTER_CASES
 
 DROP_REASONS = ("upstream_flank_not_placed", "downstream_flank_not_placed", "no_placement",
-                "negative_value")
+                "no_bed_base", "negative_value")
 
 # Cases whose outcome under the objective is not their true tuple or drop
 # reason, and why.
@@ -108,9 +109,17 @@ def drop_reasons(result: FlankPlacement, i: int) -> set[str]:
         reasons.add("downstream_flank_not_placed")
     if result.no_placement[i]:
         reasons.add("no_placement")
+    if result.no_bed_base[i]:
+        reasons.add("no_bed_base")
     if result.negative_value[i]:
         reasons.add("negative_value")
     return reasons
+
+
+def holds_bed_base(rec, bed_start: int, bed_end: int) -> bool:
+    """Whether the alignment aligns a read base inside the BED interval."""
+    return any(bed_start <= ref < bed_end
+               for _, ref in rec.get_aligned_pairs(matches_only=True))
 
 
 def flank_record(case: ReadCase, spec, orientation: str) -> FlankRecord:
@@ -126,11 +135,14 @@ def flank_record(case: ReadCase, spec, orientation: str) -> FlankRecord:
 
 def _place(case: ReadCase, orientation: str) -> FlankPlacement:
     records = [rec for _, rec in all_records(case, orientation)]
+    bed_start, bed_end = bed_interval(case.locus, orientation)
     return place_flanks(
-        [r.query_sequence for r in records],
+        records,
         upstream=flank_record(case, case.up, orientation),
         downstream=flank_record(case, case.dn, orientation),
         ref_orientation=orientation,
+        bed_start=bed_start,
+        bed_end=bed_end,
     )
 
 
@@ -314,10 +326,10 @@ def test_placement_matches_the_slow_reference_on_random_reads():
     reads = [_random_read(rng) for _ in range(800)]
     # Two copies of the flank in one read, before and after the run.
     reads += [UP + "GGGG" + UP + "GGGGGG" + DN + "GG" + DN, UP + "GGT" + DN + "GGGG" + DN]
-    result = place_polyg_reads(reads, UP, DN)
+    result = place_polyg_reads(reads, UP, DN, slow.marks_matrix(reads))
     n_placed = 0
     for i, read in enumerate(reads):
-        want = slow.best_placement(read, UP, DN)
+        want = slow.best_placement(read, UP, DN, slow.every_base(read))
         assert result.upstream_matched[i] == bool(slow.u_positions(read, UP))
         assert result.downstream_matched[i] == bool(slow.v_positions(read, DN))
         if want is None:
@@ -334,6 +346,39 @@ def test_placement_matches_the_slow_reference_on_random_reads():
     assert n_placed > 400
 
 
+def _random_marks(rng: random.Random, read: str) -> frozenset[int]:
+    """An interval, scattered positions, or nothing."""
+    choice = rng.random()
+    if choice < 0.5:
+        lo = rng.randrange(len(read))
+        return frozenset(range(lo, min(len(read), lo + rng.randint(1, 12))))
+    if choice < 0.8:
+        return frozenset(rng.sample(range(len(read)), k=min(len(read), rng.randint(1, 3))))
+    return frozenset()
+
+
+def test_placement_matches_the_slow_reference_with_marks():
+    rng = random.Random(23)
+    reads = [_random_read(rng) for _ in range(800)]
+    marks = [_random_marks(rng, read) for read in reads]
+    result = place_polyg_reads(reads, UP, DN, slow.marks_matrix(reads, marks))
+    n_placed = n_no_bed_base = 0
+    for i, read in enumerate(reads):
+        want = slow.best_placement(read, UP, DN, marks[i])
+        ups, downs = slow.u_positions(read, UP), slow.v_positions(read, DN)
+        ordered = any(a < b for a in ups for b in downs)
+        assert result.no_placement[i] == bool(ups and downs and not ordered)
+        assert result.no_bed_base[i] == (ordered and want is None)
+        n_no_bed_base += bool(result.no_bed_base[i])
+        if want is None:
+            assert not result.placed[i]
+            continue
+        n_placed += 1
+        assert (result.value[i], result.upstream_run_side[i],
+                result.downstream_run_side[i]) == want
+    assert n_placed > 100 and n_no_bed_base > 100
+
+
 def test_equal_value_placements_keep_the_shortest_tract():
     """`TGGTGGTGGT` matches at each TGG copy, and each GGT adds 0. Of the
     placements with the top value, the largest `a` and then the smallest `b`
@@ -341,9 +386,9 @@ def test_equal_value_placements_keep_the_shortest_tract():
     periodic = "TGGTGGTGGT"
     downstream = UP + "GGGGG" + "TGGTGGTGGTGGT" + "AAAAAAAA"
     upstream = "CCCC" + "TGGTGGTGGTGGT" + "GGGGG" + DN
-    result = place_polyg_reads([downstream], UP, periodic)
+    result = place_polyg_reads([downstream], UP, periodic, slow.marks_matrix([downstream]))
     assert result.tracts[0] == "GGGGG"
-    result = place_polyg_reads([upstream], periodic, DN)
+    result = place_polyg_reads([upstream], periodic, DN, slow.marks_matrix([upstream]))
     assert result.tracts[0] == "GGGGG"
 
 
@@ -373,9 +418,9 @@ def test_tracts_match_the_slow_reference_where_placements_tie():
                          ("AGG", "AGGAGGAGGA", "TAGGAGGAGG"),
                          ("TGGG", "GGTGGGTGGT", "TTGGGTGGGT")):
         reads = [_repeat_unit_read(rng, unit) for _ in range(300)]
-        result = place_polyg_reads(reads, up, dn)
+        result = place_polyg_reads(reads, up, dn, slow.marks_matrix(reads))
         for i, read in enumerate(reads):
-            want = slow.best_placement(read, up, dn)
+            want = slow.best_placement(read, up, dn, slow.every_base(read))
             if want is None:
                 assert not result.placed[i]
                 continue
@@ -391,7 +436,8 @@ def test_tracts_match_the_slow_reference_where_placements_tie():
 def test_negative_value_and_no_placement_are_counted_not_kept():
     decoy = "ACTTCAGCTT" + "G" + "ACTTACATCATTACCATACA" + "G" + "CAAATTTAAT"
     reversed_order = "G" + DN + "TA" + UP + "GGGG"
-    result = place_polyg_reads([decoy, reversed_order], UP, DN)
+    result = place_polyg_reads([decoy, reversed_order], UP, DN,
+                               slow.marks_matrix([decoy, reversed_order]))
     # G + 20 other bases + G, and one substitution in each flank.
     assert result.placed[0] and result.value[0] == 2 * 2 - 4 * 20 - 2 - 2
     assert not result.kept[0] and result.tracts[0] is None
@@ -408,17 +454,25 @@ def test_negative_value_and_no_placement_are_counted_not_kept():
 @pytest.mark.parametrize("case", ALL_CASES, ids=[c.case_id for c in ALL_CASES])
 @pytest.mark.parametrize("orientation", ["+", "-"])
 def test_every_alignment_gives_the_expected_outcome(case: ReadCase, orientation: str):
+    """An alignment that marks no read base, such as one that soft-clips the
+    whole tract, has no placement: its reason is `no_bed_base` unless a flank
+    does not match."""
     result = _place(case, orientation)
     want = expected_outcome(case)
-    for i, p in enumerate(placements(case)):
-        assert outcome(result, i) == want, p.form
+    bed = bed_interval(case.locus, orientation)
+    for i, (p, rec) in enumerate(all_records(case, orientation)):
+        if not holds_bed_base(rec, *bed) and not str(want).endswith("flank_not_placed"):
+            assert outcome(result, i) == "no_bed_base", p.form
+        else:
+            assert outcome(result, i) == want, p.form
 
 
 @pytest.mark.parametrize("case", ALL_CASES, ids=[c.case_id for c in ALL_CASES])
 def test_the_slow_reference_gives_the_expected_outcome(case: ReadCase):
     """The expected outcome follows from the reference, not from the code under test."""
     want = expected_outcome(case)
-    p = slow.best_placement(case.read, case.up.bases, case.dn.bases)
+    p = slow.best_placement(case.read, case.up.bases, case.dn.bases,
+                            slow.every_base(case.read))
     if isinstance(want, str):
         side = {"upstream_flank_not_placed": slow.u_positions,
                 "downstream_flank_not_placed": slow.v_positions}[want]
@@ -433,8 +487,8 @@ def test_the_slow_reference_gives_the_expected_outcome(case: ReadCase):
 def test_both_orientations_give_the_same_tract(case: ReadCase):
     plus, minus = _place(case, "+"), _place(case, "-")
     assert list(plus.tracts) == list(minus.tracts)
-    for field in ("upstream_matched", "downstream_matched", "no_placement", "negative_value",
-                  "value"):
+    for field in ("upstream_matched", "downstream_matched", "no_placement", "no_bed_base",
+                  "negative_value", "value"):
         assert list(getattr(plus, field)) == list(getattr(minus, field)), field
 
 
