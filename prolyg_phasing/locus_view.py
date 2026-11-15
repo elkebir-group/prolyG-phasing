@@ -1,22 +1,24 @@
-"""A locus viewer that reads only ``panel.db``: one self-contained HTML page.
+"""A locus viewer that reads only ``panel.db``: a directory of small files and one page.
 
-The page shows each requested locus as the fit and the phasing see it: the
-flanks and their reference positions, the kept molecules, the tract-length
-and largest-run counts, and every per-locus counter. It reads the panel, not
-the BAM, so dropped reads appear only as counts.
+The page shows each locus as the fit and the phasing see it: the flanks and
+the reference tract on the G strand, the tracts with their read and molecule
+counts, the largest G run per read, a pile-up of the tracts between the
+flanks with six flanking bases on each side, and the base counts over the
+full flanking width of each side. It reads the panel, not the BAM, so
+dropped reads appear only as counts.
 
-:func:`locus_view_data` turns one `ExtractedLocus` into a plain dict;
-:func:`write_locus_page` embeds those dicts as JSON in the page template
-``locus_view.html`` (plain CSS and JS, no external assets). The page draws
-every sequence in polyG orientation (the G strand).
+:func:`locus_view_data` turns one `ExtractedLocus` into the plain dict that
+the page draws. :func:`write_locus_view` writes the directory: ``index.html``
+(the page template ``locus_view.html``, plain CSS and JS), ``loci.json`` (the
+locus list) and one JSON file per sample and locus, which the page fetches
+when the locus is opened. The page needs an HTTP server, because browsers
+block ``fetch`` from ``file://``.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import html
 import json
-from collections import Counter
 from collections.abc import Sequence
 from importlib import resources
 from pathlib import Path
@@ -25,8 +27,18 @@ import numpy as np
 
 from prolyg_phasing.io.panel import ExtractedLocus, ExtractedPanel, parse_run_lengths
 
-# Molecule rows the page draws per locus and sample; the rest are counted.
-ROWS_SHOWN = 150
+# Pile-up rows drawn per locus and sample; the rest are counted.
+PILEUP_ROWS = 150
+
+# Tract rows kept per locus and sample; the rest are counted.
+TRACT_ROWS = 200
+
+# Flanking bases drawn outside each flank in the pile-up.
+PILEUP_FLANKING = 6
+
+# Characters counted at each flanking position. "." (no read base) is not
+# counted.
+FLANKING_BASES = "ACGTN"
 
 _COUNTER_PREFIXES = ("n_alignments_", "n_read_pairs")
 
@@ -34,8 +46,7 @@ _COUNTER_PREFIXES = ("n_alignments_", "n_read_pairs")
 def panel_sample(panel: ExtractedPanel) -> str:
     """The sample name of a panel: the file stem of the BAM its provenance names.
 
-    The provenance holds no sample field of its own; the BAM name is the
-    sample's name in this cohort's files.
+    The provenance holds no sample field of its own.
     """
     return Path(panel.provenance.bam_path).stem
 
@@ -43,68 +54,123 @@ def panel_sample(panel: ExtractedPanel) -> str:
 def _flank_view(flank) -> dict:
     if flank.has_position:
         return {"bases": flank.bases, "status": "recovered",
-                "ref_positions": list(flank.ref_positions),
                 "outer_position": flank.outer_position,
                 "run_side_position": flank.run_side_position}
-    return {"bases": flank.bases, "status": "no_reference_position", "ref_positions": [],
+    return {"bases": flank.bases, "status": "no_reference_position",
             "outer_position": None, "run_side_position": None}
 
 
+def _summed(keys: np.ndarray, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Distinct keys, their summed weights, and each row's index among them."""
+    distinct, index = np.unique(keys, return_inverse=True)
+    index = index.ravel()
+    sums = np.bincount(index, weights=weights, minlength=len(distinct)).astype(np.int64)
+    return distinct, sums, index
+
+
+def _flanking_matrix(locus: ExtractedLocus) -> np.ndarray:
+    """The flanking strings as a (n_flanking, up_width + 1 + dn_width) byte matrix."""
+    width = int(locus.flanking_up_width) + 1 + int(locus.flanking_dn_width)
+    if len(locus.flanking_seq) == 0:
+        return np.zeros((0, width), dtype=np.uint8)
+    text = "".join(str(s) for s in locus.flanking_seq).encode("ascii")
+    return np.frombuffer(text, dtype=np.uint8).reshape(len(locus.flanking_seq), width)
+
+
+def _base_counts(matrix: np.ndarray, weights: np.ndarray) -> list[list[int]]:
+    """Per column, the weighted count of each base of `FLANKING_BASES`."""
+    if matrix.shape[1] == 0:
+        return []
+    counts = np.stack([weights @ (matrix == ord(b)) for b in FLANKING_BASES], axis=1)
+    return counts.astype(np.int64).tolist()
+
+
 def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str) -> dict:
-    """One locus of one sample as a plain dict for the page.
+    """One locus of one sample as the plain dict the page draws.
 
     Keys
     ----
-    locus, sample : str
-    chrom, bed_name : str
+    locus, sample, chrom, bed_name : str
     bed_start, bed_end : int
         The BED interval, 0-based half-open.
     ref_orientation : str
         "+" or "-"; empty when the locus has no geometry.
     reference_window_status : str
     reference_tract : str
-        The reference between the two run-side bases, polyG orientation;
-        empty when a flank has no reference position.
+        The reference between the two run-side bases, G strand; empty when
+        a flank has no reference position.
     reference_run_lengths : list of int
-    n_runs : int
     flanks : dict or None
         ``{"upstream": side, "downstream": side}``, None when the locus has
         no flank. A side holds ``bases``, ``status`` ("recovered" or
-        "no_reference_position"), ``ref_positions`` (polyG read order,
-        empty with no position), ``outer_position`` and
+        "no_reference_position"), ``outer_position`` and
         ``run_side_position`` (None with no position).
-    flanking : dict
-        ``up_width``, ``dn_width``, ``up_ref_pos_start``,
-        ``dn_ref_pos_start`` (-1 for a side with no position).
     counters : dict of str to int
-        Every ``n_alignments_*`` and ``n_read_pairs*`` field, and
-        ``n_reads``.
-    tract_length_counts, largest_run_counts : list of [int, int]
-        ``[value, reads]``, sorted by value, over the kept reads.
-    molecules : list of dict
-        The `ROWS_SHOWN` distinct (tract, upstream flanking string,
-        downstream flanking string) rows with the most reads:
-        ``tract``, ``up_flanking``, ``dn_flanking``, ``reads`` (summed read
-        count) and ``molecules`` (distinct MI). Sorted by reads, most
-        first, then by tract.
-    n_rows : int
-        The distinct rows.
-    rows_not_shown, reads_not_shown : int
-        The rows past the first `ROWS_SHOWN`, and their reads.
+        Every ``n_alignments_*`` and ``n_read_pairs*`` field, and ``n_reads``.
+    tracts : list of [str, int, int]
+        ``[tract, reads, molecules]`` for the `TRACT_ROWS` tracts with the
+        most reads; molecules are distinct MI. Sorted by reads, then tract.
+    n_tracts, tract_reads_not_shown : int
+        The distinct tracts, and the reads of the tracts not kept.
+    largest_run : list of [int, int]
+        ``[largest G run, reads]`` over the kept reads.
+    pileup : dict
+        ``rows``: ``[upstream flanking, tract, downstream flanking, reads]``
+        for the `PILEUP_ROWS` rows with the most reads. A row is a distinct
+        tract with its `PILEUP_FLANKING` flanking bases on each side,
+        outermost first upstream and nearest first downstream; "." is no
+        read base. ``n_rows`` and ``reads_not_drawn`` count the rest.
+    flanking : dict
+        ``up`` and ``dn``: ``start`` (reference coordinate of index 0, -1
+        with no flanking bases), ``width``, and ``counts``: per index, the
+        reads with each base of `FLANKING_BASES`. Upstream index 0 is the
+        base farthest from the flank; downstream index 0 is the nearest.
+        Reference coordinates rise with the index on a "+" locus and fall
+        on a "-" locus.
     """
     counters = {f.name: int(getattr(locus, f.name))
                 for f in dataclasses.fields(locus)
                 if f.name.startswith(_COUNTER_PREFIXES)}
     counters["n_reads"] = int(locus.n_reads)
+    count = np.asarray(locus.count, dtype=np.int64)
+    seq = np.asarray(locus.seq, dtype=str)
 
-    molecules, n_rows, rows_not_shown, reads_not_shown = _top_molecules(locus, ROWS_SHOWN)
+    # Tracts, with their reads and molecules (distinct MI).
+    tracts, tract_reads, tract_of_row = _summed(seq, count)
+    mi = np.unique(np.asarray(locus.mi, dtype=str), return_inverse=True)[1].ravel()
+    span = len(mi) + 1
+    pairs = np.unique(tract_of_row.astype(np.int64) * span + mi)
+    tract_molecules = np.bincount(pairs // span, minlength=len(tracts))
+    order = np.lexsort((tracts, -tract_reads))
+    tract_rows = [[str(tracts[i]), int(tract_reads[i]), int(tract_molecules[i])]
+                  for i in order[:TRACT_ROWS]]
+    largest: dict[int, int] = {}
+    for tract, reads in zip(tracts, tract_reads, strict=True):
+        run = max(parse_run_lengths(str(tract)))
+        largest[run] = largest.get(run, 0) + int(reads)
 
-    lengths: Counter = Counter()
-    largest: Counter = Counter()
-    for seq, count in zip(locus.seq, locus.count, strict=True):
-        lengths[len(str(seq))] += int(count)
-        largest[max(parse_run_lengths(str(seq)))] += int(count)
+    # Pile-up rows: a tract with its flanking bases next to each flank.
+    up_w, dn_w = int(locus.flanking_up_width), int(locus.flanking_dn_width)
+    matrix = _flanking_matrix(locus)
+    n = PILEUP_FLANKING
+    near = np.full((len(matrix), 2 * n), ord("."), dtype=np.uint8)
+    take_up, take_dn = min(n, up_w), min(n, dn_w)
+    if take_up:
+        near[:, n - take_up:n] = matrix[:, up_w - take_up:up_w]
+    if take_dn:
+        near[:, n:n + take_dn] = matrix[:, up_w + 1:up_w + 1 + take_dn]
+    near_text = np.array([row.tobytes().decode("ascii") for row in near] or [""], dtype=str)
+    fid = np.asarray(locus.flanking_id, dtype=np.int64)
+    row_key = np.char.add(np.char.add(near_text[fid], "|"), seq) if len(fid) else seq
+    row_keys, row_reads, _ = _summed(row_key, count)
+    row_order = np.lexsort((row_keys, -row_reads))
+    pile_rows = []
+    for i in row_order[:PILEUP_ROWS]:
+        sides, tract = str(row_keys[i]).split("|", 1)
+        pile_rows.append([sides[:n], tract, sides[n:], int(row_reads[i])])
 
+    # Base counts over the full flanking width of each side.
+    weights = np.bincount(fid, weights=count, minlength=len(matrix)).astype(np.int64)
     flanks = None
     if locus.upstream_flank is not None:
         flanks = {"upstream": _flank_view(locus.upstream_flank),
@@ -116,104 +182,72 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str) -> dict:
         "reference_window_status": locus.reference_window_status,
         "reference_tract": locus.reference_tract,
         "reference_run_lengths": [int(x) for x in locus.reference_run_lengths],
-        "n_runs": int(locus.n_runs),
         "flanks": flanks,
-        "flanking": {"up_width": int(locus.flanking_up_width),
-                     "dn_width": int(locus.flanking_dn_width),
-                     "up_ref_pos_start": int(locus.flanking_up_ref_pos_start),
-                     "dn_ref_pos_start": int(locus.flanking_dn_ref_pos_start)},
         "counters": counters,
-        "tract_length_counts": [[k, v] for k, v in sorted(lengths.items())],
-        "largest_run_counts": [[k, v] for k, v in sorted(largest.items())],
-        "molecules": molecules,
-        "n_rows": n_rows,
-        "rows_not_shown": rows_not_shown,
-        "reads_not_shown": reads_not_shown,
+        "tracts": tract_rows,
+        "n_tracts": len(tracts),
+        "tract_reads_not_shown": int(tract_reads[order[TRACT_ROWS:]].sum()),
+        "largest_run": [[k, v] for k, v in sorted(largest.items())],
+        "pileup": {"rows": pile_rows, "n_rows": len(row_keys),
+                   "reads_not_drawn": int(row_reads[row_order[PILEUP_ROWS:]].sum())},
+        "flanking": {
+            "up": {"start": int(locus.flanking_up_ref_pos_start), "width": up_w,
+                   "counts": _base_counts(matrix[:, :up_w], weights)},
+            "dn": {"start": int(locus.flanking_dn_ref_pos_start), "width": dn_w,
+                   "counts": _base_counts(matrix[:, up_w + 1:], weights)},
+        },
     }
 
 
-def _top_molecules(locus: ExtractedLocus, n_shown: int) -> tuple[list[dict], int, int, int]:
-    """The `n_shown` distinct (tract, flanking) rows with the most reads, and the rest's size.
+def _all_loci(panels: Sequence[ExtractedPanel]) -> list[str]:
+    """Every locus of the panels: the first panel's, then the others' new ones."""
+    seen: dict[str, None] = {}
+    for panel in panels:
+        for locus in panel.loci:
+            seen.setdefault(locus, None)
+    return list(seen)
 
-    A row's key is the tract and the flanking id; each flanking id names
-    one (upstream, downstream) flanking pair. Rows are counted with numpy,
-    and only the rows kept become dicts. Ties go to the smaller tract, then
-    the smaller upstream and downstream flanking strings.
 
-    Returns the kept rows, the number of distinct rows, and the rows and
-    reads not kept.
+def write_locus_view(panel_paths: Sequence[str | Path], out_dir: str | Path,
+                     loci: Sequence[str] | None = None) -> Path:
+    """Write the viewer directory for `loci` (all loci of the panels when None).
+
+    Writes ``index.html``, ``loci.json`` and ``data/<sample index>/<locus
+    index>.json``, one locus at a time, so only one locus's data is in
+    memory. A locus that a panel does not hold has no file for that sample.
+    Returns the path of ``index.html``.
     """
-    if len(locus.seq) == 0:
-        return [], 0, 0, 0
-    tracts, tract_id = np.unique(np.asarray(locus.seq, dtype=str), return_inverse=True)
-    sides = [str(s).split("|") for s in locus.flanking_seq]
-    up_rank = np.unique([u for u, _ in sides], return_inverse=True)[1].ravel()
-    dn_rank = np.unique([d for _, d in sides], return_inverse=True)[1].ravel()
-    fid = np.asarray(locus.flanking_id, dtype=np.int64)
-    key = tract_id.ravel().astype(np.int64) * len(sides) + fid
-    keys, group = np.unique(key, return_inverse=True)
-    group = group.ravel()
-    reads = np.bincount(group, weights=locus.count, minlength=len(keys)).astype(np.int64)
-    mi_id = np.unique(np.asarray(locus.mi, dtype=str), return_inverse=True)[1].ravel()
-    families = np.unique(group.astype(np.int64) * (int(mi_id.max()) + 1) + mi_id)
-    molecules = np.bincount(families // (int(mi_id.max()) + 1), minlength=len(keys))
-    key_tract, key_fid = keys // len(sides), keys % len(sides)
-    order = np.lexsort((dn_rank[key_fid], up_rank[key_fid], key_tract, -reads))
-    top = order[:n_shown]
-    rows = [{"tract": str(tracts[key_tract[i]]), "up_flanking": sides[key_fid[i]][0],
-             "dn_flanking": sides[key_fid[i]][1], "reads": int(reads[i]),
-             "molecules": int(molecules[i])} for i in top]
-    rest = order[n_shown:]
-    return rows, len(keys), len(rest), int(reads[rest].sum())
-
-
-def locus_blocks(panels: Sequence[tuple[str, ExtractedPanel]], locus: str) -> list[dict]:
-    """One :func:`locus_view_data` dict per panel for `locus`.
-
-    `panels` are ``(path, panel)`` pairs. Raises KeyError naming the locus
-    and the panel when a panel does not hold the locus.
-    """
-    blocks = []
-    for path, panel in panels:
-        try:
-            extracted = panel.loci[locus]
-        except KeyError:
-            raise KeyError(f"{path}: the panel holds no locus {locus}") from None
-        blocks.append(locus_view_data(locus, extracted, panel_sample(panel)))
-    return blocks
-
-
-def _json_script(element_id: str, value) -> str:
-    text = json.dumps(value, separators=(",", ":")).replace("</", "<\\/")
-    return f'<script type="application/json" id="{html.escape(element_id)}">{text}</script>\n'
-
-
-def write_locus_page(panel_paths: Sequence[str | Path], loci: Sequence[str],
-                     out: str | Path) -> Path:
-    """Write the self-contained HTML page of `loci` over the panels; return its path.
-
-    The page holds one JSON element per locus (id ``locus-<name>``) and one
-    index element (id ``index``): per locus, each sample's read count and
-    status. The file is written one locus at a time, so only one locus's
-    data is in memory. The page draws a locus when it is opened.
-    """
-    panels = [(str(path), ExtractedPanel.load_db(path)) for path in panel_paths]
+    panels = [ExtractedPanel.load_db(path) for path in panel_paths]
+    names = list(loci) if loci is not None else _all_loci(panels)
+    out = Path(out_dir)
+    for s in range(len(panels)):
+        (out / "data" / str(s)).mkdir(parents=True, exist_ok=True)
+    held = [set(panel.loci) for panel in panels]
+    entries = []
+    for i, name in enumerate(names):
+        per_sample = []
+        for s, panel in enumerate(panels):
+            if name not in held[s]:
+                per_sample.append(None)
+                continue
+            data = locus_view_data(name, panel.loci[name], panel_sample(panel))
+            (out / "data" / str(s) / f"{i}.json").write_text(
+                json.dumps(data, separators=(",", ":")), encoding="utf-8")
+            flanks = data["flanks"]
+            per_sample.append({
+                "n_reads": data["counters"]["n_reads"], "n_tracts": data["n_tracts"],
+                "status": data["reference_window_status"],
+                "no_position": flanks is not None and any(
+                    side["status"] != "recovered" for side in flanks.values())})
+        entries.append({"locus": name, "file": i, "samples": per_sample})
+    (out / "loci.json").write_text(json.dumps({
+        "samples": [{"sample": panel_sample(panel), "panel": str(path),
+                     "flank_table_sample": panel.provenance.flank_table_sample}
+                    for path, panel in zip(panel_paths, panels, strict=True)],
+        "loci": entries,
+        "pileup_rows": PILEUP_ROWS, "pileup_flanking": PILEUP_FLANKING,
+        "flanking_bases": FLANKING_BASES}, separators=(",", ":")), encoding="utf-8")
     page = resources.files("prolyg_phasing").joinpath("locus_view.html").read_text("utf-8")
-    head, tail = page.split("__DATA__")
-    title = html.escape(", ".join(loci[:4]) + (" …" if len(loci) > 4 else ""))
-    index = []
-    out = Path(out)
-    with out.open("w", encoding="utf-8") as f:
-        f.write(head.replace("__TITLE__", title))
-        for locus in loci:
-            blocks = locus_blocks(panels, locus)
-            f.write(_json_script(f"locus-{locus}", {"locus": locus, "blocks": blocks}))
-            index.append([locus, [[b["counters"]["n_reads"], b["reference_window_status"]]
-                                  for b in blocks]])
-        f.write(_json_script("index", {
-            "samples": [{"sample": panel_sample(panel), "panel": path,
-                         "flank_table_sample": panel.provenance.flank_table_sample}
-                        for path, panel in panels],
-            "loci": index, "rows_shown": ROWS_SHOWN}))
-        f.write(tail)
-    return out
+    index = out / "index.html"
+    index.write_text(page, encoding="utf-8")
+    return index
