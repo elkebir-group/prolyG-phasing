@@ -266,46 +266,14 @@ class ExtractedPanel:
         is possible, not because this write path itself saves memory (the
         panel is already fully built in memory by extraction time).
 
-        Writes to a temporary path in the same directory and renames into
-        place, so a crash mid-write cannot leave a partial file at ``path``.
+        Writes through :class:`PanelWriter`: to a temporary path in the
+        same directory, renamed into place, so a crash mid-write cannot
+        leave a partial file at ``path``.
         """
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.unlink(missing_ok=True)
-        conn = sqlite3.connect(str(tmp))
-        try:
-            col_defs = ", ".join(
-                f'"{c}" {"INTEGER" if c in _DB_INT_COLUMNS else "TEXT"}'
-                for c in _DB_LOCI_COLUMNS[1:]
-            )
-            conn.execute(
-                f'CREATE TABLE loci (locus_id TEXT PRIMARY KEY, {col_defs}, '
-                f'row_blob BLOB)'
-            )
-            conn.execute("CREATE TABLE provenance (json TEXT)")
-            conn.execute("CREATE TABLE panel_info (n_alleles INTEGER)")
-            conn.execute(
-                "INSERT INTO provenance (json) VALUES (?)",
-                (json.dumps(self.provenance.to_dict()),),
-            )
-            conn.execute(
-                "INSERT INTO panel_info (n_alleles) VALUES (?)", (self.n_alleles,)
-            )
-            placeholders = ", ".join("?" for _ in _DB_LOCI_COLUMNS)
-            insert_sql = (
-                f"INSERT INTO loci ({', '.join(_DB_LOCI_COLUMNS)}, row_blob) "
-                f"VALUES ({placeholders}, ?)"
-            )
+        with PanelWriter(path) as writer:
             for locus_id, locus in self.loci.items():
-                meta = _locus_meta_row(locus)
-                values = [locus_id] + [meta[c] for c in _DB_LOCI_COLUMNS[1:]]
-                values.append(_encode_row_blob(locus))
-                conn.execute(insert_sql, values)
-            conn.commit()
-        finally:
-            conn.close()
-        tmp.replace(p)
+                writer.add(locus_id, locus)
+            writer.finish(self.n_alleles, self.provenance)
 
     @classmethod
     def load_db(cls, path: str | Path) -> ExtractedPanel:
@@ -811,5 +779,73 @@ def _locus_meta_row(locus: ExtractedLocus) -> dict:
         "flanking_up_ref_pos_start": locus.flanking_up_ref_pos_start,
         "flanking_dn_ref_pos_start": locus.flanking_dn_ref_pos_start,
     }
+
+
+def encode_locus_row(locus: ExtractedLocus) -> list:
+    """One ``loci`` table row of a locus, without its id.
+
+    The scalar metadata in ``_DB_LOCI_COLUMNS[1:]`` order, then the
+    gzip-pickled row arrays. A worker process can encode a locus and send
+    only this row to the process that writes the panel.
+    """
+    meta = _locus_meta_row(locus)
+    return [meta[c] for c in _DB_LOCI_COLUMNS[1:]] + [_encode_row_blob(locus)]
+
+
+class PanelWriter:
+    """Write a panel.db one locus at a time.
+
+    Rows go to a temporary file beside `path`. :meth:`finish` writes the
+    panel-wide fields and renames the file into place; leaving the
+    ``with`` block without :meth:`finish` removes the temporary file, so a
+    failed write never leaves a partial panel at `path`. The reader orders
+    loci by id, so the order of :meth:`add` calls does not matter.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._tmp = self.path.with_name(self.path.name + ".tmp")
+        self._tmp.unlink(missing_ok=True)
+        self._conn = sqlite3.connect(str(self._tmp))
+        col_defs = ", ".join(
+            f'"{c}" {"INTEGER" if c in _DB_INT_COLUMNS else "TEXT"}'
+            for c in _DB_LOCI_COLUMNS[1:]
+        )
+        self._conn.execute(
+            f"CREATE TABLE loci (locus_id TEXT PRIMARY KEY, {col_defs}, row_blob BLOB)"
+        )
+        self._conn.execute("CREATE TABLE provenance (json TEXT)")
+        self._conn.execute("CREATE TABLE panel_info (n_alleles INTEGER)")
+        placeholders = ", ".join("?" for _ in _DB_LOCI_COLUMNS)
+        self._insert = (f"INSERT INTO loci ({', '.join(_DB_LOCI_COLUMNS)}, row_blob) "
+                        f"VALUES ({placeholders}, ?)")
+        self._finished = False
+
+    def add(self, locus_id: str, locus: ExtractedLocus) -> None:
+        """Write one locus."""
+        self.add_row(locus_id, encode_locus_row(locus))
+
+    def add_row(self, locus_id: str, row: list) -> None:
+        """Write one locus from :func:`encode_locus_row`."""
+        self._conn.execute(self._insert, [locus_id, *row])
+
+    def finish(self, n_alleles: int, provenance: ExtractionProvenance) -> None:
+        """Write the panel-wide fields, and move the file into place."""
+        self._conn.execute("INSERT INTO provenance (json) VALUES (?)",
+                           (json.dumps(provenance.to_dict()),))
+        self._conn.execute("INSERT INTO panel_info (n_alleles) VALUES (?)", (n_alleles,))
+        self._conn.commit()
+        self._conn.close()
+        self._tmp.replace(self.path)
+        self._finished = True
+
+    def __enter__(self) -> PanelWriter:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if not self._finished:
+            self._conn.close()
+            self._tmp.unlink(missing_ok=True)
 
 

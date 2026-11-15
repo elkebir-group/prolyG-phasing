@@ -36,6 +36,7 @@ from prolyg_phasing.io._flank_placement import (
     tract_edges,
     window_costs,
 )
+from prolyg_phasing.io._workers import worker_count
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import parse_run_lengths
 from tests import _slow_flank_eval as slow
@@ -437,7 +438,7 @@ def test_a_locus_with_no_positive_pair_gets_its_own_status(tmp_path):
 
 @pytest.mark.skipif(not hasattr(os, "sched_getaffinity"), reason="Linux only")
 def test_worker_count_leaves_free_cores():
-    n = fc.worker_count()
+    n = worker_count()
     assert 1 <= n < max(2, len(os.sched_getaffinity(0)))
 
 

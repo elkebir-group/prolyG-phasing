@@ -15,12 +15,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from prolyg_phasing.io._flank_construction import (
-    build_flanks,
-    worker_count,
-    write_flank_table,
-)
-from prolyg_phasing.io.bam import extract_panel
+from prolyg_phasing.io._flank_construction import build_flanks, write_flank_table
+from prolyg_phasing.io._workers import worker_count
+from prolyg_phasing.io.bam import extract_panel_to_db
 from prolyg_phasing.io.panel import ExtractedPanel
 from prolyg_phasing.io.phasing_tables import (
     build_haplotype_calls,
@@ -82,13 +79,18 @@ def _add_extract_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--verbose", action="store_true",
                     help="Show a progress bar over the BED (one tick per "
                          "locus). Silent by default.")
+    p.add_argument("--workers", type=_positive_int, default=None,
+                    help="Worker processes; each extracts one locus at a time, and "
+                         "this process writes each locus to the panel as it "
+                         "finishes. Without it, the count comes from the free "
+                         "cores and memory of this machine.")
 
 
 def _run_extract(args: argparse.Namespace) -> None:
-    panel = extract_panel(
-        bam_path=args.bam,
-        bed_path=args.bed,
-        flanks_path=args.flanks,
+    n_workers = worker_count() if args.workers is None else args.workers
+    n_loci = extract_panel_to_db(
+        args.bam, args.bed, args.flanks, args.out_db,
+        n_workers=n_workers,
         min_mapq=args.min_mapq,
         drop_chimeric=args.drop_chimeric,
         max_tlen=args.max_tlen,
@@ -96,8 +98,7 @@ def _run_extract(args: argparse.Namespace) -> None:
         min_base_q=args.min_flanking_base_q,
         verbose=args.verbose,
     )
-    panel.save_db(args.out_db)
-    print(f"wrote {args.out_db} ({len(panel.loci)} loci)")
+    print(f"wrote {args.out_db} ({n_loci} loci; {n_workers} workers)")
 
 
 _BUILD_FLANKS_DESCRIPTION = """\

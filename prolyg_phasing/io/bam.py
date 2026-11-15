@@ -39,6 +39,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterator, Sequence
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
+from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +57,7 @@ from prolyg_phasing.io._flank_placement import (
     WINDOW_UNRECOVERABLE,
     FlankPlacement,
     FlankRecord,
+    FlankTable,
     place_flanks,
     read_flank_table,
     window_index,
@@ -65,6 +67,8 @@ from prolyg_phasing.io.panel import (
     ExtractedLocus,
     ExtractedPanel,
     ExtractionProvenance,
+    PanelWriter,
+    encode_locus_row,
     parse_run_lengths,
 )
 
@@ -954,11 +958,86 @@ def extract_panel(
         When a flank position breaks an invariant of build-flanks (see
         :func:`locus_geometry`).
     """
-    bam_path = Path(bam_path)
-    bed_path = Path(bed_path)
-    flanks_path = Path(flanks_path)
-
+    bam_path, bed_path, flanks_path = Path(bam_path), Path(bed_path), Path(flanks_path)
     bed_rows = _load_bed(bed_path)
+    flank_table = _flank_table_for(flanks_path, bed_rows)
+    settings = _ExtractionSettings(min_mapq, drop_chimeric, max_tlen, min_base_q)
+
+    loci: dict[str, ExtractedLocus] = {}
+    max_observed_run_length = 0
+    bed_iter = tqdm(bed_rows, desc="extract_panel", unit="locus") if verbose else bed_rows
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        for row in bed_iter:
+            locus = _extract_bed_locus(bam, row, flank_table, settings)
+            loci[row[0]] = locus
+            max_observed_run_length = max(max_observed_run_length,
+                                          locus.max_observed_run_length)
+    return ExtractedPanel(
+        loci=loci, n_alleles=max_observed_run_length + n_alleles_margin,
+        provenance=_provenance(bam_path, bed_path, flanks_path, flank_table, settings,
+                               n_alleles_margin))
+
+
+def extract_panel_to_db(
+    bam_path: str | Path,
+    bed_path: str | Path,
+    flanks_path: str | Path,
+    out_db: str | Path,
+    *,
+    n_workers: int,
+    min_mapq: int = 40,
+    drop_chimeric: bool = True,
+    max_tlen: int = 1000,
+    n_alleles_margin: int = 1,
+    min_base_q: int = DEFAULT_MIN_FLANKING_BASE_Q,
+    verbose: bool = False,
+) -> int:
+    """Extract every BED locus in `n_workers` processes and write ``panel.db``.
+
+    The panel equals ``extract_panel(...).save_db(out_db)`` with the same
+    arguments. Each worker opens the BAM once and extracts one locus at a
+    time; it sends back the locus's encoded table row. This process writes
+    each row as it arrives, in BED order, and keeps only the largest
+    observed run length, which sets ``n_alleles``. No process holds the
+    whole panel. Returns the number of loci.
+    """
+    bam_path, bed_path, flanks_path = Path(bam_path), Path(bed_path), Path(flanks_path)
+    bed_rows = _load_bed(bed_path)
+    flank_table = _flank_table_for(flanks_path, bed_rows)
+    settings = _ExtractionSettings(min_mapq, drop_chimeric, max_tlen, min_base_q)
+    # Open the BAM here first: a worker whose start-up fails is restarted by
+    # the pool without end, so an unreadable BAM must fail before the pool.
+    pysam.AlignmentFile(str(bam_path), "rb").close()
+    max_observed_run_length = 0
+    n_workers = max(1, min(n_workers, len(bed_rows)))
+    with PanelWriter(out_db) as writer, Pool(
+            n_workers, initializer=_open_extract_worker,
+            initargs=(str(bam_path), str(flanks_path), settings)) as pool:
+        results = pool.imap(_extract_worker_row, bed_rows, chunksize=1)
+        if verbose:
+            results = tqdm(results, total=len(bed_rows), desc="extract_panel", unit="locus")
+        for name, row, max_run in results:
+            writer.add_row(name, row)
+            max_observed_run_length = max(max_observed_run_length, max_run)
+        writer.finish(max_observed_run_length + n_alleles_margin,
+                      _provenance(bam_path, bed_path, flanks_path, flank_table, settings,
+                                  n_alleles_margin))
+    return len(bed_rows)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExtractionSettings:
+    """The read filters of one extraction."""
+
+    min_mapq: int
+    drop_chimeric: bool
+    max_tlen: int
+    min_base_q: int
+
+
+def _flank_table_for(flanks_path: Path, bed_rows: Sequence[tuple[str, str, int, int]]
+                     ) -> FlankTable:
+    """The flank table, checked to hold exactly the BED loci."""
     flank_table = read_flank_table(flanks_path)
     bed_names = [name for name, *_ in bed_rows]
     missing = [name for name in bed_names if name not in flank_table.loci]
@@ -969,70 +1048,12 @@ def extract_panel(
     if extra:
         raise ValueError(f"{flanks_path}: flanks for {len(extra)} loci not in the BED: "
                          f"{extra[:10]}")
+    return flank_table
 
-    bam = pysam.AlignmentFile(str(bam_path), "rb")
 
-    # One pass: extract a locus and immediately turn it into its
-    # `ExtractedLocus`, so the locus's `Counter` — one 4-tuple key per
-    # deduped row, and a full panel has millions of them — is released
-    # before the next locus starts. Holding every locus's Counter across
-    # a second pass kept those tuples alive to the end of the run, which
-    # both raised peak memory and made every cyclic-collection pass walk
-    # them again.
-    loci: dict[str, ExtractedLocus] = {}
-    max_observed_run_length = 0
-
-    bed_iter = (
-        tqdm(bed_rows, desc="extract_panel", unit="locus") if verbose else bed_rows
-    )
-
-    try:
-        for name, chrom, bed_start, bed_end in bed_iter:
-            # A locus has no geometry when the matched normal had no reference
-            # window or no flank pair, so it has no flanks, or when this BAM
-            # has no reference window.
-            if name in flank_table.no_flank_pair:
-                flanks = geometry = None
-                no_geometry_status = NO_FLANK_PAIR
-            elif name in flank_table.no_reference_window:
-                flanks = geometry = None
-                no_geometry_status = WINDOW_UNRECOVERABLE
-            else:
-                no_geometry_status = WINDOW_UNRECOVERABLE
-                flanks = flank_table.records[name]
-                geometry = locus_geometry(bam, name, chrom, bed_start, bed_end, flanks,
-                                          min_mapq=min_mapq)
-            if geometry is None:
-                counts: Counter = Counter()
-                flanking_seqs: list[str] = []
-                up_width = 0
-                dn_width = 0
-                qc = new_locus_qc()
-            else:
-                counts, flanking_seqs, up_width, dn_width, qc = _extract_locus(
-                    bam, chrom, bed_start, bed_end,
-                    geometry=geometry,
-                    min_mapq=min_mapq,
-                    drop_chimeric=drop_chimeric,
-                    max_tlen=max_tlen,
-                    min_base_q=min_base_q,
-                )
-
-            locus = _build_locus(
-                name, chrom, bed_start, bed_end,
-                flanks=flanks, geometry=geometry, no_geometry_status=no_geometry_status,
-                counts=counts, qc=qc,
-                flanking_seqs=flanking_seqs, up_width=up_width, dn_width=dn_width,
-            )
-            loci[name] = locus
-            if locus.max_observed_run_length > max_observed_run_length:
-                max_observed_run_length = locus.max_observed_run_length
-    finally:
-        bam.close()
-
-    n_alleles = max_observed_run_length + n_alleles_margin
-
-    provenance = ExtractionProvenance(
+def _provenance(bam_path: Path, bed_path: Path, flanks_path: Path, flank_table: FlankTable,
+                settings: _ExtractionSettings, n_alleles_margin: int) -> ExtractionProvenance:
+    return ExtractionProvenance(
         bam_path=str(bam_path),
         bed_path=str(bed_path),
         flank_table_path=str(flanks_path),
@@ -1040,16 +1061,76 @@ def extract_panel(
         flank_table_sample=flank_table.sample,
         extraction_version=_prolyg_version(),
         extraction_date=datetime.date.today().isoformat(),
-        min_mapq=min_mapq,
-        drop_chimeric=drop_chimeric,
-        max_tlen=max_tlen,
+        min_mapq=settings.min_mapq,
+        drop_chimeric=settings.drop_chimeric,
+        max_tlen=settings.max_tlen,
         pair_disagreement_policy=PAIR_DISAGREEMENT_POLICY,
         n_alleles_margin=n_alleles_margin,
-        min_base_q=min_base_q,
+        min_base_q=settings.min_base_q,
         extraction_schema_version=EXTRACTION_SCHEMA_VERSION,
     )
 
-    return ExtractedPanel(loci=loci, n_alleles=n_alleles, provenance=provenance)
+
+def _extract_bed_locus(bam: pysam.AlignmentFile, row: tuple[str, str, int, int],
+                       flank_table: FlankTable, settings: _ExtractionSettings
+                       ) -> ExtractedLocus:
+    """One BED locus of one BAM as its `ExtractedLocus`.
+
+    The locus's read `Counter` is released when this returns, before the
+    next locus starts.
+    """
+    name, chrom, bed_start, bed_end = row
+    # A locus has no geometry when the matched normal had no reference
+    # window or no flank pair, so it has no flanks, or when this BAM has no
+    # reference window.
+    if name in flank_table.no_flank_pair:
+        flanks = geometry = None
+        no_geometry_status = NO_FLANK_PAIR
+    elif name in flank_table.no_reference_window:
+        flanks = geometry = None
+        no_geometry_status = WINDOW_UNRECOVERABLE
+    else:
+        no_geometry_status = WINDOW_UNRECOVERABLE
+        flanks = flank_table.records[name]
+        geometry = locus_geometry(bam, name, chrom, bed_start, bed_end, flanks,
+                                  min_mapq=settings.min_mapq)
+    if geometry is None:
+        counts: Counter = Counter()
+        flanking_seqs: list[str] = []
+        up_width = dn_width = 0
+        qc = new_locus_qc()
+    else:
+        counts, flanking_seqs, up_width, dn_width, qc = _extract_locus(
+            bam, chrom, bed_start, bed_end,
+            geometry=geometry,
+            min_mapq=settings.min_mapq,
+            drop_chimeric=settings.drop_chimeric,
+            max_tlen=settings.max_tlen,
+            min_base_q=settings.min_base_q,
+        )
+    return _build_locus(
+        name, chrom, bed_start, bed_end,
+        flanks=flanks, geometry=geometry, no_geometry_status=no_geometry_status,
+        counts=counts, qc=qc,
+        flanking_seqs=flanking_seqs, up_width=up_width, dn_width=dn_width,
+    )
+
+
+_EXTRACT_WORKER: dict = {}
+
+
+def _open_extract_worker(bam_path: str, flanks_path: str,
+                         settings: _ExtractionSettings) -> None:
+    _EXTRACT_WORKER["bam"] = pysam.AlignmentFile(bam_path, "rb")
+    _EXTRACT_WORKER["flank_table"] = read_flank_table(flanks_path)
+    _EXTRACT_WORKER["settings"] = settings
+
+
+def _extract_worker_row(row: tuple[str, str, int, int]) -> tuple[str, list, int]:
+    """One locus in a worker: its id, its encoded table row, its largest run."""
+    locus = _extract_bed_locus(_EXTRACT_WORKER["bam"], row, _EXTRACT_WORKER["flank_table"],
+                               _EXTRACT_WORKER["settings"])
+    return row[0], encode_locus_row(locus), locus.max_observed_run_length
 
 
 def _build_locus(

@@ -73,7 +73,6 @@ has no flank and gets its own status in the flank table.
 from __future__ import annotations
 
 import dataclasses
-import os
 from collections.abc import Iterator, Sequence
 from multiprocessing import Pool
 from pathlib import Path
@@ -134,15 +133,6 @@ _LIST_ALL = 1 << 20
 
 # Largest cell count of one 0/1 matrix block in the joint bound.
 _JOINT_BOUND_CELLS = 20_000_000
-
-# Memory one worker process can use at a deep locus, with headroom.
-_WORKER_MEMORY_BYTES = 1 << 30
-
-# Share of the available memory that the workers may use together.
-_WORKER_MEMORY_SHARE = 0.5
-
-# Share of the usable cores that is left free for other work.
-_FREE_CORE_SHARE = 0.125
 
 # The read filters of the extraction, at their defaults.
 _FILTERS = {"min_mapq": 40, "drop_chimeric": True, "max_tlen": 1000}
@@ -956,22 +946,6 @@ def _open_worker_bam(bam_path: str) -> None:
 def _solve_bed_row(row: tuple[str, str, int, int]) -> tuple[str, LocusFlanks | None]:
     name, chrom, bed_start, bed_end = row
     return name, solve_locus(_WORKER_BAM["bam"], name, chrom, bed_start, bed_end)
-
-
-def worker_count() -> int:
-    """Worker processes for the flank search, from the live box.
-
-    The usable cores (``os.sched_getaffinity``) less `_FREE_CORE_SHARE` of
-    them, and no more than `_WORKER_MEMORY_SHARE` of ``MemAvailable`` in
-    `_WORKER_MEMORY_BYTES` units. At least one.
-    """
-    cores = len(os.sched_getaffinity(0))
-    by_cores = cores - max(1, int(np.ceil(cores * _FREE_CORE_SHARE)))
-    with open("/proc/meminfo") as f:
-        available_kb = next(int(line.split()[1]) for line in f
-                            if line.startswith("MemAvailable:"))
-    by_memory = int(available_kb * 1024 * _WORKER_MEMORY_SHARE // _WORKER_MEMORY_BYTES)
-    return max(1, min(by_cores, by_memory))
 
 
 def sample_name(bam_path: str | Path, sample: str | None = None) -> str:
