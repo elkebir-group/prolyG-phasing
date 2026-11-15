@@ -70,7 +70,6 @@ canvas{display:block}
 .tip{position:fixed;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.18);max-width:min(90vw,640px);z-index:20}
 .tip .mono{word-break:break-all}
 .note{color:var(--muted);font-size:12px;max-width:95ch}
-.lab-unk{background:transparent!important;border:1.5px solid var(--muted)}
 .help{display:inline-block;width:15px;height:15px;line-height:15px;border-radius:50%;text-align:center;font-size:10px;background:var(--chip);color:var(--muted);cursor:help;text-transform:none;letter-spacing:0;vertical-align:1px}
 .sec{margin-top:10px}
 .rowband{position:absolute;left:0;box-sizing:border-box;pointer-events:none;border:2px solid var(--fg);background:none;border-radius:2px}
@@ -317,7 +316,7 @@ function histCard(r){
   const totals=lab.map((_,i)=>r.largest_run_labels.reduce((a,[,v])=>a+v[i],0));
   const ymax=sc.ymax;
   lab.forEach((l,i)=>{const rows=SH[l].map(([k,v])=>[k,v,(counts[k]||[0,0,0])[i]]);
-    c.innerHTML+=`<div class="sec" style="margin-top:4px"><h3>${labelSwatch(l)}${LABEL_NAME[l].toLowerCase()} · ${fmt(totals[i])} reads</h3>`+
+    c.innerHTML+=`<div class="sec" style="margin-top:4px"><h3${l==="unk"?' style="color:var(--muted)"':""}>${labelSwatch(l)}${LABEL_NAME[l].toLowerCase()} · ${fmt(totals[i])} reads</h3>`+
       panel(rows,ymax,78,l==="unk"?"outline":`var(${LABEL_COLOR[l]})`,(k,v,n)=>`${LABEL_NAME[l].toLowerCase()}, largest G run ${k}: ${fmt(n)} reads (${pct(v)} of ${LABEL_NAME[l].toLowerCase()})`)+`</div>`});
   c.innerHTML+=`<div class="note" style="text-align:center">largest G run</div>`;
   return c;
@@ -345,7 +344,8 @@ document.addEventListener("keydown",e=>{const el=e.target.closest&&e.target.clos
 // Label styles: major and minor are filled; unk is a hollow outline in the
 // muted text color. Hue in the pile-up belongs to the bases.
 const LABEL_COLOR={hap_major:"--hmajor",hap_minor:"--hminor",unk:"--muted"};
-function labelSwatch(l){return l==="unk"?`<i class="lab-unk"></i>`:`<i style="background:var(${LABEL_COLOR[l]})"></i>`}
+// Next to its word, unk has no swatch: the muted word is enough.
+function labelSwatch(l){return l==="unk"?"":`<i style="background:var(${LABEL_COLOR[l]})"></i>`}
 const LABEL_NAME={hap_major:"Major",hap_minor:"Minor",unk:"Unk"};
 function profileText(r,label){
   const field=label==="hap_major"?"hap_major_base":"hap_minor_base";
@@ -354,7 +354,7 @@ function profileText(r,label){
 function sectionHeading(r,S){
   if(!S.label)return "";
   const sw=labelSwatch(S.label);
-  if(S.label==="unk")return `<h3>${sw}Unk: these reads have no label (no phased SNV covered, or a tied vote) · ${fmt(S.reads)} reads</h3>`;
+  if(S.label==="unk")return `<h3 style="color:var(--muted)">${sw}Unk: these reads have no label (no phased SNV covered, or a tied vote) · ${fmt(S.reads)} reads</h3>`;
   return `<h3>${sw}${LABEL_NAME[S.label]} haplotype: ${profileText(r,S.label)} · ${fmt(S.reads)} reads</h3>`}
 function pileCard(r){
   const c=document.createElement("div");c.className="card";const P=r.pileup;
@@ -366,7 +366,7 @@ function pileCard(r){
    <div class="note">Each row: reads with the same tract${r.phasing?", phase label":""} and bases at the shown columns. Empty cell: no base.${r.phasing?"":" No phasing result given for this sample."}</div>
    ${dropped.length?`<div class="note">Dropped SNVs, not in the profile: ${dropped.map(v=>`${fmt(v.ref_pos)} ${esc(v.allele_major)}/${esc(v.allele_minor)}`).join(", ")}.</div>`:""}
    ${secs}
-   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank band</span><span><i style="background:var(--tract)"></i>tract band</span>${r.phasing?`<span><i style="background:var(--snvband)"></i>phased SNV</span><span><i style="background:transparent;border:1.5px dashed var(--muted)"></i>dropped SNV</span><span>${labelSwatch("hap_major")}major</span><span>${labelSwatch("hap_minor")}minor</span><span>${labelSwatch("unk")}unk</span><span><i style="background:transparent;outline:2px solid var(--fg)"></i>differs from its haplotype</span>`:""}<span>faded bases: the panel's flank</span><span>— tract padding</span><span>▮ skipped positions</span></div>`;
+   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank band</span><span><i style="background:var(--tract)"></i>tract band</span>${r.phasing?`<span><i style="background:var(--snvband)"></i>phased SNV</span><span><i style="background:transparent;border:1.5px dashed var(--muted)"></i>dropped SNV</span><span>${labelSwatch("hap_major")}major</span><span>${labelSwatch("hap_minor")}minor</span><span style="color:var(--muted)">unk</span><span><i style="background:transparent;outline:2px solid var(--fg)"></i>differs from its haplotype</span>`:""}<span>faded bases: the panel's flank</span><span>— tract padding</span><span>▮ skipped positions</span></div>`;
   queueMicrotask(()=>{const T=r._shared?r._shared.tract:tractWidth(r);
     P.sections.forEach((S,k)=>drawPile(r,S,$("#pilehost"+r._col+k),T))});
   return c;
