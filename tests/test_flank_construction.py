@@ -290,7 +290,9 @@ def test_no_pair_reaches_a_positive_objective():
 def _locus_flanks(records, name="L") -> fc.LocusFlanks:
     pair = fc.FlankPair("ACTTCAGCAT", "CAAATTTTAT", 41, (("ACTTCAGCAT", "CAAATTTTAT"),),
                         30, 25)
-    return fc.LocusFlanks(name, "+", pair, records)
+    positions = tuple(fc.FlankPosition(r, 0 if r is None else 20, 0 if r is None else 18)
+                      for r in records)
+    return fc.LocusFlanks(name, "+", pair, positions)
 
 
 def test_side_table_round_trips_flanks_of_any_reference_length(tmp_path):
@@ -307,18 +309,20 @@ def test_side_table_round_trips_flanks_of_any_reference_length(tmp_path):
     row = sides.iloc[0]
     assert (row.objective, row.n_reads, row.n_reads_placed, row.n_tied_pairs) == \
         ("20.5", "30", "25", "1")
+    assert (row.n_reads_positioned, row.n_reads_at_position) == ("20", "18")
 
 
 def test_a_flank_with_no_reference_position_stops_construction():
     up = FlankRecord("ACTTCAGCAT", tuple(range(100, 110)), 9)
-    with pytest.raises(ValueError, match=r"no kept read gives a reference position for 1 "
+    with pytest.raises(ValueError, match=r"no kept read gives both reference positions for 1 "
                                          r"flanks: \['L downstream'\]"):
         fc.construct_flanks([("L", _locus_flanks((up, None)))], sample="S1")
 
 
 def test_a_locus_with_no_positive_pair_stops_construction():
     with pytest.raises(ValueError, match=r"no flank pair reaches F > 0 at 1 loci: \['L'\]"):
-        fc.construct_flanks([("L", fc.LocusFlanks("L", "+", None, (None, None)))],
+        none = fc.FlankPosition(None, 0, 0)
+        fc.construct_flanks([("L", fc.LocusFlanks("L", "+", None, (none, none)))],
                             sample="S1")
 
 
@@ -535,32 +539,56 @@ def _locus_reads(reads: list[str], coords: list[list[int]]) -> fc.LocusReads:
     return fc.LocusReads("L", "+", 0, "", 0, 0, reads, matrix)
 
 
-def test_a_flank_range_against_the_polyg_direction_is_an_error():
-    read = "TTACCAGTCA" + "ACTTCAGCAT" + "G" * 12 + "CAAATTTTAT" + "ACCAGTCATT"
-    pair = fc.solve_flank_pair([read])
+_READ = "TTACCAGTCA" + "ACTTCAGCAT" + "G" * 12 + "CAAATTTTAT" + "ACCAGTCATT"
+
+
+def _coords_with(outer: int, run: int) -> list[int]:
+    """Coordinates of `_READ` from 100, with its upstream flank's outer base
+    (index 10) and run-side base (index 19) set."""
+    coords = list(range(100, 100 + len(_READ)))
+    coords[10], coords[19] = outer, run
+    return coords
+
+
+def test_a_flank_range_against_the_polyg_direction_is_an_invariant_error():
+    """No real alignment maps two read bases out of order."""
+    pair = fc.solve_flank_pair([_READ])
     assert (pair.upstream, pair.downstream) == ("ACTTCAGCAT", "CAAATTTTAT")
-    coords = list(range(100, 100 + len(read)))
-    # The read maps its upstream flank backward: outer base 19 past its run side.
-    coords[10] = coords[19] + 1
-    with pytest.raises(ValueError, match="L: the upstream flank ACTTCAGCAT runs from"):
-        fc.flank_records_from_alignments(_locus_reads([read], [coords]), pair)
+    loc = _locus_reads([_READ], [_coords_with(120, 119)])
+    with pytest.raises(RuntimeError, match="L: the upstream flank ACTTCAGCAT runs from"):
+        fc.flank_records_from_alignments(loc, pair)
 
 
 def test_a_flank_base_without_a_coordinate_leaves_no_record():
-    read = "TTACCAGTCA" + "ACTTCAGCAT" + "G" * 12 + "CAAATTTTAT" + "ACCAGTCATT"
-    pair = fc.solve_flank_pair([read])
-    coords = list(range(100, 100 + len(read)))
+    pair = fc.solve_flank_pair([_READ])
+    coords = list(range(100, 100 + len(_READ)))
     coords[41] = -1  # the downstream outer base is soft-clipped
-    up, dn = fc.flank_records_from_alignments(_locus_reads([read], [coords]), pair)
-    assert up.ref_positions == tuple(range(110, 120))
-    assert dn is None
+    up, dn = fc.flank_records_from_alignments(_locus_reads([_READ], [coords]), pair)
+    assert up.record.ref_positions == tuple(range(110, 120))
+    assert (up.n_reads_positioned, up.n_reads_at_position) == (1, 1)
+    assert dn == fc.FlankPosition(None, 0, 0)
 
 
-def test_modal_coordinate_breaks_a_tie_toward_the_run():
-    coords = np.array([5, 7, 5, 7, 9])
-    assert fc.modal_coordinate(coords, 1) == 7
-    assert fc.modal_coordinate(coords, -1) == 5
-    assert fc.modal_coordinate(np.array([], dtype=np.int64), 1) is None
+def test_the_pair_vote_differs_from_two_separate_votes():
+    """Separate votes on each end give outer 112 (4 reads) and run side 121
+    (4 reads), but no read gives that pair. Of the reads with both ends, 3
+    give (110, 119) and 2 give (112, 121)."""
+    rows = ([_coords_with(110, 119)] * 3 + [_coords_with(112, 121)] * 2
+            + [_coords_with(112, -1)] * 2 + [_coords_with(-1, 121)] * 2)
+    pair = fc.solve_flank_pair([_READ])
+    up, _ = fc.flank_records_from_alignments(_locus_reads([_READ] * len(rows), rows), pair)
+    assert up.record.ref_positions == tuple(range(110, 120))
+    assert (up.n_reads_positioned, up.n_reads_at_position) == (5, 3)
+
+
+def test_modal_pair_breaks_a_tie_by_the_run_side_then_the_outer_base():
+    outer, run = np.array([5, 6, 4]), np.array([9, 9, 10])
+    # The run side nearest the G run wins first: 10 toward larger coordinates.
+    assert fc.modal_pair(outer, run, 1) == (4, 10, 1)
+    # Toward smaller coordinates, run side 9 is nearer; then outer 5 over 6.
+    assert fc.modal_pair(outer, run, -1) == (5, 9, 1)
+    assert fc.modal_pair(np.array([5, 6, 6]), np.array([9, 9, 9]), 1) == (6, 9, 2)
+    assert fc.modal_pair(np.zeros(0, np.int64), np.zeros(0, np.int64), 1) is None
 
 
 # ---------------------------------------------------------------------------
@@ -669,7 +697,8 @@ def test_locus_without_a_reference_window_gets_a_status_row(tmp_path):
     assert list(no_window.side) == ["upstream", "downstream"]
     assert set(no_window.reference_window_status) == {"ref_window_unrecoverable"}
     for column in ("ref_orientation", "flank_bases", "flank_ref_positions", "objective",
-                   "n_reads", "n_reads_placed", "n_tied_pairs"):
+                   "n_reads", "n_reads_placed", "n_tied_pairs", "n_reads_positioned",
+                   "n_reads_at_position"):
         assert set(no_window[column]) == {""}, column
     window = sides[sides.locus == "PolyG5177"]
     assert set(window.reference_window_status) == {"recovered"}

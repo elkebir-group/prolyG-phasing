@@ -121,6 +121,7 @@ def write_side_table(prefix: Path, sample: str,
                 "ref_orientation": "", "flank_bases": record.bases,
                 "flank_ref_positions": ",".join(map(str, record.ref_positions)),
                 "objective": 0.0, "n_reads": 0, "n_reads_placed": 0, "n_tied_pairs": 1,
+                "n_reads_positioned": 0, "n_reads_at_position": 0,
             })
     result = fc.FlankConstruction(sample, records, pd.DataFrame(rows, columns=fc.SIDE_COLUMNS))
     return fc.write_flank_table(result, prefix)

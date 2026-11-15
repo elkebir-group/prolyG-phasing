@@ -47,10 +47,10 @@ function extraction uses, and the summed value must equal the optimum.
 in the reference; the reference sequence is not searched, so a donor flank
 can differ from the reference by any number of edits. In each kept read the
 flank occupies known read bases at the best placement. The aligner maps the
-flank's outer base and its run-side base to reference coordinates. Each of
-the two coordinates is the most common one over the kept reads (see
-:func:`flank_records_from_alignments`). The phasing window starts past the
-outer base. The tract never uses these coordinates.
+flank's outer base and its run-side base to reference coordinates. The
+flank's position is the most common (outer, run-side) pair over the kept
+reads that give both (see :func:`flank_records_from_alignments`). The
+phasing window starts past the outer base. The tract never uses these coordinates.
 """
 
 from __future__ import annotations
@@ -670,38 +670,68 @@ def locus_reads(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
                       polyg_reference_coordinates(records, anchors.ref_orientation))
 
 
-def modal_coordinate(coords: np.ndarray, toward_run: int) -> int | None:
-    """The most common coordinate in `coords`; None when it is empty.
+def modal_pair(outer: np.ndarray, run: np.ndarray, toward_run: int
+               ) -> tuple[int, int, int] | None:
+    """The most common (outer, run-side) coordinate pair, with its read count.
 
-    On a tie, the coordinate nearer the G run wins: the largest
-    ``toward_run * coordinate``. `toward_run` is +1 when the G run lies at
+    `outer` and `run` hold one pair per read. On a tie, the pair whose
+    run-side coordinate is nearer the G run wins; if still tied, the pair
+    whose outer coordinate is nearer the G run. Nearer means a larger
+    ``toward_run * coordinate``: `toward_run` is +1 when the G run lies at
     larger reference coordinates, -1 when it lies at smaller ones.
+
+    Returns ``(outer, run, count)``, or None when there is no pair.
     """
-    if coords.size == 0:
+    if outer.size == 0:
         return None
-    values, counts = np.unique(coords, return_counts=True)
-    top = values[counts == counts.max()]
-    return int(top[np.argmax(toward_run * top)])
+    pairs, counts = np.unique(np.stack([outer, run], axis=1), axis=0, return_counts=True)
+    top = pairs[counts == counts.max()]
+    # Sort by the run-side key, then the outer key, both nearest the G run first.
+    best = top[np.lexsort((-toward_run * top[:, 0], -toward_run * top[:, 1]))[0]]
+    return int(best[0]), int(best[1]), int(counts.max())
+
+
+@dataclasses.dataclass(frozen=True)
+class FlankPosition:
+    """One side's flank record, with the reads that voted for its position.
+
+    Attributes
+    ----------
+    record : FlankRecord or None
+        None when no kept read gives both of the side's coordinates.
+    n_reads_positioned : int
+        Kept reads whose alignment gives both the outer and the run-side
+        base a coordinate.
+    n_reads_at_position : int
+        Those of them that give the chosen pair.
+    """
+
+    record: FlankRecord | None
+    n_reads_positioned: int
+    n_reads_at_position: int
 
 
 def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
-                                  ) -> tuple[FlankRecord | None, FlankRecord | None]:
-    """The upstream and downstream flank records of a solved pair, from the alignments.
+                                  ) -> tuple[FlankPosition, FlankPosition]:
+    """The upstream and downstream flank positions of a solved pair, from the alignments.
 
     The kept reads are those whose best placement under the pair has a
     value of at least 0. In each one, the flank occupies the read bases
     from its outer base to its run-side base at the best placement
     (:func:`~prolyg_phasing.io._flank_placement.flank_outer_bases`). The
     alignment gives each of these two bases a reference coordinate,
-    unless the base is soft-clipped or in an insertion; such a read adds
-    nothing for that base. Each coordinate is the most common one over the
-    kept reads; on a tie, the one nearer the G run (:func:`modal_coordinate`).
-    `ref_positions` is the contiguous range between the two, in polyG read
-    order.
+    unless the base is soft-clipped or in an insertion. Only a read that
+    gives both coordinates votes, with its (outer, run-side) pair. The
+    flank's position is the most common pair. On a tie, the pair whose
+    run-side coordinate is nearer the G run wins; if still tied, the pair
+    whose outer coordinate is nearer the G run (:func:`modal_pair`).
+    `ref_positions` is the contiguous range between the two coordinates,
+    in polyG read order.
 
-    An entry is None when no kept read gives one of the side's two
-    coordinates. Raises ValueError, naming the locus, when a side's range
-    runs against the polyG direction or holds fewer than two bases.
+    The record is None when no kept read gives both coordinates. An
+    alignment keeps the read bases in reference order, so a pair from one
+    read always runs toward the G run and spans at least two bases. Raises
+    RuntimeError if the chosen pair does not.
     """
     placement = place_polyg_reads(loc.reads, pair.upstream, pair.downstream)
     up_outer, dn_outer = flank_outer_bases(loc.reads, placement, pair.upstream,
@@ -713,41 +743,49 @@ def flank_records_from_alignments(loc: LocusReads, pair: FlankPair
         "upstream": (up_outer[kept], placement.upstream_run_side[kept], step),
         "downstream": (dn_outer[kept], placement.downstream_run_side[kept], -step),
     }
-    records = []
+    out = []
     for side, bases in zip(SIDES, (pair.upstream, pair.downstream), strict=True):
         outer_index, run_index, toward_run = read_bases[side]
         outer_coords = coords[kept, outer_index]
         run_coords = coords[kept, run_index]
-        outer = modal_coordinate(outer_coords[outer_coords >= 0], toward_run)
-        run = modal_coordinate(run_coords[run_coords >= 0], toward_run)
-        if outer is None or run is None:
-            records.append(None)
+        both = (outer_coords >= 0) & (run_coords >= 0)
+        n_positioned = int(both.sum())
+        voted = modal_pair(outer_coords[both], run_coords[both], toward_run)
+        if voted is None:
+            out.append(FlankPosition(None, 0, 0))
             continue
+        outer, run, n_at = voted
         if toward_run * (run - outer) < 1:
-            raise ValueError(
+            raise RuntimeError(
                 f"{loc.name}: the {side} flank {bases} runs from reference position "
                 f"{outer} (outer base) to {run} (run-side base), not toward the G run")
         if side == "upstream":
             positions = tuple(range(outer, run + step, step))
-            records.append(FlankRecord(bases, positions, len(positions) - 1))
+            record = FlankRecord(bases, positions, len(positions) - 1)
         else:
             positions = tuple(range(run, outer + step, step))
-            records.append(FlankRecord(bases, positions, 0))
-    return records[0], records[1]
+            record = FlankRecord(bases, positions, 0)
+        out.append(FlankPosition(record, n_positioned, n_at))
+    return out[0], out[1]
 
 
 @dataclasses.dataclass
 class LocusFlanks:
     """One locus's flank pair, and where each flank lies in the reference.
 
-    `records` holds the upstream and downstream record; an entry is None
-    when no kept read gives that flank a reference coordinate.
+    `positions` holds the upstream and downstream position; its record is
+    None when no kept read gives that flank both reference coordinates.
     """
 
     name: str
     ref_orientation: str
     pair: FlankPair | None
-    records: tuple[FlankRecord | None, FlankRecord | None]
+    positions: tuple[FlankPosition, FlankPosition]
+
+    @property
+    def records(self) -> tuple[FlankRecord | None, FlankRecord | None]:
+        """The upstream and downstream flank records."""
+        return self.positions[0].record, self.positions[1].record
 
 
 def solve_locus(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
@@ -762,7 +800,8 @@ def solve_locus(bam: pysam.AlignmentFile, name: str, chrom: str, bed_start: int,
         return None
     pair = solve_flank_pair(loc.reads)
     if pair is None:
-        return LocusFlanks(name, loc.ref_orientation, None, (None, None))
+        none = FlankPosition(None, 0, 0)
+        return LocusFlanks(name, loc.ref_orientation, None, (none, none))
     return LocusFlanks(name, loc.ref_orientation, pair,
                        flank_records_from_alignments(loc, pair))
 
@@ -793,11 +832,13 @@ class FlankConstruction:
 
 SIDE_COLUMNS = ("locus", "side", "reference_window_status", "ref_orientation",
                 "flank_bases", "flank_ref_positions", "objective", "n_reads",
-                "n_reads_placed", "n_tied_pairs")
+                "n_reads_placed", "n_tied_pairs", "n_reads_positioned",
+                "n_reads_at_position")
 
 # Integer columns of the side table that a side with no reference window
 # leaves empty.
-_SIDE_INT_COLUMNS = ("n_reads", "n_reads_placed", "n_tied_pairs")
+_SIDE_INT_COLUMNS = ("n_reads", "n_reads_placed", "n_tied_pairs", "n_reads_positioned",
+                     "n_reads_at_position")
 
 
 def construct_flanks(loci: Sequence[tuple[str, LocusFlanks | None]], *, sample: str
@@ -806,8 +847,10 @@ def construct_flanks(loci: Sequence[tuple[str, LocusFlanks | None]], *, sample: 
 
     A locus with None has no reference window: it gets a row on each side
     with the status `WINDOW_UNRECOVERABLE`, empty flank fields and no
-    record. The locus columns (`objective`, the read counts, the tied
-    pairs) repeat on both side rows. `objective` is in the units of the
+    record. The locus columns (`objective`, `n_reads`, `n_reads_placed`,
+    `n_tied_pairs`) repeat on both side rows. `n_reads_positioned` and
+    `n_reads_at_position` are per side (see :class:`FlankPosition`); they
+    are for diagnosis. `objective` is in the units of the
     decision record, half the half-unit value.
 
     Raises ValueError when a locus with a reference window has no pair with
@@ -821,7 +864,7 @@ def construct_flanks(loci: Sequence[tuple[str, LocusFlanks | None]], *, sample: 
     unlocated = [f"{name} {side}" for name, loc in loci if loc is not None
                  for side, record in zip(SIDES, loc.records, strict=True) if record is None]
     if unlocated:
-        raise ValueError(f"{sample}: no kept read gives a reference position for "
+        raise ValueError(f"{sample}: no kept read gives both reference positions for "
                          f"{len(unlocated)} flanks: {unlocated}")
     records: dict[str, tuple[FlankRecord, FlankRecord]] = {}
     rows = []
@@ -832,10 +875,12 @@ def construct_flanks(loci: Sequence[tuple[str, LocusFlanks | None]], *, sample: 
                              "reference_window_status": WINDOW_UNRECOVERABLE,
                              "ref_orientation": "", "flank_bases": "",
                              "flank_ref_positions": "", "objective": None, "n_reads": None,
-                             "n_reads_placed": None, "n_tied_pairs": None})
+                             "n_reads_placed": None, "n_tied_pairs": None,
+                             "n_reads_positioned": None, "n_reads_at_position": None})
             continue
         records[name] = loc.records
-        for side, record in zip(SIDES, loc.records, strict=True):
+        for side, position in zip(SIDES, loc.positions, strict=True):
+            record = position.record
             rows.append({
                 "locus": name, "side": side, "reference_window_status": WINDOW_RECOVERED,
                 "ref_orientation": loc.ref_orientation, "flank_bases": record.bases,
@@ -843,6 +888,8 @@ def construct_flanks(loci: Sequence[tuple[str, LocusFlanks | None]], *, sample: 
                 "objective": loc.pair.objective_half_units / 2,
                 "n_reads": loc.pair.n_reads, "n_reads_placed": loc.pair.n_reads_placed,
                 "n_tied_pairs": len(loc.pair.optimal_pairs),
+                "n_reads_positioned": position.n_reads_positioned,
+                "n_reads_at_position": position.n_reads_at_position,
             })
     sides = pd.DataFrame(rows, columns=list(SIDE_COLUMNS))
     sides["objective"] = sides["objective"].astype(float)
