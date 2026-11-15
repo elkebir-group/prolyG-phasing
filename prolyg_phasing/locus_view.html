@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PolyG loci: __TITLE__</title>
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--fg:#1b2330;--muted:#5d6878;--line:#dde2e9;--accent:#0f6e8c;
+  --chip:#eef2f6;--warnbg:#fff1dc;--warn:#a85c00;
+  --bG:#9aa3af;--bA:#2f8a3b;--bC:#2f62b8;--bT:#c43c32;--bN:#222;
+  --flank:#fde3c0;--tract:#ece6f8;--bed:#0f6e8c;
+  --sans:system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#12161c;--panel:#1a2029;--fg:#e4e9f0;--muted:#97a3b3;
+  --line:#2c3440;--accent:#4fb3d4;--chip:#242c37;--warnbg:#3a2c16;--warn:#f0b35a;
+  --bG:#6b7480;--bA:#5cbf68;--bC:#5f92e6;--bT:#ec6a5f;--bN:#ddd;--flank:#4a3517;--tract:#2e2742;--bed:#4fb3d4}}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans);margin:0;padding:14px 18px}
+h1{font-size:18px;margin:0 0 4px} h2{font-size:20px;margin:22px 0 8px;font-family:var(--mono)}
+.note{color:var(--muted);font-size:12px;max-width:95ch;margin:2px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:10px 0}
+.card h3{font-size:14px;margin:0 0 6px}
+.pill{display:inline-block;font-size:11px;border-radius:4px;padding:0 6px;line-height:18px;background:var(--chip);color:var(--muted);margin-left:6px}
+.pill.warn{background:var(--warnbg);color:var(--warn)}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:4px 18px;margin:6px 0}
+.kv b{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:500}
+.kv span{font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}
+.row3{display:grid;grid-template-columns:minmax(260px,1fr) minmax(220px,1fr) minmax(220px,1fr);gap:14px;align-items:start}
+@media (max-width:1000px){.row3{grid-template-columns:1fr}}
+table.ctr{border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+table.ctr td{padding:1px 8px;border-bottom:1px solid var(--line)} table.ctr td.n{text-align:right}
+.bars{font-size:11px;font-variant-numeric:tabular-nums}
+.bars .b{display:grid;grid-template-columns:3.5em 1fr 5em;gap:6px;align-items:center;height:14px}
+.bars .bar{height:10px;background:var(--accent);border-radius:2px;min-width:1px}
+.bars .lbl{text-align:right;color:var(--muted)} .bars .val{color:var(--muted)}
+.bars h4,.ctrw h4{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:0 0 4px;font-weight:500}
+.aln{overflow-x:auto;margin-top:8px;border-top:1px solid var(--line);padding-top:6px}
+.aln table{border-collapse:collapse;font-family:var(--mono);font-size:12px;line-height:14px}
+.aln td{padding:0;white-space:pre} .aln td.meta{padding:0 10px 0 0;text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}
+.c{display:inline-block;width:8px;text-align:center}
+.gA{color:var(--bA)} .gC{color:var(--bC)} .gG{color:var(--bG)} .gT{color:var(--bT)} .gN{color:var(--bN)}
+.gap{color:transparent} .pad{color:transparent}
+.fl{background:var(--flank)} .tr{background:var(--tract)}
+.ruler{color:var(--muted)} .refrow td{border-bottom:1px solid var(--line)}
+.legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--muted);margin-top:4px}
+.legend i{display:inline-block;width:12px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+</style>
+<h1>PolyG loci from panel.db</h1>
+<p class="note">Read from the extracted panel only, not from the BAM: the page shows the reads the fit and
+the phasing use. Dropped reads appear only in the counters. Every sequence is in polyG orientation (the G
+strand): at a "-" locus the bases are reverse-complemented and reference coordinates fall from left to
+right.</p>
+<p class="note">Columns: the upstream flanking bases on their reference columns, the upstream flank, the
+tract, the downstream flank, the downstream flanking bases. <b>The upstream side is fixed</b>: every row's
+tract starts in the same column. The downstream flank and flanking bases follow each row's own tract, so
+they line up only between rows with tracts of one length. A "." in the panel (no read base) is drawn as a
+gap. The panel holds no reference bases outside the tract, so the reference row shows coordinates there.</p>
+<div class="legend"><span><i class="fl"></i>flank (the donor's flank bases)</span><span><i class="tr"></i>tract</span>
+<span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span>
+<span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span></div>
+<div id="app"></div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+const DATA=JSON.parse(document.getElementById("data").textContent);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmt=n=>n==null?"–":Number(n).toLocaleString();
+function cells(s,cls){let o="";for(const ch of s){
+  if(ch==="."){o+=`<span class="c gap ${cls||""}">.</span>`;continue}
+  o+=`<span class="c g${"ACGT".includes(ch)?ch:"N"} ${cls||""}">${esc(ch)}</span>`}return o}
+function pad(n){return n>0?`<span class="c pad"> </span>`.repeat(n):""}
+function coordAt(orient,start,i){return orient==="-"?start-i:start+i}
+function ruler(width,orient,start){
+  // A tick every 10 columns: a "|" at the column, its coordinate in the title.
+  let o="";for(let i=0;i<width;i++){const c=coordAt(orient,start,i);
+    o+=`<span class="c ruler" title="${c}">${c%10===0?"|":"·"}</span>`}return o}
+function bars(title,rows){
+  if(!rows.length)return `<div class="bars"><h4>${title}</h4><span class="note">no kept reads</span></div>`;
+  const mx=Math.max(...rows.map(r=>r[1]));
+  return `<div class="bars"><h4>${title}</h4>`+rows.map(([k,v])=>
+    `<div class="b"><span class="lbl">${k}</span><span><span class="bar" style="display:block;width:${(100*v/mx).toFixed(1)}%"></span></span><span class="val">${fmt(v)}</span></div>`).join("")+`</div>`}
+function counters(c){return `<div class="ctrw"><h4>Counters</h4><table class="ctr">`+
+  Object.entries(c).map(([k,v])=>`<tr><td>${esc(k)}</td><td class="n">${fmt(v)}</td></tr>`).join("")+`</table></div>`}
+function flankText(f){if(!f)return "–";
+  if(f.status!=="recovered")return `${esc(f.bases)} <span class="pill warn">no reference position</span>`;
+  const p=f.ref_positions;return `${esc(f.bases)} at ${fmt(p[0])}..${fmt(p[p.length-1])}`}
+function alignment(b){
+  const f=b.flanks,fl=b.flanking,o=b.ref_orientation;
+  const mols=b.molecules,shown=mols.slice(0,DATA.rows_shown);
+  const upW=fl.up_width,dnW=fl.dn_width;
+  const tw=Math.max(b.reference_tract.length,...shown.map(m=>m.tract.length));
+  const up=f.upstream.bases,dn=f.downstream.bases;
+  const rowLen=t=>tw-t.length;
+  let h=`<div class="aln"><table><tr><td class="meta">reads</td><td class="meta">mols</td>`+
+    `<td class="note">upstream fixed; downstream follows each tract</td></tr>`;
+  // Reference row: coordinates on the flanking columns, the flanks, the reference tract.
+  const upRuler=upW&&fl.up_ref_pos_start>=0?ruler(upW,o,fl.up_ref_pos_start):pad(upW);
+  const dnRuler=dnW&&fl.dn_ref_pos_start>=0?ruler(dnW,o,fl.dn_ref_pos_start):pad(dnW);
+  const refTract=b.reference_tract;
+  h+=`<tr class="refrow"><td class="meta">reference</td><td class="meta"></td><td>${upRuler}${cells(up,"fl")}${cells(refTract,"tr")}${cells(dn,"fl")}${dnRuler}${pad(rowLen(refTract))}</td></tr>`;
+  for(const m of shown){
+    h+=`<tr title="tract length ${m.tract.length}; runs ${esc(runs(m.tract))}"><td class="meta">${fmt(m.reads)}</td><td class="meta">${fmt(m.molecules)}</td><td>${cells(m.up_flanking)}${cells(up,"fl")}${cells(m.tract,"tr")}${cells(dn,"fl")}${cells(m.dn_flanking)}${pad(rowLen(m.tract))}</td></tr>`}
+  h+=`</table>`;
+  const rest=mols.slice(DATA.rows_shown),restReads=rest.reduce((a,m)=>a+m.reads,0);
+  h+=`<p class="note">${fmt(mols.length)} distinct rows; "reads" is the read count and "mols" the molecules (distinct MI).`+
+    (rest.length?` ${fmt(rest.length)} more rows with ${fmt(restReads)} reads are not drawn.`:"")+`</p></div>`;
+  return h}
+function runs(t){return t.split(/[^G]+/).map(s=>s.length).join(",")||"0"}
+function block(b){
+  const st=b.reference_window_status;
+  let h=`<div class="card"><h3>${esc(b.sample)}<span class="pill${st==="recovered"?"":" warn"}">${esc(st)}</span></h3>`;
+  h+=`<div class="kv"><div><b>BED interval</b><span>${esc(b.chrom)}:${fmt(b.bed_start)}-${fmt(b.bed_end)} (${esc(b.bed_name)})</span></div>`+
+     `<div><b>Orientation</b><span>${esc(b.ref_orientation||"–")}</span></div>`+
+     `<div><b>Reference tract</b><span>${esc(b.reference_tract||"–")} (${b.reference_run_lengths.join(",")||"–"})</span></div>`+
+     `<div><b>Upstream flank</b><span>${flankText(b.flanks&&b.flanks.upstream)}</span></div>`+
+     `<div><b>Downstream flank</b><span>${flankText(b.flanks&&b.flanks.downstream)}</span></div>`+
+     `<div><b>Reads</b><span>${fmt(b.counters.n_reads)}</span></div></div>`;
+  h+=`<div class="row3">${counters(b.counters)}${bars("Tract length (reads)",b.tract_length_counts)}${bars("Largest run (reads)",b.largest_run_counts)}</div>`;
+  if(b.flanks&&b.molecules.length)h+=alignment(b);
+  else if(b.flanks)h+=`<p class="note">No kept reads.</p>`;
+  else h+=`<p class="note">This locus has no flank in this sample (${esc(st)}), so it has no reads.</p>`;
+  return h+`</div>`}
+const app=document.getElementById("app");
+let html=`<p class="note">Samples: `+DATA.samples.map(s=>`${esc(s.sample)} (flanks from ${esc(s.flank_table_sample)})`).join("; ")+`.</p>`;
+for(const L of DATA.loci){html+=`<section id="${esc(L.locus)}"><h2>${esc(L.locus)}</h2>`+L.blocks.map(block).join("")+`</section>`}
+app.innerHTML=html;
+</script>
+</html>

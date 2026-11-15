@@ -1,5 +1,5 @@
 """Command-line entry point: ``prolyg-phasing extract`` / ``build-flanks`` / ``phase`` /
-``ref-phase``.
+``ref-phase`` / ``view-loci``.
 
 Thin argparse wrappers, one per stage. Run directly against one BAM (or one
 already-extracted ``panel.db``), or drive ``extract``/``phase`` over many
@@ -29,6 +29,7 @@ from prolyg_phasing.io.phasing_tables import (
     build_snv_calls,
     haplotypes_from_snv_calls_table,
 )
+from prolyg_phasing.locus_view import write_locus_page
 from prolyg_phasing.phasing import PhasingPanel
 from prolyg_phasing.ref_phasing import assign_flanking_haplotypes_ref
 
@@ -152,6 +153,39 @@ def _positive_int(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be at least 1, not {value}")
     return value
+
+
+_VIEW_LOCI_DESCRIPTION = """\
+Write one self-contained HTML page that shows the given loci in one or more
+panel.db files of a donor (its normal and its tumors). The page reads only
+the panels, not the BAMs: per locus and sample it shows the reference row
+with the BED interval and the two flanks, the kept molecules (one row per
+distinct tract and flanking bases, with read and molecule counts), the
+tract-length and largest-run counts, and every per-locus counter. Each
+panel is labeled with the file stem of the BAM its provenance names. All
+sequence is in polyG orientation."""
+
+
+def _add_view_loci_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--panel", required=True, type=Path, action="append",
+                   help="A panel.db of the donor. Repeat for each sample.")
+    loci = p.add_mutually_exclusive_group(required=True)
+    loci.add_argument("--loci", help="Comma-separated locus names, e.g. PolyG3145,PolyG4320.")
+    loci.add_argument("--loci-file", type=Path,
+                      help="A file with one locus name per line.")
+    p.add_argument("--out", required=True, type=Path, help="The HTML file to write.")
+
+
+def _requested_loci(args: argparse.Namespace) -> list[str]:
+    text = args.loci if args.loci is not None else args.loci_file.read_text()
+    names = [name.strip() for name in text.replace(",", "\n").splitlines()]
+    return [name for name in names if name]
+
+
+def _run_view_loci(args: argparse.Namespace) -> None:
+    loci = _requested_loci(args)
+    path = write_locus_page(args.panel, loci, args.out)
+    print(f"{len(loci)} loci over {len(args.panel)} panels; wrote {path}")
 
 
 def _run_build_flanks(args: argparse.Namespace) -> None:
@@ -389,6 +423,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_ref_phase_args(ref_phase_p)
     ref_phase_p.set_defaults(func=_run_ref_phase)
+
+    view_loci_p = sub.add_parser(
+        "view-loci",
+        help="Write an HTML page that shows loci of one or more panel.db files.",
+        description=_VIEW_LOCI_DESCRIPTION,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    _add_view_loci_args(view_loci_p)
+    view_loci_p.set_defaults(func=_run_view_loci)
 
     return p
 
