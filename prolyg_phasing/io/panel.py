@@ -49,7 +49,7 @@ from prolyg_phasing.io.format import format_pattern
 
 # Version of the saved-panel layout and extraction rules. `load_db` rejects
 # a panel written under any other version.
-EXTRACTION_SCHEMA_VERSION = "4"
+EXTRACTION_SCHEMA_VERSION = "3"
 
 # ---------------------------------------------------------------------------
 # Dataclasses

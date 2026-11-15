@@ -826,7 +826,7 @@ def test_extraction_schema_version_in_provenance(tmp_path):
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])
     bam_path = _make_test_bam(tmp_path, [])
     panel = extract_panel(bam_path, bed_path, _flank_table(), min_base_q=25)
-    assert panel.provenance.extraction_schema_version == "4"
+    assert panel.provenance.extraction_schema_version == "3"
     assert panel.provenance.min_base_q == 25
 
 
