@@ -51,6 +51,9 @@ th{position:sticky;top:0;background:var(--panel);font-size:11px;text-transform:u
 #loci tbody tr:hover{background:var(--chip)}
 #loci tbody tr[aria-selected="true"]{background:var(--chip);box-shadow:inset 3px 0 0 var(--accent)}
 .num{text-align:right}
+#loci.side th.grp{text-align:center;cursor:default}
+#loci.side .ga{border-left:1px solid var(--line)}
+#loci .sname{display:inline-block;max-width:8em;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom;text-transform:none;letter-spacing:0;font-weight:400}
 .mono{font-family:var(--mono);font-size:12px}
 .pill{display:inline-block;font-size:11px;border-radius:4px;padding:0 6px;line-height:18px}
 .p-warn{background:var(--warnbg);color:var(--warn)} .p-bad{background:var(--badbg);color:var(--bad)} .p-ok{background:var(--okbg);color:var(--ok)} .p-n{background:var(--chip);color:var(--muted)}
@@ -105,6 +108,9 @@ canvas{display:block}
 // The page reads the locus list from /loci and one locus from /locus, served by
 // prolyg-phasing view-loci on the local machine.
 let LIST,sample=0,sample2=1,side=false,current=null,sortKey="locus",sortDir=1,filter="all";
+// sortCol is the side-by-side sub-column the list sorts on: 0 for the left
+// sample, 1 for the right one. One sample shown sorts on that sample.
+let sortCol=0,HEAD1;
 const $=s=>document.querySelector(s);
 const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const fmt=n=>n==null?"–":Number(n).toLocaleString();
@@ -127,7 +133,11 @@ async function load(){
   $("#side").onchange=()=>{side=$("#side").checked;route()};
   const F=[["all","All"],["noflank","No flank"],["noposition","Side with no position"],["noreads","No reads"]];
   for(const [k,l] of F){const b=document.createElement("button");b.textContent=l;b.dataset.k=k;b.onclick=()=>{filter=k;renderList()};$("#filters").appendChild(b)}
-  document.querySelectorAll("#loci th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;if(sortKey===k)sortDir*=-1;else{sortKey=k;sortDir=k==="locus"||k==="status"?1:-1}renderList()});
+  HEAD1=$("#loci thead").innerHTML;
+  $("#loci thead").onclick=ev=>{const th=ev.target.closest("th[data-k]");if(!th)return;
+    const k=th.dataset.k,c=th.dataset.s===undefined?0:+th.dataset.s;
+    if(sortKey===k&&(!side||k==="locus"||sortCol===c))sortDir*=-1;else{sortKey=k;sortDir=k==="locus"||k==="status"?1:-1}
+    sortCol=c;renderList()};
   $("#q").addEventListener("input",renderList);
   $("#q").addEventListener("keydown",e=>{if(e.key==="Enter"){const r=visible()[0];if(r)select(r)}});
   window.addEventListener("hashchange",fromHash);
@@ -151,13 +161,16 @@ function renderAll(){
   renderList();renderDetail();
 }
 function info(e){return e.samples[sample]}
+// The samples the list shows: one, or the left and right sample side by side.
+function shown(){return side?[sample,sample2]:[sample]}
+// A filter chip keeps a locus when any shown sample matches it.
+const FILTERS={noflank:s=>s.status!=="recovered",noposition:s=>s.no_position,noreads:s=>s.n_reads===0};
 function visible(){
   const q=$("#q").value.trim().toLowerCase();
   let rows=LIST.loci.filter(e=>!q||e.locus.toLowerCase().includes(q));
-  if(filter==="noflank")rows=rows.filter(e=>info(e)&&info(e).status!=="recovered");
-  if(filter==="noposition")rows=rows.filter(e=>info(e)&&info(e).no_position);
-  if(filter==="noreads")rows=rows.filter(e=>info(e)&&info(e).n_reads===0);
-  const key=e=>{if(sortKey==="locus")return e.locus;const s=info(e);if(!s)return null;
+  const match=FILTERS[filter];
+  if(match)rows=rows.filter(e=>shown().some(k=>e.samples[k]&&match(e.samples[k])));
+  const key=e=>{if(sortKey==="locus")return e.locus;const s=e.samples[shown()[side?sortCol:0]];if(!s)return null;
     if(sortKey==="snvs")return s.snvs?s.snvs.phased+s.snvs.dropped/1000:null;return s[sortKey]};
   return rows.slice().sort((a,b)=>{const x=key(a),y=key(b);
     if(sortKey==="locus")return natural.compare(x,y)*sortDir;
@@ -167,19 +180,41 @@ function visible(){
 function snvText(s){if(!s||!s.snvs)return "–";const v=s.snvs;
   if(!v.phased&&!v.dropped)return `<span class="note">no SNV</span>`;
   return fmt(v.phased)+(v.dropped?` <span class="note">(${fmt(v.dropped)})</span>`:"")}
+function statusPill(s){
+  return !s?`<span class="pill p-n">not in panel</span>`:s.status!=="recovered"?`<span class="pill p-bad">${esc(s.status.replaceAll("_"," "))}</span>`:s.no_position?`<span class="pill p-warn">side with no position</span>`:`<span class="pill p-ok">recovered</span>`}
+function snvTitle(k){return LIST.samples[k].phasing?"SNVs of this sample's phasing result (snv_calls.tsv): phased, and dropped for low linkage in brackets":"no phasing result given for this sample"}
+// Short names for the two sub-column heads: the names without the start they
+// share, cut at a "_", "-" or "." so that a name part stays whole.
+function shortNames(a,b){if(a===b)return [a,b];let n=0;while(n<a.length&&a[n]===b[n])n++;
+  const cut=Math.max(a.lastIndexOf("_",n-1),a.lastIndexOf("-",n-1),a.lastIndexOf(".",n-1))+1;
+  return [a.slice(cut),b.slice(cut)]}
+const LIST_COLS=[["n_reads","Reads",true],["largest_run","Largest run",true],["snvs","Phasing SNVs",true],["status","Status",false]];
+function listHead(){
+  if(!side){$("#loci").removeAttribute("class");$("#loci thead").innerHTML=HEAD1;$("#snvhead").title=snvTitle(sample);return}
+  $("#loci").setAttribute("class","side");
+  const names=shown().map(k=>LIST.samples[k].sample),short=shortNames(...names);
+  $("#loci thead").innerHTML=`<tr><th data-k="locus" rowspan="2">Locus</th>${LIST_COLS.map(([k,l,num])=>
+    `<th colspan="2" class="grp ga"${k==="snvs"?` title="${esc(shown().map(s=>LIST.samples[s].sample+": "+snvTitle(s)).join("\n"))}"`:""}>${l}</th>`).join("")}</tr>
+    <tr>${LIST_COLS.map(([k,,num])=>[0,1].map(c=>`<th data-k="${k}" data-s="${c}" class="${num?"num":""}${c?"":" ga"}" title="${esc(names[c])}"><span class="sname">${esc(short[c])}</span></th>`).join("")).join("")}</tr>`;
+  // The sub-column heads stick just below the first head row.
+  const top=$("#loci thead tr").offsetHeight+"px";
+  for(const th of $("#loci thead tr:nth-child(2)").cells)th.style.top=top}
 function renderList(){
-  $("#snvhead").title=LIST.samples[sample].phasing?"SNVs of this sample's phasing result (snv_calls.tsv): phased, and dropped for low linkage in brackets":"no phasing result given for this sample";
+  listHead();
   document.querySelectorAll("#filters button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.k===filter));
   const tb=$("#loci tbody");tb.textContent="";
   for(const e of visible()){const s=info(e);
     const tr=document.createElement("tr");tr.tabIndex=0;tr.setAttribute("aria-selected",current===e);
-    const pill=!s?`<span class="pill p-n">not in panel</span>`:s.status!=="recovered"?`<span class="pill p-bad">${esc(s.status.replaceAll("_"," "))}</span>`:s.no_position?`<span class="pill p-warn">side with no position</span>`:`<span class="pill p-ok">recovered</span>`;
-    tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.largest_run):"–"}</td><td class="num">${snvText(s)}</td><td>${pill}</td>`;
+    if(!side)tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.largest_run):"–"}</td><td class="num">${snvText(s)}</td><td>${statusPill(s)}</td>`;
+    else{const ss=shown().map(k=>e.samples[k]),sub=(f,num)=>ss.map((x,c)=>`<td class="${num?"num":""}${c?"":" ga"}">${f(x)}</td>`).join("");
+      tr.innerHTML=`<td class="mono">${esc(e.locus)}</td>`+sub(x=>x?fmt(x.n_reads):"–",true)+sub(x=>x?fmt(x.largest_run):"–",true)+sub(snvText,true)+sub(statusPill,false)}
     tr.onclick=()=>select(e);tr.onkeydown=ev=>{if(ev.key==="Enter")select(e)};
     tb.appendChild(tr)}
   // Keep the open locus in view inside the list panel, without moving the page.
   const sel=tb.querySelector('tr[aria-selected="true"]'),wrap=$(".tablewrap");
-  if(sel&&(sel.offsetTop<wrap.scrollTop+30||sel.offsetTop>wrap.scrollTop+wrap.clientHeight-20))wrap.scrollTop=sel.offsetTop-60;
+  // The list head is one row tall for one sample and two rows side by side.
+  const h=$("#loci thead").offsetHeight;
+  if(sel&&(sel.offsetTop<wrap.scrollTop+h+6||sel.offsetTop>wrap.scrollTop+wrap.clientHeight-20))wrap.scrollTop=sel.offsetTop-h-36;
 }
 async function fetchLocus(s){
   const q=new URLSearchParams({sample:s,locus:current.locus,near:$("#near").value});
