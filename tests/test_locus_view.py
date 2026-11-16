@@ -580,3 +580,22 @@ def test_without_phasing_the_one_section_counts_every_molecule(tmp_path):
     [section] = view["pileup"]["sections"]
     assert (section["label"], section["reads"], section["molecules"]) == (None, 110, 109)
     assert section["molecules"] == view["n_molecules"]
+
+
+def test_each_pileup_row_counts_its_molecules(tmp_path):
+    """Rows 0 and 1 of the panel are one family. With the same tract and the
+    same flanking bases, the two rows fall in one pile-up row with more reads
+    than molecules."""
+    def one_row(locus):
+        locus.seq[1] = locus.seq[0]
+        locus.flanking_id[1] = locus.flanking_id[0]
+
+    db, _ = _snv_panel(tmp_path, edit=one_row)
+    view = locus_view_data("L1", ExtractedPanel.load_db(db).loci["L1"], "S")
+    [section] = view["pileup"]["sections"]
+    rows = section["rows"]
+    assert all(1 <= row["molecules"] <= row["reads"] for row in rows)
+    assert any(row["molecules"] < row["reads"] for row in rows)
+    # Each molecule is in at least one row, and the rows hold every read.
+    assert sum(row["molecules"] for row in rows) >= section["molecules"]
+    assert sum(row["reads"] for row in rows) == section["reads"]

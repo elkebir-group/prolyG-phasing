@@ -553,14 +553,17 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
     sections = []
     for code in labels_present:
         in_label = row_label == code
-        keys, key_reads, _ = _summed(row_key[in_label], count[in_label])
+        keys, key_reads, key_of_row = _summed(row_key[in_label], count[in_label])
+        # Molecules per pile-up row: distinct MI among the row's reads.
+        key_mi = np.unique(np.stack([key_of_row, mi_id[in_label]]), axis=1)
+        key_molecules = np.bincount(key_mi[0], minlength=len(keys))
         key_order = np.lexsort((keys, -key_reads))
         label = PHASE_LABELS[code] if code >= 0 else None
         rows = []
         for k in key_order[:PILEUP_ROWS]:
             tract, up, dn = str(keys[k]).split("\t")
-            row = {"tract": tract, "reads": int(key_reads[k]), "up": up, "dn": dn,
-                   "label": label}
+            row = {"tract": tract, "reads": int(key_reads[k]),
+                   "molecules": int(key_molecules[k]), "up": up, "dn": dn, "label": label}
             if label in ("hap_major", "hap_minor"):
                 field = f"{label}_base"
                 row["differs"] = {

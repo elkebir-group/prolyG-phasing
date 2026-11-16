@@ -480,7 +480,7 @@ function drawPile(r,S,host,T){
     band.hidden=!onRow;if(onRow){g.font=font;const end=X(width)+6+g.measureText(fmt(S.rows[kk].reads)).width+4;
       band.style.top=(HEAD+kk*RH-2)+"px";band.style.height=(RH+3)+"px";band.style.width=Math.min(W,end)+"px"}
     if(onRow&&(j<0||j>=width)){const row=S.rows[kk];tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";
-      tip.innerHTML=`<div class="mono">${fmt(row.reads)} reads${row.label?` · ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;return}
+      tip.innerHTML=`<div class="mono">${fmt(row.reads)} ${row.reads===1?"read":"reads"} · ${fmt(row.molecules)} ${row.molecules===1?"molecule":"molecules"}${row.label?` · ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;return}
     if(j<0||j>=width){tip.hidden=true;return}
     const sl=slots[j];let html="";
     if(sl.gap)html="<b>skipped flanking positions</b>";
@@ -492,7 +492,7 @@ function drawPile(r,S,host,T){
       html+=`<div>all reads: ${cellsText(c.counts)}</div>`}
     const k=Math.floor((yy-HEAD)/RH);
     if(yy>=HEAD&&k<S.rows.length){const row=S.rows[k];
-      html+=`<div class="mono">${fmt(row.reads)} reads${row.label?` · ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;
+      html+=`<div class="mono">${fmt(row.reads)} ${row.reads===1?"read":"reads"} · ${fmt(row.molecules)} ${row.molecules===1?"molecule":"molecules"}${row.label?` · ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;
       if(sl.side){const ch=row[sl.side][sl.k];html+=`<div>this row's reads: ${ch==="."?"no base here":esc(ch)}${row.differs&&row.differs[sl.side].includes(sl.k)?" (differs from the row's haplotype base)":""}</div>`}}
     tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";tip.innerHTML=html};
   cv.onmouseleave=()=>{band.hidden=true;if(!HELP.open)tip.hidden=true};
