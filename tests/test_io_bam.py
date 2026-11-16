@@ -454,7 +454,7 @@ def test_pair_merge_winner_differs_by_position(tmp_path):
 
 
 def test_pair_merge_equal_quality_drops(tmp_path):
-    """Equal qualities at the differing base: the pair is dropped."""
+    """Equal qualities at a differing base inside the tracts: the pair is dropped."""
     reads = _pair_reads(
         _tract_with({1: "G"}), _tract_with({1: "T"}),
         _quality_at({}), _quality_at({}),
@@ -614,6 +614,50 @@ def test_pair_with_equal_tracts_is_not_merged(tmp_path):
     assert loc.n_read_pairs_merged == 0
     assert loc.n_read_pairs_drop_disagree == 0
     assert list(loc.seq) == [_REF_POLYG]
+
+
+def _pair_with_flank_bases(flank_a: dict[int, str], flank_b: dict[int, str],
+                           qual_a: str, qual_b: str) -> list[dict]:
+    """Two mates of one fragment whose tracts differ at tract index 1.
+
+    Mate B reads T at tract index 1 at low quality. `flank_a` and `flank_b`
+    replace bases of the upstream flank ACGTACGTAC (read indices 50 to 59).
+    """
+    reads = _pair_reads(_REF_POLYG, _tract_with({1: "T"}), qual_a, qual_b)
+    for read, flank in zip(reads, (flank_a, flank_b), strict=True):
+        seq = list(read["read_seq"])
+        for i, base in flank.items():
+            seq[i] = base
+        read["read_seq"] = "".join(seq)
+    return reads
+
+
+def test_pair_merge_writes_n_at_a_tied_flank_base(tmp_path):
+    """A tie at a flank base gives N there; the flank still matches and the pair merges."""
+    reads = _pair_with_flank_bases(
+        {}, {BED_START - 4: "A"},
+        _quality_at({}), _quality_at({BED_START + 1: _LOW_Q}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs_merged == 1
+    assert loc.n_read_pairs_drop_disagree == 0
+    assert list(loc.seq) == [_REF_POLYG]
+
+
+def test_pair_merge_n_and_a_second_flank_mismatch_drops(tmp_path):
+    """The N and a second mismatch in the same flank leave no flank match; the pair drops."""
+    # Mate A carries a substitution at read index 52 at high quality, and mate
+    # B the flank base there at low quality, so the merged flank has the
+    # substitution and the N.
+    reads = _pair_with_flank_bases(
+        {BED_START - 8: "A"}, {BED_START - 4: "A"},
+        _quality_at({}), _quality_at({BED_START + 1: _LOW_Q, BED_START - 8: _LOW_Q}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_alignments_placed == 2
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 1
+    assert int(loc.count.sum()) == 0
 
 
 def test_provenance_records_merge_rule(tmp_path):

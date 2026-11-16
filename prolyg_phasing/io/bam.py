@@ -479,14 +479,16 @@ def _merge_by_quality(
     seq_b: str,
     quality_a: Sequence[int] | None,
     quality_b: Sequence[int] | None,
+    tracts: Sequence[tuple[int, int]],
 ) -> str | None:
     """Merge two mates' equal-length stretches of read by base quality.
 
     At each position where the mates differ, the base with the higher
-    Phred quality wins. Return ``None`` when the stretches differ in
-    length, when either mate has no stored qualities, or when the mates
-    differ at a position where their qualities are equal. The caller then
-    drops the pair.
+    Phred quality wins. At a position where the mates differ with equal
+    qualities, we write N if the position lies outside both mates' tracts,
+    and we return ``None`` if the position lies inside either tract. We
+    also return ``None`` when the stretches differ in length or when
+    either mate has no stored qualities. The caller then drops the pair.
 
     Parameters
     ----------
@@ -495,6 +497,8 @@ def _merge_by_quality(
     quality_a, quality_b : sequence of int or None
         Per-base Phred qualities of the two stretches, in the same
         orientation and over the same slice as ``seq_a`` and ``seq_b``.
+    tracts : sequence of (int, int)
+        Each mate's own tract as a half-open interval of stretch positions.
 
     Returns
     -------
@@ -508,8 +512,10 @@ def _merge_by_quality(
         if base_a == base_b:
             continue
         if quality_a[i] == quality_b[i]:
-            return None
-        if quality_b[i] > quality_a[i]:
+            if any(start <= i < end for start, end in tracts):
+                return None
+            merged[i] = "N"
+        elif quality_b[i] > quality_a[i]:
             merged[i] = base_b
     return "".join(merged)
 
@@ -555,7 +561,8 @@ def _merge_pair_tracts(
     stretch as aligned inside the BED interval, because each mate's tract
     lies inside its stretch and holds such a base. The caller drops a
     pair with ``None``: the two stretches cannot be merged, or the merged
-    stretch has no tract with a value of at least 0.
+    stretch has no tract with a value of at least 0. An N that the merge
+    writes at a tied flank base counts as a substitution in the flank match.
 
     Parameters
     ----------
@@ -578,12 +585,15 @@ def _merge_pair_tracts(
     up_outer, dn_outer = flank_outer_bases(reads, placement.take(index), upstream, downstream)
     merged: list[str | None] = []
     for k in range(len(pairs)):
-        stretches, qualities = [], []
+        stretches, qualities, tracts = [], [], []
         for j in (2 * k, 2 * k + 1):
             start, end = int(up_outer[j]), int(dn_outer[j]) + 1
             stretches.append(reads[j][start:end])
             qualities.append(_polyg_qualities(alignments[index[j]], start, end, ref_orientation))
-        merged.append(_merge_by_quality(*stretches, *qualities))
+            i = index[j]
+            tracts.append((int(placement.upstream_run_side[i]) + 1 - start,
+                           int(placement.downstream_run_side[i]) - start))
+        merged.append(_merge_by_quality(*stretches, *qualities, tracts))
     rows = [k for k, m in enumerate(merged) if m is not None]
     out: list[str | None] = [None] * len(pairs)
     if rows:

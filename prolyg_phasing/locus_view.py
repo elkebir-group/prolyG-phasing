@@ -154,12 +154,14 @@ _COUNTER_HELP = {
     "n_read_pairs_drop_disagree":
         "Read pairs with two mates over the BED interval and two different tracts that we "
         "cannot merge. The two stretches from flank match to flank match differ in length, "
-        "a mate has no base qualities, the two mates differ at a base of equal quality, or "
-        "the merged stretch has no tract. We drop these read pairs.",
+        "a mate has no base qualities, the two mates differ at a base of equal quality "
+        "inside either mate's tract, or the merged stretch has no tract. We drop these "
+        "read pairs.",
     "n_read_pairs_merged":
         "Read pairs with two different tracts. In each mate we take the stretch from the "
         "outer base of one flank match to the outer base of the other. At each base where "
-        "the two stretches differ, we keep the base of higher quality. The tract is the "
+        "the two stretches differ, we keep the base of higher quality. At a flank base of "
+        "equal quality, we write N. The tract is the "
         "best placement of the two flanks in the merged stretch. A read pair with two equal "
         "tracts counts neither here nor in n_read_pairs_drop_disagree.",
     "n_reads":
