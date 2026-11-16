@@ -315,11 +315,33 @@ def test_the_list_shows_phasing_snvs_no_snv_or_no_phasing_result(tmp_path):
     out = tmp_path / "both_phasing"
     cli.main(["phase", "--panel-db", str(both), "--out-dir", str(out)])
     panel = ExtractedPanel.load_db(both)
-    listing = lv.locus_list([panel, panel], [lv.PhasingIndex.read(out), None])
+    listing = lv.locus_list([panel, panel], [lv.PhasingIndex.read(out), None],
+                            [lv.molecule_counts(both, 1)] * 2)
     snvs = {e["locus"]: [s["snvs"] for s in e["samples"]] for e in listing["loci"]}
     assert snvs == {"L1": [{"phased": 1, "dropped": 0}, None],
                     "L2": [{"phased": 0, "dropped": 0}, None]}
     assert [s["phasing"] is not None for s in listing["samples"]] == [True, False]
+
+
+def test_the_list_molecules_are_the_tract_tables_distinct_mi(tmp_path):
+    """Six rows: M0 on both strands, M1 under two tracts, M2 once. Three molecules."""
+    from tests.test_phasing_tables import _make_locus, _make_provenance
+
+    locus = _make_locus(flanking_strings=["AAAA|TTTT"], counts=[6],
+                        seqs=["GGGGGG", "GGGGGG", "GGGGGG", "GGGGGGG", "GGGGGG", "GGGGGG"],
+                        up_width=4, dn_width=4)
+    locus.mi = np.asarray(["M0", "M0", "M1", "M1", "M2", "M2"], dtype=object)
+    locus.strand = np.asarray(["A", "B", "A", "A", "A", "A"], dtype="U1")
+    db = tmp_path / "molecules.panel.db"
+    ExtractedPanel(loci={"L1": locus}, n_alleles=8, provenance=_make_provenance()).save_db(db)
+    panel = ExtractedPanel.load_db(db)
+    view = locus_view_data("L1", panel.loci["L1"], "S")
+    # The tract table: M0, M1 and M2 under GGGGGG; M1 alone under GGGGGGG.
+    assert {t: m for t, _, m in view["tracts"]} == {"GGGGGG": 3, "GGGGGGG": 1}
+    assert view["n_molecules"] == 3
+    for n_workers in (1, 2):
+        listing = lv.locus_list([panel], [None], [lv.molecule_counts(db, n_workers)])
+        assert listing["loci"][0]["samples"][0]["molecules"] == view["n_molecules"]
 
 
 def test_labels_join_the_panel_rows_in_order(tmp_path):

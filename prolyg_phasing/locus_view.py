@@ -29,6 +29,7 @@ from array import array
 from collections.abc import Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
+from multiprocessing import Pool
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -46,6 +47,7 @@ from prolyg_phasing.io._flank_placement import (
     WINDOW_RECOVERED,
     WINDOW_UNRECOVERABLE,
 )
+from prolyg_phasing.io._workers import worker_count
 from prolyg_phasing.io.panel import (
     ExtractedLocus,
     ExtractedPanel,
@@ -389,6 +391,16 @@ def _summed(keys: np.ndarray, weights: np.ndarray) -> tuple[np.ndarray, np.ndarr
     return distinct, sums, index
 
 
+def molecule_ids(locus: ExtractedLocus) -> tuple[int, np.ndarray]:
+    """The locus's molecules, and each row's molecule as an index among them.
+
+    A molecule is a distinct MI. The panel's MI holds no strand (strand is
+    its own field), so the A and B strands of a read family are one molecule.
+    """
+    distinct, index = np.unique(np.asarray(locus.mi, dtype=str), return_inverse=True)
+    return len(distinct), index.ravel()
+
+
 def _flanking_matrix(locus: ExtractedLocus) -> np.ndarray:
     """The flanking strings as a (n_flanking, up_width + 1 + dn_width) byte matrix."""
     width = int(locus.flanking_up_width) + 1 + int(locus.flanking_dn_width)
@@ -443,6 +455,8 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
         ``[tract, reads, molecules]`` for the `TRACT_ROWS` tracts with the
         most reads; molecules are distinct MI. Sorted by reads, then tract.
     n_tracts, tract_reads_not_shown : int
+    n_molecules : int
+        The locus's molecules, distinct MI (:func:`molecule_ids`).
     largest_run : list of [int, int]
         ``[largest G run, reads]`` over the kept reads.
     near : int
@@ -489,7 +503,7 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
 
     # Tracts, with their reads and molecules (distinct MI).
     tracts, tract_reads, tract_of_row = _summed(seq, count)
-    mi_id = np.unique(np.asarray(locus.mi, dtype=str), return_inverse=True)[1].ravel()
+    n_molecules, mi_id = molecule_ids(locus)
     span = len(mi_id) + 1
     pairs = np.unique(tract_of_row.astype(np.int64) * span + mi_id)
     tract_molecules = np.bincount(pairs // span, minlength=len(tracts))
@@ -602,6 +616,7 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
         "tracts": tract_rows,
         "tract_labels": tract_labels,
         "n_tracts": len(tracts),
+        "n_molecules": n_molecules,
         "tract_reads_not_shown": int(tract_reads[order[TRACT_ROWS:]].sum()),
         "largest_run": [[k, v] for k, v in sorted(largest.items())],
         "largest_run_labels": largest_labels,
@@ -642,32 +657,57 @@ def _lacks_position(text: str | None) -> bool:
     return text is not None and not json.loads(text)["ref_positions"]
 
 
-def locus_list(panels: Sequence[ExtractedPanel],
-               phasings: Sequence[PhasingIndex | None]) -> dict:
+_MOLECULE_PANEL: list[ExtractedPanel] = []
+
+
+def _open_molecule_worker(path: str) -> None:
+    _MOLECULE_PANEL[:] = [ExtractedPanel.load_db(path)]
+
+
+def _locus_molecules(locus_id: str) -> int:
+    return molecule_ids(_MOLECULE_PANEL[0].loci[locus_id])[0]
+
+
+def molecule_counts(path: str | Path, n_workers: int) -> dict[str, int]:
+    """The molecules of every locus of the panel at `path` (see :func:`molecule_ids`).
+
+    It decodes the rows of every locus, which costs seconds per panel, so
+    `n_workers` processes share the loci.
+    """
+    loci = list(ExtractedPanel.load_db(path).loci)
+    n_workers = max(1, min(n_workers, len(loci)))
+    with Pool(n_workers, initializer=_open_molecule_worker, initargs=(str(path),)) as pool:
+        return dict(zip(loci, pool.map(_locus_molecules, loci, chunksize=1), strict=True))
+
+
+def locus_list(panels: Sequence[ExtractedPanel], phasings: Sequence[PhasingIndex | None],
+               molecules: Sequence[dict[str, int]]) -> dict:
     """The locus list: every locus of the panels, with per-sample fields.
 
-    Read from the panels' metadata columns, without decoding any locus's
-    rows. Per sample: ``n_reads``, ``status``, ``largest_run`` (the largest
-    observed G run), ``no_position`` (a flank side with no reference
+    Read from the panels' metadata columns; `molecules` gives each panel's
+    :func:`molecule_counts`. Per sample: ``n_reads``, ``molecules`` (distinct MI, see
+    :func:`molecule_ids`), ``status``, ``largest_run`` (the largest observed
+    G run), ``no_position`` (a flank side with no reference
     position) and ``snvs`` (``{"phased": n, "dropped": m}`` from the
     phasing result's ``snv_calls.tsv``, None when no phasing result was
     given), or None when the panel does not hold the locus. Each entry of
     ``samples`` also holds ``help``, the panel's :func:`view_help`.
     """
     columns = []
-    for panel in panels:
+    for panel, counts in zip(panels, molecules, strict=True):
         up, dn = panel.locus_column("upstream_flank"), panel.locus_column("downstream_flank")
         columns.append({
             "n_reads": panel.locus_column("n_reads"),
             "status": panel.locus_column("reference_window_status"),
             "largest_run": panel.locus_column("max_observed_run_length"),
             "no_position": {k: _lacks_position(up[k]) or _lacks_position(dn[k]) for k in up},
+            "molecules": counts,
         })
     names: dict[str, None] = {}
     for panel in panels:
         for name in panel.loci:
             names.setdefault(name, None)
-    fields = ("n_reads", "status", "largest_run", "no_position")
+    fields = ("n_reads", "molecules", "status", "largest_run", "no_position")
 
     def entry(c, phasing, name):
         if name not in c["n_reads"]:
@@ -747,7 +787,8 @@ def make_server(panels: Sequence[tuple[str | Path, str | Path | None]],
     `panels` are ``(panel.db, phasing directory or None)`` pairs. Each
     phasing directory is read once, here, and checked against its panel
     (:meth:`PhasingIndex.check`); a pair that does not belong together
-    raises ValueError. The locus list is read once, here. Call
+    raises ValueError. The locus list is read once, here, with the molecules
+    of every locus (:func:`molecule_counts`). Call
     ``serve_forever()`` on the server.
     """
     paths = [str(p) for p, _ in panels]
@@ -761,7 +802,10 @@ def make_server(panels: Sequence[tuple[str | Path, str | Path | None]],
         phasing.check(panel, path)
         phasings.append(phasing)
     page = resources.files("prolyg_phasing").joinpath("locus_view.html").read_bytes()
-    listing = json.dumps(locus_list(opened.get(), phasings), separators=(",", ":")).encode()
+    n_workers = worker_count()
+    molecules = [molecule_counts(path, n_workers) for path in paths]
+    listing = json.dumps(locus_list(opened.get(), phasings, molecules),
+                         separators=(",", ":")).encode()
     handler = type("LocusViewHandler", (_Handler,),
                    {"panels": opened, "phasings": phasings, "page": page, "listing": listing})
     return ThreadingHTTPServer(("127.0.0.1", port), handler)

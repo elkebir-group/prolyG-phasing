@@ -100,7 +100,7 @@ canvas{display:block}
   <section class="list" aria-label="Loci">
     <div class="filters" id="filters"></div>
     <div class="tablewrap"><table id="loci"><thead><tr>
-      <th data-k="locus">Locus</th><th data-k="n_reads" class="num">Reads</th><th data-k="largest_run" class="num">Largest run</th><th data-k="snvs" class="num" id="snvhead">Phasing SNVs</th><th data-k="status">Status</th>
+      <th data-k="locus">Locus</th><th data-k="n_reads" class="num">Reads</th><th data-k="molecules" class="num" data-help="Molecules: distinct read families (MI) at the locus. The A and B strands of a family count as one molecule.">Molecules</th><th data-k="largest_run" class="num">Largest run</th><th data-k="snvs" class="num" id="snvhead">Phasing SNVs</th><th data-k="status">Status</th>
     </tr></thead><tbody></tbody></table></div>
   </section>
   <section class="detail" id="detail"></section>
@@ -191,13 +191,14 @@ function snvTitle(k){return LIST.samples[k].phasing?"SNVs of this sample's phasi
 function shortNames(a,b){if(a===b)return [a,b];let n=0;while(n<a.length&&a[n]===b[n])n++;
   const cut=Math.max(a.lastIndexOf("_",n-1),a.lastIndexOf("-",n-1),a.lastIndexOf(".",n-1))+1;
   return [a.slice(cut),b.slice(cut)]}
-const LIST_COLS=[["n_reads","Reads",true],["largest_run","Largest run",true],["snvs","Phasing SNVs",true],["status","Status",false]];
+const MOLECULES_HELP="Molecules: distinct read families (MI) at the locus. The A and B strands of a family count as one molecule.";
+const LIST_COLS=[["n_reads","Reads",true],["molecules","Molecules",true],["largest_run","Largest run",true],["snvs","Phasing SNVs",true],["status","Status",false]];
 function listHead(){
   if(!side){$("#loci").removeAttribute("class");$("#loci thead").innerHTML=HEAD1;$("#snvhead").title=snvTitle(sample);return}
   $("#loci").setAttribute("class","side");
   const names=shown().map(k=>LIST.samples[k].sample),short=shortNames(...names);
   $("#loci thead").innerHTML=`<tr><th data-k="locus" rowspan="2">Locus</th>${LIST_COLS.map(([k,l,num])=>
-    `<th colspan="2" class="grp ga"${k==="snvs"?` title="${esc(shown().map(s=>LIST.samples[s].sample+": "+snvTitle(s)).join("\n"))}"`:""}>${l}</th>`).join("")}</tr>
+    `<th colspan="2" class="grp ga"${k==="molecules"?` data-help="${esc(MOLECULES_HELP)}"`:""}${k==="snvs"?` title="${esc(shown().map(s=>LIST.samples[s].sample+": "+snvTitle(s)).join("\n"))}"`:""}>${l}</th>`).join("")}</tr>
     <tr>${LIST_COLS.map(([k,,num])=>[0,1].map(c=>`<th data-k="${k}" data-s="${c}" class="${num?"num":""}${c?"":" ga"}" title="${esc(names[c])}"><span class="sname">${esc(short[c])}</span></th>`).join("")).join("")}</tr>`;
   // The sub-column heads stick just below the first head row.
   const top=$("#loci thead tr").offsetHeight+"px";
@@ -208,9 +209,9 @@ function renderList(){
   const tb=$("#loci tbody");tb.textContent="";
   for(const e of visible()){const s=info(e);
     const tr=document.createElement("tr");tr.tabIndex=0;tr.setAttribute("aria-selected",current===e);
-    if(!side)tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.largest_run):"–"}</td><td class="num">${snvText(s)}</td><td>${statusPill(s,sample)}</td>`;
+    if(!side)tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.molecules):"–"}</td><td class="num">${s?fmt(s.largest_run):"–"}</td><td class="num">${snvText(s)}</td><td>${statusPill(s,sample)}</td>`;
     else{const ss=shown().map(k=>e.samples[k]),sub=(f,num)=>ss.map((x,c)=>`<td class="${num?"num":""}${c?"":" ga"}">${f(x,shown()[c])}</td>`).join("");
-      tr.innerHTML=`<td class="mono">${esc(e.locus)}</td>`+sub(x=>x?fmt(x.n_reads):"–",true)+sub(x=>x?fmt(x.largest_run):"–",true)+sub(snvText,true)+sub(statusPill,false)}
+      tr.innerHTML=`<td class="mono">${esc(e.locus)}</td>`+sub(x=>x?fmt(x.n_reads):"–",true)+sub(x=>x?fmt(x.molecules):"–",true)+sub(x=>x?fmt(x.largest_run):"–",true)+sub(snvText,true)+sub(statusPill,false)}
     tr.onclick=()=>select(e);tr.onkeydown=ev=>{if(ev.key==="Enter")select(e)};
     tb.appendChild(tr)}
   // Keep the open locus in view inside the list panel, without moving the page.
@@ -324,7 +325,7 @@ function tractCard(r){
   const c=document.createElement("div");c.className="card";const total=r.counters.n_reads;const max=Math.max(1,...r.tracts.map(x=>x[1]));
   const L=r.tract_labels,lab=["hap_major","hap_minor","unk"];
   const head=L?lab.map(l=>`<th class="num" style="color:var(${LABEL_COLOR[l]})"><span class="legend" style="display:inline;margin:0">${labelSwatch(l)}</span>${LABEL_NAME[l]}</th>`).join(""):"";
-  c.innerHTML=`<h2>Tracts${helpMark("Molecules: distinct read families (MI)."+(L?" Major, minor, unk: reads by phase label.":""))}</h2><div class="note">${fmt(total)} reads, ${fmt(r.n_tracts)} tracts${r.tract_reads_not_shown?` (${fmt(r.n_tracts-r.tracts.length)} tracts, ${fmt(r.tract_reads_not_shown)} reads not listed)`:""}.</div>
+  c.innerHTML=`<h2>Tracts${helpMark("Molecules: distinct read families (MI). The A and B strands of a family count as one molecule."+(L?" Major, minor, unk: reads by phase label.":""))}</h2><div class="note">${fmt(total)} reads, ${fmt(r.n_molecules)} molecules, ${fmt(r.n_tracts)} tracts${r.tract_reads_not_shown?` (${fmt(r.n_tracts-r.tracts.length)} tracts, ${fmt(r.tract_reads_not_shown)} reads not listed)`:""}.</div>
    <div class="scroll" style="max-height:420px;overflow:auto"><table><thead><tr><th class="num">Reads</th>${head}<th class="num">Molecules</th><th class="num">Share</th><th></th><th>Tract</th></tr></thead><tbody>${r.tracts.map(([s,n,m],i)=>`<tr><td class="num">${fmt(n)}</td>${L?L[i].map((v,k)=>`<td class="num" style="color:var(${LABEL_COLOR[lab[k]]})">${fmt(v)}</td>`).join(""):""}<td class="num">${fmt(m)}</td><td class="num">${pct(n/total)}</td>
    <td><span style="display:inline-block;height:8px;width:${Math.round(60*n/max)}px;background:var(--muted);border-radius:2px"></span></td>
    <td class="mono">${tractSeq(s)}</td></tr>`).join("")}</tbody></table></div>`;
