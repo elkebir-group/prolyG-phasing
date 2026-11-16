@@ -4,8 +4,7 @@
 ``GET /`` with the page (the template ``locus_view.html``, plain CSS and
 JS), ``GET /loci`` with the locus list, and ``GET /locus`` with one locus
 of one sample, built on request by :func:`locus_view_data`. It writes no
-files. It reads the panels, not the BAMs, so dropped reads appear only as
-counts.
+files. It reads the panels. Dropped reads appear only as counts.
 
 Per locus the page shows the flanks and the reference tract on the G strand,
 the tracts with their read and molecule counts, the largest G run per read,

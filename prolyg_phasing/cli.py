@@ -159,12 +159,12 @@ def _positive_int(text: str) -> int:
 _VIEW_LOCI_DESCRIPTION = """\
 Start a local locus viewer for one or more panel.db files of a donor (its
 normal and its tumors). It is an HTTP server bound to 127.0.0.1; it reads
-the panels on request, not the BAMs, and writes no files. Each panel is a
+the panels on request and writes no files. Each panel is a
 sample tab, named by the file stem of the BAM its provenance names.
 
 Each --panel may name, after the panel, the --out-dir of "prolyg-phasing
 phase" for that panel. The viewer then reads snv_calls.tsv,
-haplotype_calls.tsv and locus_summary.tsv (not phasing.pkl): the pile-up
+haplotype_calls.tsv and locus_summary.tsv: the pile-up
 shows a column per SNV and splits its rows by the read family's phase
 label. At start it checks that the phasing result belongs to the panel
 (the same read families at every locus) and stops if it does not.

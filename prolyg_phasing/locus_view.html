@@ -298,8 +298,7 @@ function headCard(r){
     <div><b>Dropped, share of the alignments over the locus</b>${drops.filter(([,f])=>k[f]).map(([l,f])=>`${l} ${share(k[f])}`).join(" · ")||"none"}</div>
    </div>`;
   const ph=r.phasing;
-  if(!ph)c.innerHTML+=`<p class="note">No phasing result given for this sample.</p>`;
-  else if(ph.summary){const m=ph.summary;c.innerHTML+=`<div class="kv">
+  if(ph&&ph.summary){const m=ph.summary;c.innerHTML+=`<div class="kv">
     <div><b>Haplotype profiles</b><span class="mono">major ${esc(m.hap_major_profile||"–")} · minor ${esc(m.hap_minor_profile||"–")}</span></div>
     <div><b>SNVs</b>${fmt(+m.n_snvs_phased)} phased · ${fmt(+m.n_snvs_dropped_low_linkage)} dropped (low linkage)</div>
     <div><b>Reads by phase label</b>major ${fmt(+m.reads_major)} · minor ${fmt(+m.reads_minor)} · unk ${fmt(+m.reads_unk)}</div></div>`}
@@ -408,13 +407,13 @@ function pileCard(r){
   const c=document.createElement("div");c.className="card";const P=r.pileup;
   const snvCols=[...P.up,...P.dn].filter(x=>x.snv);
   const dropped=r.phasing?r.phasing.snvs.filter(v=>v.status!=="phased").sort((a,b)=>a.ref_pos-b.ref_pos):[];
-  const help=(r.phasing?"Columns: the bases next to each flank, and one column per SNV of the phasing result. A phased SNV's header shows the major haplotype's base over the minor haplotype's base; a dropped SNV's header shows its two alleles. Major: the phasing code's name for the haplotype with the more common base at the anchor SNV; not maternal or paternal, and not the longer allele. Framed cell: the base differs from its row's haplotype base at that phased SNV. "+MOLECULE_IN_EACH_LABEL+" ":"Columns: the bases next to each flank. ")+"The flank columns show the panel's flank, not each read's bases. The tract is left-justified and padded with a line. A short mark between columns stands for skipped positions. Hover a column for its position and base counts.";
+  const help=(r.phasing?"Columns: the bases next to each flank, and one column per SNV of the phasing result. A phased SNV's header shows the major haplotype's base over the minor haplotype's base; a dropped SNV's header shows its two alleles. Major: the haplotype with the more common base at the anchor SNV. Framed cell: the base differs from its row's haplotype base at that phased SNV. "+MOLECULE_IN_EACH_LABEL+" ":"Columns: the bases next to each flank. ")+"The flank columns show the flank sequence we built from the donor's normal. The tract is left-justified and padded with a line. A short mark between columns stands for skipped positions. Hover a column for its position and base counts.";
   const secs=P.sections.map((S,k)=>`<div class="sec">${sectionHeading(r,S)}<div class="note">${fmt(S.n_rows)} rows, ${fmt(S.rows.length)} drawn${S.reads_not_drawn?` (${fmt(S.reads_not_drawn)} reads not drawn)`:""}.</div><div class="scroll" id="pilehost${r._col}${k}"></div></div>`).join("");
   c.innerHTML=`<h2>Pile-up${helpMark(help)}</h2>
-   <div class="note">Each row: reads with the same tract${r.phasing?", phase label":""} and bases at the shown columns. Empty cell: no base.${r.phasing?"":" No phasing result given for this sample."}</div>
-   ${dropped.length?`<div class="note">Dropped SNVs, not in the profile: ${dropped.map(v=>`${fmt(v.ref_pos)} ${esc(v.allele_major)}/${esc(v.allele_minor)}`).join(", ")}.</div>`:""}
+   <div class="note">Each row: reads with the same tract${r.phasing?", phase label":""} and bases at the shown columns. Empty cell: the read has no base there.</div>
+   ${dropped.length?`<div class="note">Dropped SNVs: ${dropped.map(v=>`${fmt(v.ref_pos)} ${esc(v.allele_major)}/${esc(v.allele_minor)}`).join(", ")}.</div>`:""}
    ${secs}
-   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank band</span><span><i style="background:var(--tract)"></i>tract band</span>${r.phasing?`<span><i style="background:var(--snvband)"></i>phased SNV</span><span><i style="background:transparent;border:1.5px dashed var(--muted)"></i>dropped SNV</span><span><i style="background:transparent;outline:2px solid var(--fg)"></i>differs from its haplotype</span>`:""}<span>faded bases: the panel's flank</span><span>— tract padding</span><span>▮ skipped positions</span></div>`;
+   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank band</span><span><i style="background:var(--tract)"></i>tract band</span>${r.phasing?`<span><i style="background:var(--snvband)"></i>phased SNV</span><span><i style="background:transparent;border:1.5px dashed var(--muted)"></i>dropped SNV</span><span><i style="background:transparent;outline:2px solid var(--fg)"></i>differs from its haplotype</span>`:""}<span>faded bases: flank sequence</span><span>— tract padding</span><span>▮ skipped positions</span></div>`;
   queueMicrotask(()=>{const T=r._shared?r._shared.tract:tractWidth(r);
     P.sections.forEach((S,k)=>drawPile(r,S,$("#pilehost"+r._col+k),T))});
   return c;
@@ -484,7 +483,7 @@ function drawPile(r,S,host,T){
     if(j<0||j>=width){tip.hidden=true;return}
     const sl=slots[j];let html="";
     if(sl.gap)html="<b>skipped flanking positions</b>";
-    else if(sl.flank)html=`<b>${sl.flank==="up"?"upstream":"downstream"} flank, base ${sl.i+1}</b> (the panel's flank)`;
+    else if(sl.flank)html=`<b>${sl.flank==="up"?"upstream":"downstream"} flank, base ${sl.i+1}</b> (the flank sequence we built from the donor's normal)`;
     else if(sl.tract!=null)html=`<b>tract, position ${sl.tract+1}</b>`;
     else{const c=sl.col,v=c.snv;html=`<b>reference ${fmt(c.position)}</b> · ${sl.side==="up"?"upstream":"downstream"}, ${sl.side==="up"?r.flanking.up.width-c.index:c.index+1} from the flank`;
       if(v)html+=v.status==="phased"?`<div>phased SNV${v.is_anchor?", anchor":""}: major haplotype ${esc(v.hap_major_base)}, minor haplotype ${esc(v.hap_minor_base)}; alleles ${esc(v.allele_major)}/${esc(v.allele_minor)}, minor allele ${pct(v.vaf_minor)} of ${fmt(v.coverage)} families</div>`
