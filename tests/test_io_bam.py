@@ -538,6 +538,84 @@ def test_pair_merge_without_qualities_drops(tmp_path):
     assert int(loc.count.sum()) == 0
 
 
+# A read error at the first G of the tract: one mate reads the C of the
+# upstream flank ACGTACGTAC once more, at tract index 0. That mate's best
+# upstream flank match ends at the extra C (a 1-base gap), and its tract is
+# one base shorter than its mate's. Its stretch from flank match to flank
+# match keeps the length of the mate's stretch.
+_EDGE_ERROR_TRACT = _tract_with({0: "C"})
+
+
+def test_pair_merge_restores_a_tract_whose_first_g_was_misread(tmp_path):
+    """The lower-quality misread at the first G loses; the pair keeps the full tract."""
+    reads = _pair_reads(
+        _REF_POLYG, _EDGE_ERROR_TRACT,
+        _quality_at({}), _quality_at({BED_START: _LOW_Q}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_alignments_placed == 2
+    assert loc.n_read_pairs == 1
+    assert loc.n_read_pairs_merged == 1
+    assert loc.n_read_pairs_drop_disagree == 0
+    assert list(loc.seq) == [_REF_POLYG]
+
+
+def test_pair_merge_misread_first_g_of_equal_quality_drops(tmp_path):
+    """The same pair with equal qualities at the misread base is dropped."""
+    reads = _pair_reads(
+        _REF_POLYG, _EDGE_ERROR_TRACT, _quality_at({}), _quality_at({}),
+    )
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 1
+    assert int(loc.count.sum()) == 0
+
+
+def test_pair_merge_deletion_in_the_run_drops(tmp_path):
+    """A mate with one G fewer in the run has a shorter stretch; the pair is dropped."""
+    seq_a, rs = _canonical_read_seq(_REF_POLYG)
+    # One G fewer in the tract; the read stays 150 bases long.
+    seq_b = (REFERENCE[:BED_START] + _REF_POLYG[1:] + REFERENCE[BED_END:])[:150]
+    reads = [
+        dict(qname="q1", read_seq=seq_a, ref_start=rs, mi="10004/A",
+             is_read1=True, tlen=120, quality_str=_quality_at({})),
+        dict(qname="q1", read_seq=seq_b, ref_start=rs, mi="10004/A",
+             is_read1=False, tlen=120, quality_str=_quality_at({BED_START: _LOW_Q})),
+    ]
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 1
+    assert int(loc.count.sum()) == 0
+
+
+def test_pair_with_a_mate_that_ends_in_the_run_keeps_the_other_mate(tmp_path):
+    """A mate that ends inside the run has no tract; the pair counts its other mate."""
+    seq_a, rs = _canonical_read_seq(_REF_POLYG)
+    seq_b = seq_a[:BED_START + 5]
+    reads = [
+        dict(qname="q1", read_seq=seq_a, ref_start=rs, mi="10004/A",
+             is_read1=True, tlen=120),
+        dict(qname="q1", read_seq=seq_b, ref_start=rs, mi="10004/A",
+             is_read1=False, tlen=120),
+    ]
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_alignments_drop_downstream_flank_not_placed == 1
+    assert loc.n_read_pairs == 1
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 0
+    assert list(loc.seq) == [_REF_POLYG]
+
+
+def test_pair_with_equal_tracts_is_not_merged(tmp_path):
+    """Two mates with the same tract count once, and neither as merged nor as dropped."""
+    reads = _pair_reads(_REF_POLYG, _REF_POLYG, _quality_at({}), _quality_at({BED_START: _LOW_Q}))
+    loc = _extract_one_locus(tmp_path, reads)
+    assert loc.n_read_pairs == 1
+    assert loc.n_read_pairs_merged == 0
+    assert loc.n_read_pairs_drop_disagree == 0
+    assert list(loc.seq) == [_REF_POLYG]
+
+
 def test_provenance_records_merge_rule(tmp_path):
     """A panel states the pair-disagreement rule it was built with."""
     bed_path = _make_bed(tmp_path, [(CHROM, BED_START, BED_END, "Locus1")])

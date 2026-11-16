@@ -13,8 +13,8 @@ Every locus needs its two flanks from the matched normal's flank table
    (MAPQ, SA, TLEN, MI), cut each read's tract between its best placement
    of the two flanks (`_flank_placement.place_flanks`; the tract must hold
    a read base aligned inside the BED interval), group by
-   `query_name` for pair collapse, merge or drop pair disagreements, and
-   emit per-(MI, strand, seq) read counts.
+   `query_name` for pair collapse, merge or drop pair disagreements
+   (`_merge_pair_tract`), and emit per-(MI, strand, seq) read counts.
 
 Per-locus ``n_runs`` is set from the **data** (max parsed tuple length
 across accepted reads), not from the reference tract.
@@ -58,7 +58,10 @@ from prolyg_phasing.io._flank_placement import (
     FlankPlacement,
     FlankRecord,
     FlankTable,
+    flank_outer_bases,
     place_flanks,
+    place_polyg_reads,
+    polyg_reads,
     read_flank_table,
     window_index,
 )
@@ -471,32 +474,32 @@ def _consensus(a: FlankingSide, b: FlankingSide) -> FlankingSide:
     return _strip_side(start_a, text_a[:head_len] + overlap + tail)
 
 
-def _merge_tract_by_quality(
+def _merge_by_quality(
     seq_a: str,
     seq_b: str,
     quality_a: Sequence[int] | None,
     quality_b: Sequence[int] | None,
 ) -> str | None:
-    """Merge two mates' equal-length tracts by base quality.
+    """Merge two mates' equal-length stretches of read by base quality.
 
     At each position where the mates differ, the base with the higher
-    Phred quality wins. Return ``None`` when the tracts differ in length,
-    when either mate has no stored qualities, or when the mates differ at
-    a position where their qualities are equal. The caller then drops the
-    pair.
+    Phred quality wins. Return ``None`` when the stretches differ in
+    length, when either mate has no stored qualities, or when the mates
+    differ at a position where their qualities are equal. The caller then
+    drops the pair.
 
     Parameters
     ----------
     seq_a, seq_b : str
-        Tracts in polyG orientation.
+        Stretches of the two mates in polyG orientation.
     quality_a, quality_b : sequence of int or None
-        Per-base Phred qualities of the two tracts, in the same
+        Per-base Phred qualities of the two stretches, in the same
         orientation and over the same slice as ``seq_a`` and ``seq_b``.
 
     Returns
     -------
     str or None
-        The merged tract, or ``None`` when no merge is possible.
+        The merged stretch, or ``None`` when no merge is possible.
     """
     if len(seq_a) != len(seq_b) or quality_a is None or quality_b is None:
         return None
@@ -511,24 +514,68 @@ def _merge_tract_by_quality(
     return "".join(merged)
 
 
-def _tract_qualities(
+def _polyg_qualities(
     alignment: pysam.AlignedSegment,
-    tract_start: int,
-    tract_end: int,
+    start: int,
+    end: int,
     ref_orientation: str,
 ) -> Sequence[int] | None:
-    """Base qualities of an alignment's tract, in polyG orientation.
+    """Base qualities of an alignment on ``[start, end)``, in polyG orientation.
 
-    The tract is the polyG-orientation read on ``[tract_start,
-    tract_end)``. Only a pair whose tracts differ reads them, so the
-    qualities of the other reads are never decoded.
+    `start` and `end` index the polyG-orientation read. Only a pair whose
+    tracts differ reads them, so the qualities of the other reads are
+    never decoded.
     """
     qualities = alignment.query_qualities
     if qualities is None:
         return None
     if ref_orientation == "-":
         qualities = qualities[::-1]
-    return qualities[tract_start:tract_end]
+    return qualities[start:end]
+
+
+def _merge_pair_tract(
+    mates: Sequence[tuple[pysam.AlignedSegment, FlankPlacement]],
+    upstream: str,
+    downstream: str,
+    ref_orientation: str,
+) -> str | None:
+    """The tract of a pair whose two mates have different tracts, or ``None``.
+
+    In each mate we take the stretch of the polyG-orientation read from the
+    outer base of the upstream flank match to the outer base of the
+    downstream flank match, at the mate's best placement. We merge the two
+    stretches by base quality (`_merge_by_quality`) and return the tract of
+    the best placement of the two flanks in the merged stretch. A misread
+    first or last G of the tract can end a mate's flank match one base
+    later and shorten its tract by one base, while its stretch keeps the
+    length of the other mate's stretch. We mark every base of the merged
+    stretch as aligned inside the BED interval, because each mate's tract
+    lies inside its stretch and holds such a base. The caller drops the
+    pair on ``None``: the two stretches cannot be merged, or the merged
+    stretch has no tract with a value of at least 0.
+
+    Parameters
+    ----------
+    mates : sequence of (pysam.AlignedSegment, FlankPlacement)
+        The two mates, each with its own placement (one entry, kept).
+    upstream, downstream : str
+        The locus's two flanks.
+    ref_orientation : str
+        "+" if the repeat reads as Gs on the reference, "-" otherwise.
+    """
+    stretches, qualities = [], []
+    for alignment, placement in mates:
+        read = polyg_reads([alignment.query_sequence], ref_orientation)
+        up_outer, dn_outer = flank_outer_bases(read, placement, upstream, downstream)
+        start, end = int(up_outer[0]), int(dn_outer[0]) + 1
+        stretches.append(read[0][start:end])
+        qualities.append(_polyg_qualities(alignment, start, end, ref_orientation))
+    merged = _merge_by_quality(*stretches, *qualities)
+    if merged is None:
+        return None
+    placement = place_polyg_reads([merged], upstream, downstream, [((0, len(merged)),)])
+    return placement.tracts[0] if placement.kept[0] else None
 
 
 def _merge_pair_flanking(
@@ -721,14 +768,13 @@ def _extract_locus(
     # whole conversion.
     kept = placement.kept.tolist()
     tracts = placement.tracts.tolist()
-    tract_starts = (placement.upstream_run_side + 1).tolist()
-    tract_ends = placement.downstream_run_side.tolist()
 
     # Second pass, still in fetch order: apply the flank and MI decisions
     # and group by query_name for pair-collapse. Each entry is
     #   (bed_mate, flanking_only_alignment)
     # with exactly one of the two set. `bed_mate` is a 6-tuple
-    # ``(mi_prefix, strand, tract, up_side, dn_side, tract_source)``. A
+    # ``(mi_prefix, strand, tract, up_side, dn_side, (alignment, index))``,
+    # where `index` is the read's entry in `placement`. A
     # flanking-only alignment is carried as-is and its flanking is
     # computed later, and only if the fragment turns out to have a
     # bed-spanning mate to attach it to: most flanking-only alignments in
@@ -762,9 +808,8 @@ def _extract_locus(
         up_flank, dn_flank = _alignment_flanking(
             r, lo=lo, hi=hi, ref_orientation=ref_orientation, min_base_q=min_base_q,
         )
-        tract_source = (r, tract_starts[i], tract_ends[i])
         by_qn[r.query_name].append(
-            ((mi_prefix, strand, tracts[i], up_flank, dn_flank, tract_source), None)
+            ((mi_prefix, strand, tracts[i], up_flank, dn_flank, (r, i)), None)
         )
 
     # Pair-collapse: group by query_name. Drop qns with no bed-spanning
@@ -772,9 +817,10 @@ def _extract_locus(
     # MI/strand/length), then drop >2-mate groups. A flanking-only mate
     # that covers nothing outside the flanks is not a mate at all, so it
     # is dropped before the group-size test. Tract disagreement checks
-    # only apply when both mates are bed-spanning: equal-length tracts
-    # merge by base quality, and a tie or a length difference drops the
-    # pair. Flanking sides are
+    # only apply when both mates are bed-spanning: two different tracts
+    # are merged by base quality over the mates' flank-to-flank stretches
+    # (`_merge_pair_tract`), and a failed merge drops the pair. Flanking
+    # sides are
     # pair-merged with per-position consensus (drop on disagreement); a
     # bed-spanning + flanking-only pair has no disagreement possible at
     # any single position the flanking-only mate covers — both feed into
@@ -803,14 +849,10 @@ def _extract_locus(
         qc["n_read_pairs"] += 1
         tract = bed_mates[0][2]
         if len(bed_mates) == 2 and tract != bed_mates[1][2]:
-            # Qualities are read only for pairs whose tracts differ.
-            merged_seq = None
-            if len(tract) == len(bed_mates[1][2]):
-                merged_seq = _merge_tract_by_quality(
-                    tract, bed_mates[1][2],
-                    _tract_qualities(*bed_mates[0][5], ref_orientation),
-                    _tract_qualities(*bed_mates[1][5], ref_orientation),
-                )
+            merged_seq = _merge_pair_tract(
+                [(m[5][0], placement.take(np.array([m[5][1]]))) for m in bed_mates],
+                geometry.upstream.bases, geometry.downstream.bases, ref_orientation,
+            )
             if merged_seq is None:
                 qc["n_read_pairs_drop_disagree"] += 1
                 continue
