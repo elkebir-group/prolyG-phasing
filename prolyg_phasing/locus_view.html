@@ -100,7 +100,7 @@ canvas{display:block}
   <section class="list" aria-label="Loci">
     <div class="filters" id="filters"></div>
     <div class="tablewrap"><table id="loci"><thead><tr>
-      <th data-k="locus">Locus</th><th data-k="n_reads" class="num">Reads</th><th data-k="molecules" class="num" data-help="Molecules: distinct read families (MI) at the locus. The A and B strands of a family count as one molecule.">Molecules</th><th data-k="largest_run" class="num">Largest run</th><th data-k="snvs" class="num" id="snvhead">Phasing SNVs</th><th data-k="status">Status</th>
+      <th data-k="locus">Locus</th><th data-k="n_reads" class="num">Reads</th><th data-k="molecules" class="num">Molecules</th><th data-k="largest_run" class="num">Largest run</th><th data-k="snvs" class="num" id="snvhead">Phasing SNVs</th><th data-k="status">Status</th>
     </tr></thead><tbody></tbody></table></div>
   </section>
   <section class="detail" id="detail"></section>
@@ -135,6 +135,7 @@ async function load(){
   $("#side").onchange=()=>{side=$("#side").checked;route()};
   const F=[["all","All"],["noflank","No flank"],["noposition","Side with no position"],["noreads","No reads"]];
   for(const [k,l] of F){const b=document.createElement("button");b.textContent=l;b.dataset.k=k;b.dataset.help=LIST.samples[0].help.filters[k]||"";b.onclick=()=>{filter=k;renderList()};$("#filters").appendChild(b)}
+  $('#loci thead th[data-k="molecules"]').dataset.help=MOLECULES_HELP;
   HEAD1=$("#loci thead").innerHTML;
   $("#loci thead").onclick=ev=>{const th=ev.target.closest("th[data-k]");if(!th)return;
     const k=th.dataset.k,c=th.dataset.s===undefined?0:+th.dataset.s;
@@ -191,7 +192,7 @@ function snvTitle(k){return LIST.samples[k].phasing?"SNVs of this sample's phasi
 function shortNames(a,b){if(a===b)return [a,b];let n=0;while(n<a.length&&a[n]===b[n])n++;
   const cut=Math.max(a.lastIndexOf("_",n-1),a.lastIndexOf("-",n-1),a.lastIndexOf(".",n-1))+1;
   return [a.slice(cut),b.slice(cut)]}
-const MOLECULES_HELP="Molecules: distinct read families (MI) at the locus. The A and B strands of a family count as one molecule.";
+const MOLECULES_HELP="Molecules: distinct read families (MI). The A and B strands of a family count as one molecule.";
 const LIST_COLS=[["n_reads","Reads",true],["molecules","Molecules",true],["largest_run","Largest run",true],["snvs","Phasing SNVs",true],["status","Status",false]];
 function listHead(){
   if(!side){$("#loci").removeAttribute("class");$("#loci thead").innerHTML=HEAD1;$("#snvhead").title=snvTitle(sample);return}
@@ -325,7 +326,7 @@ function tractCard(r){
   const c=document.createElement("div");c.className="card";const total=r.counters.n_reads;const max=Math.max(1,...r.tracts.map(x=>x[1]));
   const L=r.tract_labels,lab=["hap_major","hap_minor","unk"];
   const head=L?lab.map(l=>`<th class="num" style="color:var(${LABEL_COLOR[l]})"><span class="legend" style="display:inline;margin:0">${labelSwatch(l)}</span>${LABEL_NAME[l]}</th>`).join(""):"";
-  c.innerHTML=`<h2>Tracts${helpMark("Molecules: distinct read families (MI). The A and B strands of a family count as one molecule."+(L?" Major, minor, unk: reads by phase label.":""))}</h2><div class="note">${fmt(total)} reads, ${fmt(r.n_molecules)} molecules, ${fmt(r.n_tracts)} tracts${r.tract_reads_not_shown?` (${fmt(r.n_tracts-r.tracts.length)} tracts, ${fmt(r.tract_reads_not_shown)} reads not listed)`:""}.</div>
+  c.innerHTML=`<h2>Tracts${helpMark(MOLECULES_HELP+(L?" Major, minor, unk: reads by phase label.":""))}</h2><div class="note">${fmt(total)} reads, ${fmt(r.n_molecules)} molecules, ${fmt(r.n_tracts)} tracts${r.tract_reads_not_shown?` (${fmt(r.n_tracts-r.tracts.length)} tracts, ${fmt(r.tract_reads_not_shown)} reads not listed)`:""}.</div>
    <div class="scroll" style="max-height:420px;overflow:auto"><table><thead><tr><th class="num">Reads</th>${head}<th class="num">Molecules</th><th class="num">Share</th><th></th><th>Tract</th></tr></thead><tbody>${r.tracts.map(([s,n,m],i)=>`<tr><td class="num">${fmt(n)}</td>${L?L[i].map((v,k)=>`<td class="num" style="color:var(${LABEL_COLOR[lab[k]]})">${fmt(v)}</td>`).join(""):""}<td class="num">${fmt(m)}</td><td class="num">${pct(n/total)}</td>
    <td><span style="display:inline-block;height:8px;width:${Math.round(60*n/max)}px;background:var(--muted);border-radius:2px"></span></td>
    <td class="mono">${tractSeq(s)}</td></tr>`).join("")}</tbody></table></div>`;
@@ -401,19 +402,19 @@ function profileText(r,label){
 function sectionHeading(r,S){
   if(!S.label)return "";
   const sw=labelSwatch(S.label);
-  if(S.label==="unk")return `<h3 style="color:var(--muted)">${sw}Unk: these reads have no label (no phased SNV covered, or a tied vote) · ${fmt(S.reads)} reads</h3>`;
-  return `<h3>${sw}${LABEL_NAME[S.label]} haplotype: ${profileText(r,S.label)} · ${fmt(S.reads)} reads</h3>`}
+  if(S.label==="unk")return `<h3 style="color:var(--muted)">${sw}Unk: these reads have no label (no phased SNV covered, or a tied vote) · ${fmt(S.reads)} reads${molText(r,S.label)}</h3>`;
+  return `<h3>${sw}${LABEL_NAME[S.label]} haplotype: ${profileText(r,S.label)} · ${fmt(S.reads)} reads${molText(r,S.label)}</h3>`}
 function pileCard(r){
   const c=document.createElement("div");c.className="card";const P=r.pileup;
   const snvCols=[...P.up,...P.dn].filter(x=>x.snv);
   const dropped=r.phasing?r.phasing.snvs.filter(v=>v.status!=="phased").sort((a,b)=>a.ref_pos-b.ref_pos):[];
-  const help=(r.phasing?"Columns: the bases next to each flank, and one column per SNV of the phasing result. A phased SNV's header shows the major haplotype's base over the minor haplotype's base; a dropped SNV's header shows its two alleles. Major: the phasing code's name for the haplotype with the more common base at the anchor SNV; not maternal or paternal, and not the longer allele. Framed cell: the base differs from its row's haplotype base at that phased SNV. ":"Columns: the bases next to each flank. ")+"The flank columns show the panel's flank, not each read's bases. The tract is left-justified and padded with a line. A short mark between columns stands for skipped positions. Hover a column for its position and base counts.";
+  const help=(r.phasing?"Columns: the bases next to each flank, and one column per SNV of the phasing result. A phased SNV's header shows the major haplotype's base over the minor haplotype's base; a dropped SNV's header shows its two alleles. Major: the phasing code's name for the haplotype with the more common base at the anchor SNV; not maternal or paternal, and not the longer allele. Framed cell: the base differs from its row's haplotype base at that phased SNV. "+MOLECULE_IN_EACH_LABEL+" ":"Columns: the bases next to each flank. ")+"The flank columns show the panel's flank, not each read's bases. The tract is left-justified and padded with a line. A short mark between columns stands for skipped positions. Hover a column for its position and base counts.";
   const secs=P.sections.map((S,k)=>`<div class="sec">${sectionHeading(r,S)}<div class="note">${fmt(S.n_rows)} rows, ${fmt(S.rows.length)} drawn${S.reads_not_drawn?` (${fmt(S.reads_not_drawn)} reads not drawn)`:""}.</div><div class="scroll" id="pilehost${r._col}${k}"></div></div>`).join("");
   c.innerHTML=`<h2>Pile-up${helpMark(help)}</h2>
    <div class="note">Each row: reads with the same tract${r.phasing?", phase label":""} and bases at the shown columns. Empty cell: no base.${r.phasing?"":" No phasing result given for this sample."}</div>
    ${dropped.length?`<div class="note">Dropped SNVs, not in the profile: ${dropped.map(v=>`${fmt(v.ref_pos)} ${esc(v.allele_major)}/${esc(v.allele_minor)}`).join(", ")}.</div>`:""}
    ${secs}
-   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank band</span><span><i style="background:var(--tract)"></i>tract band</span>${r.phasing?`<span><i style="background:var(--snvband)"></i>phased SNV</span><span><i style="background:transparent;border:1.5px dashed var(--muted)"></i>dropped SNV</span><span>${labelSwatch("hap_major")}major</span><span>${labelSwatch("hap_minor")}minor</span><span style="color:var(--muted)">unk</span><span><i style="background:transparent;outline:2px solid var(--fg)"></i>differs from its haplotype</span>`:""}<span>faded bases: the panel's flank</span><span>— tract padding</span><span>▮ skipped positions</span></div>`;
+   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank band</span><span><i style="background:var(--tract)"></i>tract band</span>${r.phasing?`<span><i style="background:var(--snvband)"></i>phased SNV</span><span><i style="background:transparent;border:1.5px dashed var(--muted)"></i>dropped SNV</span><span><i style="background:transparent;outline:2px solid var(--fg)"></i>differs from its haplotype</span>`:""}<span>faded bases: the panel's flank</span><span>— tract padding</span><span>▮ skipped positions</span></div>`;
   queueMicrotask(()=>{const T=r._shared?r._shared.tract:tractWidth(r);
     P.sections.forEach((S,k)=>drawPile(r,S,$("#pilehost"+r._col+k),T))});
   return c;
@@ -430,17 +431,16 @@ function drawPile(r,S,host,T){
   // Header lines, top to bottom: with phasing, the major and the minor
   // haplotype base of each SNV, then the band; then the sequence line (flank
   // bases and reference tract only).
-  const PH=!!r.phasing,LEFT=PH?40:0,STRIPE=S.label?8:0;
-  const width=slots.length,LABW=90,avail=Math.max(300,host.clientWidth-LABW-STRIPE-LEFT-4);
+  const PH=!!r.phasing,LEFT=PH?40:0;
+  const width=slots.length,LABW=90,avail=Math.max(300,host.clientWidth-LABW-LEFT-4);
   const CW=Math.max(5,Math.min(12,Math.floor(avail/width))),RH=Math.max(8,Math.min(11,CW));
   const Y_MAJ=11,Y_MIN=23,BAND=PH?27:4,Y_SEQ=BAND+20,HEAD=Y_SEQ+6;
-  const H=HEAD+S.rows.length*RH+6,W=width*CW+LABW+STRIPE+LEFT;
+  const H=HEAD+S.rows.length*RH+6,W=width*CW+LABW+LEFT;
   const dpr=window.devicePixelRatio||1;const cv=document.createElement("canvas");cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+"px";cv.style.height=H+"px";
   const g=cv.getContext("2d");g.scale(dpr,dpr);const font=`${Math.min(10,CW)}px ${css("--mono")}`;g.font=font;
-  const X=j=>LEFT+STRIPE+j*CW;
+  const X=j=>LEFT+j*CW;
   if(PH){g.textAlign="left";g.font=`9px ${css("--sans")}`;
-    g.fillStyle=css("--hmajor");g.fillRect(1,Y_MAJ-7,6,6);g.fillStyle=css("--hminor");g.fillRect(1,Y_MIN-7,6,6);
-    g.fillStyle=css("--muted");g.fillText("major",10,Y_MAJ);g.fillText("minor",10,Y_MIN);g.font=font}
+    g.fillStyle=css("--muted");g.fillText("major",1,Y_MAJ);g.fillText("minor",1,Y_MIN);g.font=font}
   slots.forEach((sl,j)=>{g.textAlign="center";const x=X(j)+CW/2;
     if(sl.gap){g.fillStyle=css("--muted");g.fillRect(x-1,Y_SEQ-8,2,8);return}
     if(sl.flank||sl.tract!=null){g.fillStyle=sl.tract!=null?css("--tract"):css("--flank");g.globalAlpha=.75;g.fillRect(X(j),BAND,CW-1,5);g.globalAlpha=1;
@@ -454,8 +454,6 @@ function drawPile(r,S,host,T){
     else{g.fillStyle=css("--muted");g.fillRect(x-1,Y_SEQ-4,2,4)}});
   let y=HEAD;
   for(const row of S.rows){
-    if(STRIPE){if(row.label==="unk"){g.strokeStyle=css("--muted");g.lineWidth=1.5;g.strokeRect(LEFT+0.75,y+0.75,STRIPE-3.5,RH-2.5)}
-      else{g.fillStyle=css(LABEL_COLOR[row.label]);g.fillRect(LEFT,y,STRIPE-2,RH-1)}}
     const differs={up:new Set(row.differs?row.differs.up:[]),dn:new Set(row.differs?row.differs.dn:[])};
     slots.forEach((sl,j)=>{let ch="",faded=false;
       if(sl.gap)return;
@@ -468,12 +466,14 @@ function drawPile(r,S,host,T){
       if(sl.side&&differs[sl.side].has(sl.k)){g.strokeStyle=css("--fg");g.lineWidth=1.5;g.strokeRect(X(j)+0.75,y+0.75,CW-2.5,RH-2.5)}});
     g.fillStyle=css("--muted");g.textAlign="left";g.font=font;
     g.fillText(fmt(row.reads),X(width)+6,y+RH-2);y+=RH}
-  // The row under the mouse gets an outline across the whole row, over the canvas.
+  // The row under the mouse gets an outline across the whole row, over the
+  // canvas, in its section's label color (the text color without a label).
   const wrap=document.createElement("div");wrap.style.cssText=`position:relative;width:${W}px`;
   const band=document.createElement("div");band.className="rowband";band.hidden=true;
+  band.style.borderColor=S.label?`var(${LABEL_COLOR[S.label]})`:"var(--fg)";
   wrap.appendChild(cv);wrap.appendChild(band);host.textContent="";host.appendChild(wrap);
   const tip=$("#tip");
-  cv.onmousemove=e=>{if(HELP.open)return;const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left-STRIPE-LEFT,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
+  cv.onmousemove=e=>{if(HELP.open)return;const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left-LEFT,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
     const kk=Math.floor((yy-HEAD)/RH),onRow=yy>=HEAD&&kk>=0&&kk<S.rows.length;
     // The outline sits inside the canvas (its border is inside its box), has
     // no fill, and ends just past the row's read count.
