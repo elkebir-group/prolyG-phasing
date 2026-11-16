@@ -29,6 +29,7 @@ import prolyg_phasing.io._flank_construction as fc
 from prolyg_phasing.io._anchors import revcomp
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import ExtractedPanel
+from tests._counter_relations import counter_relation_failures, counters_of
 
 # ---------------------------------------------------------------------------
 # Synthetic BAM helpers
@@ -839,3 +840,66 @@ def test_locus_without_a_reference_window(tmp_path):
     assert loc.n_reads == 0
     assert loc.reference_tract == ""
     assert loc.upstream_flank.bases == "ACGTACGTAC"
+
+
+def _substituted(seq: str, positions: dict[int, str]) -> str:
+    out = list(seq)
+    for i, base in positions.items():
+        out[i] = base
+    return "".join(out)
+
+
+def test_every_counter_and_the_relations_between_them(tmp_path):
+    """One read name per outcome; each lands in its counter, and the relations hold.
+
+    A read with both flanks broken counts in both side reasons, so those sum
+    past the flank drops by one. A read with a negative value is both placed
+    and dropped.
+    """
+    seq, rs = _canonical_read_seq(_REF_POLYG)
+    low_at_1 = _quality_at({BED_START + 1: _LOW_Q})
+    differ_at_1, _ = _canonical_read_seq(_tract_with({1: "T"}))
+    # Two substitutions in a flank: no match. Read index = reference index here.
+    no_upstream = _substituted(seq, {51: "T", 54: "T"})
+    no_flank = _substituted(no_upstream, {75: "A", 78: "C"})
+    negative, _ = _canonical_read_seq("G" + "A" * 12 + "G")
+
+    def pair(qname, mi, a=seq, b=seq, qual_b=None, **kw):
+        kw.setdefault("tlen", 120)
+        return [dict(qname=qname, read_seq=a, ref_start=rs, mi=mi, is_read1=True, **kw),
+                dict(qname=qname, read_seq=b, ref_start=rs, mi=mi, is_read1=False,
+                     quality_str=qual_b, **kw)]
+
+    reads = [
+        *pair("agree", "1/A"),
+        *pair("merged", "2/A", b=differ_at_1, qual_b=low_at_1),
+        *pair("disagree", "3/A", b=differ_at_1),
+        dict(qname="single", read_seq=seq, ref_start=rs, mi="4/B", tlen=120),
+        *pair("low_mapq", "5/A", mapq=10),
+        *pair("chimeric", "6/A", has_sa=True),
+        *pair("long", "7/A", tlen=5000),
+        dict(qname="no_mi", read_seq=seq, ref_start=rs, mi=None, tlen=120),
+        dict(qname="no_upstream", read_seq=no_upstream, ref_start=rs, mi="8/A", tlen=120),
+        dict(qname="no_flank", read_seq=no_flank, ref_start=rs, mi="9/A", tlen=120),
+        dict(qname="negative", read_seq=negative, ref_start=rs, mi="10/A", tlen=120),
+    ]
+    c = counters_of(_extract_one_locus(tmp_path, reads))
+    assert c == {
+        "n_alignments_overlap_locus": 17,
+        "n_alignments_drop_mapq": 2,
+        "n_alignments_drop_sa": 2,
+        "n_alignments_drop_tlen": 2,
+        "n_alignments_drop_no_mi": 1,
+        "n_alignments_placed": 8,
+        "n_alignments_drop_flank": 3,
+        "n_alignments_drop_upstream_flank_not_placed": 2,
+        "n_alignments_drop_downstream_flank_not_placed": 1,
+        "n_alignments_drop_no_placement": 0,
+        "n_alignments_drop_no_bed_base": 0,
+        "n_alignments_drop_negative_value": 1,
+        "n_read_pairs": 4,
+        "n_read_pairs_drop_disagree": 1,
+        "n_read_pairs_merged": 1,
+        "n_reads": 3,
+    }
+    assert counter_relation_failures(c) == []

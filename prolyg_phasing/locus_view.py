@@ -34,7 +34,24 @@ from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 
-from prolyg_phasing.io.panel import ExtractedLocus, ExtractedPanel, parse_run_lengths
+from prolyg_phasing.io._flank_placement import (
+    FLANK_LEN,
+    G_SCORE,
+    GAP_OPEN,
+    MAX_GAP,
+    NO_FLANK_PAIR,
+    NO_REFERENCE_POSITION,
+    NON_G_SCORE,
+    SUBSTITUTION_COST,
+    WINDOW_RECOVERED,
+    WINDOW_UNRECOVERABLE,
+)
+from prolyg_phasing.io.panel import (
+    ExtractedLocus,
+    ExtractedPanel,
+    ExtractionProvenance,
+    parse_run_lengths,
+)
 
 # Pile-up rows drawn per locus and sample; the rest are counted.
 PILEUP_ROWS = 150
@@ -58,6 +75,169 @@ SUMMARY_FIELDS = ("hap_major_profile", "hap_minor_profile", "n_snvs_phased",
                   "n_snvs_dropped_low_linkage", "reads_major", "reads_minor", "reads_unk")
 
 _COUNTER_PREFIXES = ("n_alignments_", "n_read_pairs")
+
+
+# ---------------------------------------------------------------------------
+# The page's help texts
+# ---------------------------------------------------------------------------
+
+# The one table of the page's hover texts, in three groups: "counters", one
+# text per counter of `locus_view_data`, from where `io.bam` adds to it;
+# "status", one text per status label of the locus list; "filters", one text
+# per filter chip of the page. `view_help` fills the fields in braces from the
+# panel's provenance and the flank-match constants. A counter, a status the
+# extraction writes, or a chip with no text here fails a unit test.
+_FLANK_MATCH = ("A flank matches where a read substring differs from its {flank_len} bases "
+                "by at most one substitution or one gap of 1 or {max_gap} bases. ")
+_PLACEMENT_INPUT = ("The flank placement sees the alignments over the BED interval that "
+                    "pass the MAPQ, SA, TLEN and MI filters. ")
+_COUNTER_HELP = {
+    "n_alignments_overlap_locus":
+        "Alignments whose aligned reference span overlaps the BED interval. Unmapped, "
+        "secondary and supplementary alignments, and alignments with no stored sequence, "
+        "are not counted. Each counted alignment is in exactly one MAPQ, SA, TLEN or no-MI "
+        "drop, or goes to the flank placement. So this count equals those four drops, plus "
+        "n_alignments_placed, plus n_alignments_drop_flank, minus "
+        "n_alignments_drop_negative_value. A locus with no flank or no reference window "
+        "has 0 in every counter.",
+    "n_alignments_drop_mapq":
+        "Alignments over the BED interval with mapping quality below {min_mapq}. The limit "
+        "is the panel's --min-mapq (default 40). This filter comes first, so these "
+        "alignments are in no other drop.",
+    "n_alignments_drop_sa":
+        "{sa_text}",
+    "n_alignments_drop_tlen":
+        "Alignments over the BED interval with |TLEN| above {max_tlen}, after the MAPQ and "
+        "SA filters. The limit is the panel's --max-tlen (default 1000). An alignment with "
+        "TLEN 0 passes.",
+    "n_alignments_drop_no_mi":
+        "Alignments over the BED interval that pass the MAPQ, SA and TLEN filters but have "
+        "no MI tag. The MI tag names the read family, and the panel needs it.",
+    "n_alignments_placed":
+        _PLACEMENT_INPUT +
+        "This count is the alignments with at least one placement: an upstream flank match, "
+        "then a downstream flank match, with a base aligned inside the BED interval between "
+        "them. It includes the alignments with a negative value, which are dropped. So the "
+        "kept alignments are this count minus n_alignments_drop_negative_value.",
+    "n_alignments_drop_flank":
+        _PLACEMENT_INPUT +
+        "This count is the alignments it drops: no placement, or a negative best value. "
+        "Each dropped alignment counts once here. An alignment where neither flank matches "
+        "is in both the upstream and the downstream not-placed counters. So the five reason "
+        "counters add up to this count plus the alignments where neither flank matches.",
+    "n_alignments_drop_upstream_flank_not_placed":
+        _PLACEMENT_INPUT + _FLANK_MATCH +
+        "This count is the alignments with no upstream flank match that ends at a tract "
+        "edge, a non-G base before a G. An alignment where neither flank matches is also in "
+        "the downstream counter. So upstream plus downstream can exceed "
+        "n_alignments_drop_flank.",
+    "n_alignments_drop_downstream_flank_not_placed":
+        _PLACEMENT_INPUT + _FLANK_MATCH +
+        "This count is the alignments with no downstream flank match that starts at a tract "
+        "edge, a non-G base after a G. An alignment where neither flank matches is also in "
+        "the upstream counter. So upstream plus downstream can exceed "
+        "n_alignments_drop_flank.",
+    "n_alignments_drop_no_placement":
+        "Alignments where both flanks match, but no upstream match ends before a downstream "
+        "match starts.",
+    "n_alignments_drop_no_bed_base":
+        "Alignments where an upstream match ends before a downstream match starts, but no "
+        "such pair holds a read base aligned inside the BED interval. A base in an "
+        "insertion or a soft clip is never inside the interval.",
+    "n_alignments_drop_negative_value":
+        "Alignments whose best placement has a negative value. The value is {g_score} per G "
+        "in the tract and {non_g_score} per other base. Then it subtracts {sub_cost} per "
+        "flank substitution and {gap1_cost} or {gap2_cost} per flank gap of 1 or 2 bases. "
+        "These alignments are also in n_alignments_placed.",
+    "n_read_pairs":
+        "Read names, a read pair or a single read, with a kept alignment over the BED "
+        "interval. That alignment needs an MI tag that ends in /A or /B. The name needs at "
+        "most two mates, and its mates over the interval must share MI and strand. A mate "
+        "outside the interval counts only if it covers a flanking base. A name that fails "
+        "these checks is in no counter. This count is at most n_alignments_placed minus "
+        "n_alignments_drop_negative_value.",
+    "n_read_pairs_drop_disagree":
+        "Read pairs of n_read_pairs whose two mates both overlap the BED interval and give "
+        "different tracts that do not merge. The tract lengths differ, a mate has no base "
+        "qualities, or the mates differ at a base of equal quality. The panel drops these "
+        "pairs.",
+    "n_read_pairs_merged":
+        "Read pairs of n_read_pairs whose two mates give different tracts of equal length. "
+        "At each base where they differ, the base of higher quality goes into the panel. "
+        "A pair whose mates give the same tract is in neither this counter nor "
+        "n_read_pairs_drop_disagree.",
+    "n_reads":
+        "Reads in the panel at this locus, the sum of its count column. Each read is one "
+        "read name of n_read_pairs that the pair check keeps. So this count equals "
+        "n_read_pairs minus n_read_pairs_drop_disagree.",
+}
+
+
+def _half_units(score: int) -> str:
+    """A half-unit placement score in whole units, with a true minus sign."""
+    return f"{score / 2:g}".replace("-", "\u2212")
+
+
+# The status labels: the panel's stored reference_window_status, and two the
+# page derives. NO_REFERENCE_POSITION keys "side with no position", which the
+# page shows for a stored "recovered" locus with a flank side that
+# `_lacks_position`; "not_in_panel" is a locus that only the other sample's
+# panel holds.
+_STATUS_HELP = {
+    WINDOW_RECOVERED:
+        "The panel's stored status is recovered: reads of this sample rebuild the "
+        "reference window from their MD tags. The page shows this label when both flank "
+        "sides also have a reference position.",
+    WINDOW_UNRECOVERABLE:
+        "The panel's stored status. No read rebuilds the reference window from its MD tags: "
+        "no read of the matched normal, or no read of this sample with MAPQ {min_mapq} or "
+        "more. The locus has no flank in this sample, so it has no reads.",
+    NO_FLANK_PAIR:
+        "The panel's stored status. The matched normal rebuilds the reference window, but "
+        "build-flanks finds no flank pair with a positive objective. The locus has no flank, "
+        "so it has no reads.",
+    NO_REFERENCE_POSITION:
+        "The page derives this label from the flanks. The stored status is recovered. No "
+        "read of the matched normal aligns both end bases of one flank, so that side has no "
+        "reference position. The flank still sets the tract edge in each read. The side "
+        "shows no flanking bases, so it gives no SNVs to phasing.",
+    "not_in_panel":
+        "The page derives this label. The panel of this sample does not hold the locus; "
+        "the other sample's panel does.",
+}
+
+# The filter chips, by their key in the page.
+_FILTER_HELP = {
+    "all": "Show every locus of the panels.",
+    "noflank": "Show the loci where a shown sample's stored status is not recovered: ref "
+               "window unrecoverable or no flank pair.",
+    "noposition": "Show the loci where a shown sample has a flank side with no reference "
+                  "position.",
+    "noreads": "Show the loci where a shown sample has no reads in its panel.",
+}
+
+HELP_TEXTS: dict[str, dict[str, str]] = {
+    "counters": _COUNTER_HELP, "status": _STATUS_HELP, "filters": _FILTER_HELP}
+
+
+def view_help(provenance: ExtractionProvenance) -> dict[str, dict[str, str]]:
+    """`HELP_TEXTS` with the limits of the panel's provenance and the flank match filled in."""
+    if provenance.drop_chimeric:
+        sa_text = ("Alignments over the BED interval with an SA tag, a chimeric alignment, "
+                   "after the MAPQ filter. The panel drops them, the default; "
+                   "--no-drop-chimeric keeps them.")
+    else:
+        sa_text = ("The panel kept alignments with an SA tag (--no-drop-chimeric), so this "
+                   "count is 0.")
+    fields = {
+        "min_mapq": provenance.min_mapq, "max_tlen": provenance.max_tlen, "sa_text": sa_text,
+        "flank_len": FLANK_LEN, "max_gap": MAX_GAP,
+        "g_score": "+" + _half_units(G_SCORE), "non_g_score": _half_units(NON_G_SCORE),
+        "sub_cost": _half_units(SUBSTITUTION_COST), "gap1_cost": _half_units(GAP_OPEN + 1),
+        "gap2_cost": _half_units(GAP_OPEN + 2),
+    }
+    return {group: {name: text.format(**fields) for name, text in texts.items()}
+            for group, texts in HELP_TEXTS.items()}
 
 
 def panel_sample(panel: ExtractedPanel) -> str:
@@ -471,7 +651,8 @@ def locus_list(panels: Sequence[ExtractedPanel],
     observed G run), ``no_position`` (a flank side with no reference
     position) and ``snvs`` (``{"phased": n, "dropped": m}`` from the
     phasing result's ``snv_calls.tsv``, None when no phasing result was
-    given), or None when the panel does not hold the locus.
+    given), or None when the panel does not hold the locus. Each entry of
+    ``samples`` also holds ``help``, the panel's :func:`view_help`.
     """
     columns = []
     for panel in panels:
@@ -505,6 +686,7 @@ def locus_list(panels: Sequence[ExtractedPanel],
                for name in names]
     return {"samples": [{"sample": panel_sample(p),
                          "flank_table_sample": p.provenance.flank_table_sample,
+                         "help": view_help(p.provenance),
                          "phasing": None if ph is None else ph.directory}
                         for p, ph in zip(panels, phasings, strict=True)],
             "loci": entries, "pileup_rows": PILEUP_ROWS, "near": NEAR_BASES,

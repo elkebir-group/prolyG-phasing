@@ -28,6 +28,11 @@ from prolyg_phasing.io._flank_placement import FlankRecord
 from prolyg_phasing.io.bam import extract_panel
 from prolyg_phasing.io.panel import parse_run_lengths
 from prolyg_phasing.phasing import ref_pos_at_offset
+from tests._counter_relations import (
+    assert_counter_relations,
+    counters_of,
+    neither_flank_matched,
+)
 from tests._hand_built_reads import (
     CHROM_PAD,
     ReadCase,
@@ -174,6 +179,7 @@ def test_extraction_gives_the_expected_outcome_on_every_alignment(tmp_path, case
         assert locus.reference_window_status == "recovered"
         assert locus.ref_orientation == o
         assert locus.n_alignments_overlap_locus == len(placed) + 1  # and the MI-less read
+        assert_counter_relations(locus)
         kept = _rows_by_read(locus)
         if isinstance(want, str):
             assert kept == {}
@@ -206,6 +212,9 @@ def test_both_sides_count_when_both_fail(tmp_path):
         assert locus.n_alignments_drop_no_placement == 0
         assert locus.n_alignments_drop_no_bed_base == 0
         assert locus.n_alignments_drop_negative_value == 0
+        # One alignment, in both side counters: the side counters sum past the drops.
+        assert_counter_relations(locus)
+        assert neither_flank_matched(counters_of(locus)) == 1
 
 
 # ---------------------------------------------------------------------------

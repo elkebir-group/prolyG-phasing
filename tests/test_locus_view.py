@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -14,6 +16,7 @@ import pandas as pd
 import pytest
 
 import prolyg_phasing.cli as cli
+import prolyg_phasing.io._flank_placement as fp
 import prolyg_phasing.locus_view as lv
 from prolyg_phasing.io._flank_placement import FlankRecord
 from prolyg_phasing.io.bam import extract_panel
@@ -176,6 +179,71 @@ def test_a_locus_with_no_reference_window(tmp_path):
     _, panel = _panel(tmp_path, INVARIANT, edit=no_window)
     view = locus_view_data("PolyG151+", panel.loci["PolyG151+"], "S")
     assert view["flanks"] is None and view["tracts"] == [] and _all_rows(view) == []
+
+
+# ---------------------------------------------------------------------------
+# The counter help
+# ---------------------------------------------------------------------------
+
+
+def test_every_counter_has_a_help_text_and_every_text_a_counter(tmp_path):
+    _, panel = _panel(tmp_path, INVARIANT)
+    for name, locus in panel.loci.items():
+        counters = locus_view_data(name, locus, "S")["counters"]
+        assert set(lv.HELP_TEXTS["counters"]) == set(counters)
+    texts = lv.view_help(panel.provenance)
+    assert {g: set(t) for g, t in texts.items()} == \
+        {g: set(t) for g, t in lv.HELP_TEXTS.items()}
+    every = [t for group in texts.values() for t in group.values()]
+    assert all(every) and not any("{" in t or "}" in t for t in every)
+
+
+def test_every_status_label_and_filter_chip_has_a_help_text():
+    # Every reference_window_status the extraction writes, the label the page
+    # derives for a side with no position, and the label of a missing locus.
+    written = {fp.WINDOW_RECOVERED, fp.WINDOW_UNRECOVERABLE, fp.NO_FLANK_PAIR}
+    assert set(lv.HELP_TEXTS["status"]) == \
+        written | {fp.NO_REFERENCE_POSITION, "not_in_panel"}
+    page = (Path(lv.__file__).parent / "locus_view.html").read_text()
+    chips = re.search(r"const F=\[(.*?)\];", page).group(1)
+    assert set(re.findall(r'\["(\w+)",', chips)) == set(lv.HELP_TEXTS["filters"])
+    for key in ("not_in_panel", "no_reference_position", "recovered"):
+        assert f'"{key}"' in page
+
+
+def test_the_status_help_names_the_stored_field_and_the_derived_labels():
+    status = lv.HELP_TEXTS["status"]
+    for stored in (fp.WINDOW_RECOVERED, fp.WINDOW_UNRECOVERABLE, fp.NO_FLANK_PAIR):
+        assert "stored status" in status[stored]
+    for derived in (fp.NO_REFERENCE_POSITION, "not_in_panel"):
+        assert "The page derives this label" in status[derived]
+    for no_flank in (fp.WINDOW_UNRECOVERABLE, fp.NO_FLANK_PAIR):
+        assert "no reads" in status[no_flank]
+
+
+def test_the_counter_help_states_the_panel_limits():
+    from tests.test_phasing_tables import _make_provenance
+
+    provenance = dataclasses.replace(_make_provenance(), min_mapq=17, max_tlen=777,
+                                     drop_chimeric=False)
+    texts = lv.view_help(provenance)
+    counters = texts["counters"]
+    assert "below 17." in counters["n_alignments_drop_mapq"]
+    assert "MAPQ 17 or more" in texts["status"][fp.WINDOW_UNRECOVERABLE]
+    assert "above 777," in counters["n_alignments_drop_tlen"]
+    assert "--no-drop-chimeric" in counters["n_alignments_drop_sa"]
+    assert "count is 0" in counters["n_alignments_drop_sa"]
+    assert "drops them" in lv.view_help(_make_provenance())["counters"]["n_alignments_drop_sa"]
+    # The placement value in whole units: G +1, other base -2, flank costs 1, 2, 2.5.
+    value = counters["n_alignments_drop_negative_value"]
+    assert all(x in value for x in ("+1 per G", "\u22122 per other", "1 per flank", "2 or 2.5"))
+
+
+def test_the_list_carries_each_samples_help(server):
+    listing = json.loads(_get(server + "/loci")[1])
+    for sample in listing["samples"]:
+        assert {g: set(t) for g, t in sample["help"].items()} == \
+            {g: set(t) for g, t in lv.HELP_TEXTS.items()}
 
 
 # ---------------------------------------------------------------------------

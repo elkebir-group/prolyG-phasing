@@ -76,6 +76,8 @@ canvas{display:block}
 .note{color:var(--muted);font-size:12px;max-width:95ch}
 .help{display:inline-block;width:15px;height:15px;line-height:15px;border-radius:50%;text-align:center;font-size:10px;background:var(--chip);color:var(--muted);cursor:help;text-transform:none;letter-spacing:0;vertical-align:1px}
 .sec{margin-top:10px}
+.counters tbody tr{cursor:help}
+.counters tbody tr:hover,.counters tbody tr:focus-visible{outline:1.5px solid var(--muted);outline-offset:-2px}
 .rowband{position:absolute;left:0;box-sizing:border-box;pointer-events:none;border:2px solid var(--fg);background:none;border-radius:2px}
 .pair{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:stretch}
 .pair>.card,.pair>.slot{min-width:0;margin:0} .pair>.slot{display:block}
@@ -132,7 +134,7 @@ async function load(){
   $("#pickB").onchange=()=>{sample2=+$("#pickB").value;route()};
   $("#side").onchange=()=>{side=$("#side").checked;route()};
   const F=[["all","All"],["noflank","No flank"],["noposition","Side with no position"],["noreads","No reads"]];
-  for(const [k,l] of F){const b=document.createElement("button");b.textContent=l;b.dataset.k=k;b.onclick=()=>{filter=k;renderList()};$("#filters").appendChild(b)}
+  for(const [k,l] of F){const b=document.createElement("button");b.textContent=l;b.dataset.k=k;b.dataset.help=LIST.samples[0].help.filters[k]||"";b.onclick=()=>{filter=k;renderList()};$("#filters").appendChild(b)}
   HEAD1=$("#loci thead").innerHTML;
   $("#loci thead").onclick=ev=>{const th=ev.target.closest("th[data-k]");if(!th)return;
     const k=th.dataset.k,c=th.dataset.s===undefined?0:+th.dataset.s;
@@ -180,8 +182,9 @@ function visible(){
 function snvText(s){if(!s||!s.snvs)return "–";const v=s.snvs;
   if(!v.phased&&!v.dropped)return `<span class="note">no SNV</span>`;
   return fmt(v.phased)+(v.dropped?` <span class="note">(${fmt(v.dropped)})</span>`:"")}
-function statusPill(s){
-  return !s?`<span class="pill p-n">not in panel</span>`:s.status!=="recovered"?`<span class="pill p-bad">${esc(s.status.replaceAll("_"," "))}</span>`:s.no_position?`<span class="pill p-warn">side with no position</span>`:`<span class="pill p-ok">recovered</span>`}
+// The status label of sample k, with its text from the sample's help table.
+function statusPill(s,k){const H=LIST.samples[k].help.status,pill=(cls,key,label)=>`<span class="pill ${cls}" data-help="${esc(H[key]||"")}">${esc(label)}</span>`;
+  return !s?pill("p-n","not_in_panel","not in panel"):s.status!=="recovered"?pill("p-bad",s.status,s.status.replaceAll("_"," ")):s.no_position?pill("p-warn","no_reference_position","side with no position"):pill("p-ok","recovered","recovered")}
 function snvTitle(k){return LIST.samples[k].phasing?"SNVs of this sample's phasing result (snv_calls.tsv): phased, and dropped for low linkage in brackets":"no phasing result given for this sample"}
 // Short names for the two sub-column heads: the names without the start they
 // share, cut at a "_", "-" or "." so that a name part stays whole.
@@ -205,8 +208,8 @@ function renderList(){
   const tb=$("#loci tbody");tb.textContent="";
   for(const e of visible()){const s=info(e);
     const tr=document.createElement("tr");tr.tabIndex=0;tr.setAttribute("aria-selected",current===e);
-    if(!side)tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.largest_run):"–"}</td><td class="num">${snvText(s)}</td><td>${statusPill(s)}</td>`;
-    else{const ss=shown().map(k=>e.samples[k]),sub=(f,num)=>ss.map((x,c)=>`<td class="${num?"num":""}${c?"":" ga"}">${f(x)}</td>`).join("");
+    if(!side)tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.largest_run):"–"}</td><td class="num">${snvText(s)}</td><td>${statusPill(s,sample)}</td>`;
+    else{const ss=shown().map(k=>e.samples[k]),sub=(f,num)=>ss.map((x,c)=>`<td class="${num?"num":""}${c?"":" ga"}">${f(x,shown()[c])}</td>`).join("");
       tr.innerHTML=`<td class="mono">${esc(e.locus)}</td>`+sub(x=>x?fmt(x.n_reads):"–",true)+sub(x=>x?fmt(x.largest_run):"–",true)+sub(snvText,true)+sub(statusPill,false)}
     tr.onclick=()=>select(e);tr.onkeydown=ev=>{if(ev.key==="Enter")select(e)};
     tb.appendChild(tr)}
@@ -222,7 +225,7 @@ async function fetchLocus(s){
   return resp.ok?{data:await resp.json()}:{error:await resp.text()}}
 // One card per kind; a missing card is null. "col" names the column, so the
 // element ids of the two columns differ.
-function cardsOf(r,col){r._col=col;
+function cardsOf(r,col,k){r._col=col;r._k=k;
   return {head:headCard(r),ref:r.flanks?refCard(r):null,tract:tractCard(r),hist:histCard(r),
     pile:r.flanks&&r.pileup.sections.some(S=>S.rows.length)?pileCard(r):null,
     flanking:r.flanks&&r.pileup.sections.some(S=>S.rows.length)?flankingCard(r):null,
@@ -236,7 +239,7 @@ async function renderDetail(){
     const got=await fetchLocus(sample);
     if(want!==current||key!==route_key())return;
     if(got.error){el.innerHTML=`<div class="card"><p class="note">${esc(got.error)}</p></div>`;return}
-    const r=got.data;r._shared=null;const C=cardsOf(r,"");el.textContent="";
+    const r=got.data;r._shared=null;const C=cardsOf(r,"",sample);el.textContent="";
     el.appendChild(C.head);if(C.ref)el.appendChild(C.ref);
     const two=document.createElement("div");two.className="two";two.appendChild(C.tract);two.appendChild(C.hist);el.appendChild(two);
     if(C.pile){el.appendChild(C.pile);el.appendChild(C.flanking)}
@@ -247,7 +250,7 @@ async function renderDetail(){
   const rs=got.map(g=>g.data||null);
   const shared={hist:mergeHistScale(...rs.filter(Boolean).map(histScale)),
     tract:sharedTractWidth(...rs.filter(Boolean)),link:{}};
-  const cols=rs.map((r,i)=>r?(r._shared=shared,cardsOf(r,"ab"[i])):null);
+  const cols=rs.map((r,i)=>r?(r._shared=shared,cardsOf(r,"ab"[i],[sample,sample2][i])):null);
   const top=document.createElement("div");top.className="pair";
   [sample,sample2].forEach(s=>{const d=document.createElement("div");d.className="colhead";d.textContent=LIST.samples[s].sample;top.appendChild(d)});
   el.appendChild(top);
@@ -283,7 +286,7 @@ function headCard(r){
   c.innerHTML=`<div class="lhead"><span class="name">${esc(r.locus)}</span>
    <span class="mono">${esc(r.chrom)}:${fmt(r.bed_start)}–${fmt(r.bed_end)} (${esc(r.ref_orientation||"?")} strand)</span>
    <span class="pill ${r.reference_window_status==="recovered"?"p-ok":"p-bad"}">${esc(r.reference_window_status.replaceAll("_"," "))}</span>
-   <span class="note">${esc(r.sample)} · flanks from ${esc(LIST.samples[sample].flank_table_sample)}</span></div>
+   <span class="note">${esc(r.sample)} · flanks from ${esc(LIST.samples[r._k].flank_table_sample)}</span></div>
    <div class="kv">
     <div><b>Upstream flank</b>${r.flanks?flankText(r.flanks.upstream):"–"}</div>
     <div><b>Downstream flank</b>${r.flanks?flankText(r.flanks.downstream):"–"}</div>
@@ -361,21 +364,25 @@ function cellsText(cnt){const B=LIST.flanking_bases;return cnt?B.split("").map((
 function snvStatus(v){return v.status==="phased"?(v.is_anchor?"phased, anchor":"phased"):v.status==="dropped_low_linkage"?"dropped, low linkage":v.status}
 // A small "?" next to a card title; its hover holds the explanation.
 function helpMark(text){return ` <span class="help" tabindex="0" role="button" aria-label="help" data-help="${esc(text)}">?</span>`}
-// The "?" help uses the page's #tip box: shown on hover, toggled (pinned) on
+// The "?" help, and every other element with data-help, uses the page's #tip box: shown on hover, toggled (pinned) on
 // click or Enter. While it shows, the canvases leave #tip alone.
-const HELP={open:null,pinned:false};
+// A click pins the "?" help and a counter row's text; the list's labels and
+// chips show theirs on hover only, as a click there changes the list.
+const HELP={open:null,pinned:false},PIN=".help,.counters tr";
 function helpShow(el){const tip=$("#tip"),rc=el.getBoundingClientRect();
   tip.textContent=el.dataset.help;tip.hidden=false;HELP.open=el;
   const w=Math.min(420,innerWidth-16);tip.style.maxWidth=w+"px";
-  const left=Math.max(8,Math.min(rc.right+8,innerWidth-w-8));tip.style.left=left+"px";
+  // Right of a small mark; under the start of an element too wide for that.
+  const left=rc.right+8+w<=innerWidth-8?rc.right+8:Math.max(8,Math.min(rc.left,innerWidth-w-8));tip.style.left=left+"px";
   const top=rc.bottom+6,h=tip.offsetHeight;tip.style.top=(top+h>innerHeight-8?Math.max(8,rc.top-h-6):top)+"px"}
 function helpHide(){if(!HELP.open)return;$("#tip").hidden=true;HELP.open=null;HELP.pinned=false}
-document.addEventListener("mouseover",e=>{const el=e.target.closest(".help");if(el&&!HELP.pinned)helpShow(el)});
-document.addEventListener("mouseout",e=>{const el=e.target.closest(".help");if(el&&!HELP.pinned&&!el.contains(e.relatedTarget))helpHide()});
-document.addEventListener("click",e=>{const el=e.target.closest(".help");
+document.addEventListener("mouseover",e=>{if(HELP.pinned)return;const el=e.target.closest("[data-help]");
+  if(el)helpShow(el);else helpHide()});
+document.addEventListener("mouseout",e=>{const el=e.target.closest("[data-help]");if(el&&!HELP.pinned&&!el.contains(e.relatedTarget))helpHide()});
+document.addEventListener("click",e=>{const el=e.target.closest(PIN);
   if(el){if(HELP.pinned&&HELP.open===el){helpHide()}else{helpShow(el);HELP.pinned=true}return}
   if(HELP.pinned)helpHide()});
-document.addEventListener("keydown",e=>{const el=e.target.closest&&e.target.closest(".help");
+document.addEventListener("keydown",e=>{const el=e.target.closest&&e.target.closest(PIN);
   if(el&&(e.key==="Enter"||e.key===" ")){e.preventDefault();el.click()}if(e.key==="Escape")helpHide()});
 // Label styles: major and minor are filled; unk is a hollow outline in the
 // muted text color. Hue in the pile-up belongs to the bases.
@@ -565,9 +572,11 @@ function zoomSide(r,name,S,cv,reset,maxCov,B){
   // Exposed for a headless check: zoom to a reference range.
   cv.zoomTo=(a,b)=>{lo=a;hi=b;clamp();draw();share(false)};
 }
+// Each counter row carries its explanation (the sample's help.counters, from
+// the panel's provenance) for the page's #tip box.
 function counterCard(r){
-  const c=document.createElement("div");c.className="card";
-  c.innerHTML=`<h2>Extraction counters</h2><div class="scroll"><table><tbody>${Object.entries(r.counters).map(([k,v])=>`<tr><td class="mono">${esc(k)}</td><td class="num">${fmt(v)}</td></tr>`).join("")}</tbody></table></div>`;
+  const c=document.createElement("div");c.className="card";const H=LIST.samples[r._k].help.counters;
+  c.innerHTML=`<h2>Extraction counters${helpMark("Hover a row for what the counter counts.")}</h2><div class="scroll"><table class="counters"><tbody>${Object.entries(r.counters).map(([k,v])=>`<tr tabindex="0" data-help="${esc(H[k]||"")}"><td class="mono">${esc(k)}</td><td class="num">${fmt(v)}</td></tr>`).join("")}</tbody></table></div>`;
   return c;
 }
 load().catch(e=>{$("#loading").hidden=false;$("#loading").textContent="The locus list could not be read: "+e.message});
