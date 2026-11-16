@@ -192,7 +192,7 @@ function snvTitle(k){return LIST.samples[k].phasing?"SNVs of this sample's phasi
 function shortNames(a,b){if(a===b)return [a,b];let n=0;while(n<a.length&&a[n]===b[n])n++;
   const cut=Math.max(a.lastIndexOf("_",n-1),a.lastIndexOf("-",n-1),a.lastIndexOf(".",n-1))+1;
   return [a.slice(cut),b.slice(cut)]}
-const MOLECULES_HELP="Molecules: distinct read families (MI). The A and B strands of a family count as one molecule.";
+const MOLECULES_HELP="Molecules: the number of distinct MI tags. We count the A and B strands of one MI as one molecule.";
 const LIST_COLS=[["n_reads","Reads",true],["molecules","Molecules",true],["largest_run","Largest run",true],["snvs","Phasing SNVs",true],["status","Status",false]];
 function listHead(){
   if(!side){$("#loci").removeAttribute("class");$("#loci thead").innerHTML=HEAD1;$("#snvhead").title=snvTitle(sample);return}
@@ -333,7 +333,7 @@ function tractCard(r){
   return c;
 }
 // Molecules of one phase label: distinct MI among the label's reads.
-const MOLECULE_IN_EACH_LABEL="A molecule with reads under two labels counts in the molecules of each.";
+const MOLECULE_IN_EACH_LABEL="We count a molecule with reads under two labels once under each label.";
 function molText(r,label){const S=r.pileup.sections.find(x=>x.label===label);return S?` · ${fmt(S.molecules)} molecules`:""}
 function histCard(r){
   const c=document.createElement("div");c.className="card";
@@ -580,7 +580,7 @@ function zoomSide(r,name,S,cv,reset,maxCov,B){
 // the panel's provenance) for the page's #tip box.
 function counterCard(r){
   const c=document.createElement("div");c.className="card";const H=LIST.samples[r._k].help.counters;
-  c.innerHTML=`<h2>Extraction counters${helpMark("Hover a row for what the counter counts.")}</h2><div class="scroll"><table class="counters"><tbody>${Object.entries(r.counters).map(([k,v])=>`<tr tabindex="0" data-help="${esc(H[k]||"")}"><td class="mono">${esc(k)}</td><td class="num">${fmt(v)}</td></tr>`).join("")}</tbody></table></div>`;
+  c.innerHTML=`<h2>Extraction counters${helpMark("Hover over a row to see what the counter counts.")}</h2><div class="scroll"><table class="counters"><tbody>${Object.entries(r.counters).map(([k,v])=>`<tr tabindex="0" data-help="${esc(H[k]||"")}"><td class="mono">${esc(k)}</td><td class="num">${fmt(v)}</td></tr>`).join("")}</tbody></table></div>`;
   return c;
 }
 load().catch(e=>{$("#loading").hidden=false;$("#loading").textContent="The locus list could not be read: "+e.message});

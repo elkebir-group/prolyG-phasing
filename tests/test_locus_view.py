@@ -214,9 +214,9 @@ def test_every_status_label_and_filter_chip_has_a_help_text():
 def test_the_status_help_names_the_stored_field_and_the_derived_labels():
     status = lv.HELP_TEXTS["status"]
     for stored in (fp.WINDOW_RECOVERED, fp.WINDOW_UNRECOVERABLE, fp.NO_FLANK_PAIR):
-        assert "stored status" in status[stored]
+        assert status[stored].startswith("Stored in the panel.")
     for derived in (fp.NO_REFERENCE_POSITION, "not_in_panel"):
-        assert "The page derives this label" in status[derived]
+        assert status[derived].startswith("Not stored in the panel.")
     for no_flank in (fp.WINDOW_UNRECOVERABLE, fp.NO_FLANK_PAIR):
         assert "no reads" in status[no_flank]
 
@@ -233,7 +233,8 @@ def test_the_counter_help_states_the_panel_limits():
     assert "above 777," in counters["n_alignments_drop_tlen"]
     assert "--no-drop-chimeric" in counters["n_alignments_drop_sa"]
     assert "count is 0" in counters["n_alignments_drop_sa"]
-    assert "drops them" in lv.view_help(_make_provenance())["counters"]["n_alignments_drop_sa"]
+    sa_kept = lv.view_help(_make_provenance())["counters"]["n_alignments_drop_sa"]
+    assert "We drop these chimeric" in sa_kept
     # The placement value in whole units: G +1, other base -2, flank costs 1, 2, 2.5.
     value = counters["n_alignments_drop_negative_value"]
     assert all(x in value for x in ("+1 per G", "\u22122 per other", "1 per flank", "2 or 2.5"))
