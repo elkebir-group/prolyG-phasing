@@ -475,8 +475,10 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
         ``index``, ``position``, ``counts``, ``coverage`` and, at an SNV,
         ``snv`` (its row of ``snv_calls.tsv``). ``sections``: one per phase
         label in `PHASE_LABELS` order (one, label None, without phasing),
-        each with ``label``, ``reads``, ``rows``, ``n_rows`` and
-        ``reads_not_drawn`` (the rows past `PILEUP_ROWS` in the section).
+        each with ``label``, ``reads``, ``molecules`` (distinct MI among
+        the section's reads; a molecule with reads under two labels counts
+        in each), ``rows``, ``n_rows`` and ``reads_not_drawn`` (the rows
+        past `PILEUP_ROWS` in the section).
         A row is one distinct (tract, the read's own base or "." at every
         shown column) within the section, with ``tract``, ``label``,
         ``reads``, ``up`` and ``dn`` (the bases at the side's columns, one
@@ -579,8 +581,10 @@ def locus_view_data(locus_id: str, locus: ExtractedLocus, sample: str, *,
                            if bases[k2] != "." and bases[k2] != snv[field]]
                     for name, bases in (("up", up), ("dn", dn))}
             rows.append(row)
+        # A molecule with reads under two labels counts in each label.
         sections.append({"label": label, "rows": rows, "n_rows": len(keys),
                          "reads": int(key_reads.sum()),
+                         "molecules": len(np.unique(mi_id[in_label])),
                          "reads_not_drawn": int(key_reads[key_order[PILEUP_ROWS:]].sum())})
 
     # Reads per tract and per largest G run, by phase label.

@@ -255,9 +255,9 @@ SNV_STRINGS = ["AAAACAAT|TTTTTTTT", "AAAAGAAT|TTTTTTTT", "AAAA.AAT|TTTTTTTT"]
 SNV_COUNTS = [70, 30, 10]
 
 
-def _snv_panel(tmp_path, *, mi_prefix="M"):
+def _snv_panel(tmp_path, *, mi_prefix="M", edit=None):
     """A panel with one heterozygous flanking SNV, and the phase output for it,
-    made by the `phase` command."""
+    made by the `phase` command. `edit` changes the locus before it is saved."""
     from tests.test_phasing_tables import _make_locus, _make_provenance
 
     n = sum(SNV_COUNTS)
@@ -267,6 +267,8 @@ def _snv_panel(tmp_path, *, mi_prefix="M"):
     locus.mi = np.asarray([f"{mi_prefix}{i}" for i in range(n)], dtype=object)
     # Rows 0 and 1 are one read family with two tracts: one (mi, strand) on two rows.
     locus.mi[1] = locus.mi[0]
+    if edit is not None:
+        edit(locus)
     db = tmp_path / f"{mi_prefix}.panel.db"
     ExtractedPanel(loci={"L1": locus}, n_alleles=8, provenance=_make_provenance()).save_db(db)
     out = tmp_path / f"{mi_prefix}_phasing"
@@ -549,3 +551,31 @@ def test_largest_run_shares_are_per_label_hand_counts_over_label_totals(tmp_path
         assert [v for _, v in got] == pytest.approx([v for _, v in want])
         if want:
             assert sum(v for _, v in view["largest_run_shares"][label]) == pytest.approx(1.0)
+
+
+def test_each_label_counts_its_molecules_and_a_split_molecule_counts_in_each(tmp_path):
+    """Rows 0 and 1 are one family. Row 100, a read with no SNV base, is the
+    B strand of row 0's molecule: one molecule with major and unk reads."""
+    def split_molecule(locus):
+        locus.mi[100] = locus.mi[0]
+        locus.strand[100] = "B"
+
+    db, out = _snv_panel(tmp_path, edit=split_molecule)
+    view = locus_view_data("L1", ExtractedPanel.load_db(db).loci["L1"], "S",
+                           phasing=lv.PhasingIndex.read(out))
+    by_label = {S["label"]: (S["reads"], S["molecules"]) for S in view["pileup"]["sections"]}
+    # Major: 70 reads (C), M0 on rows 0 and 1. Minor: 30 reads (G). Unk: 10
+    # reads, M0 again on row 100.
+    assert by_label == {"hap_major": (70, 69), "hap_minor": (30, 30), "unk": (10, 10)}
+    assert view["n_molecules"] == 108 < sum(m for _, m in by_label.values())
+    # The histogram panels show the same reads per label.
+    totals = np.sum([v for _, v in view["largest_run_labels"]], axis=0).tolist()
+    assert totals == [70, 30, 10]
+
+
+def test_without_phasing_the_one_section_counts_every_molecule(tmp_path):
+    db, _ = _snv_panel(tmp_path)
+    view = locus_view_data("L1", ExtractedPanel.load_db(db).loci["L1"], "S")
+    [section] = view["pileup"]["sections"]
+    assert (section["label"], section["reads"], section["molecules"]) == (None, 110, 109)
+    assert section["molecules"] == view["n_molecules"]

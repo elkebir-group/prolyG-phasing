@@ -331,10 +331,13 @@ function tractCard(r){
    <td class="mono">${tractSeq(s)}</td></tr>`).join("")}</tbody></table></div>`;
   return c;
 }
+// Molecules of one phase label: distinct MI among the label's reads.
+const MOLECULE_IN_EACH_LABEL="A molecule with reads under two labels counts in the molecules of each.";
+function molText(r,label){const S=r.pileup.sections.find(x=>x.label===label);return S?` · ${fmt(S.molecules)} molecules`:""}
 function histCard(r){
   const c=document.createElement("div");c.className="card";
   const SH=r.largest_run_shares;
-  c.innerHTML=`<h2>Largest G run per read, share of reads${SH?helpMark("One histogram per phase label: each shows the share of that label's reads at each largest G run, on one x axis and one y scale."):""}</h2>`;
+  c.innerHTML=`<h2>Largest G run per read, share of reads${SH?helpMark("One histogram per phase label: each shows the share of that label's reads at each largest G run, on one x axis and one y scale. "+MOLECULE_IN_EACH_LABEL):""}</h2>`;
   if(!r.largest_run.length){c.innerHTML+=`<p class="note">No reads.</p>`;return c}
   // One sample: its own axis and scale; side by side: the shared ones.
   const sc=r._shared&&r._shared.hist?r._shared.hist:histScale(r);const lo=sc.lo,hi=sc.hi;
@@ -350,13 +353,13 @@ function histCard(r){
     return s+axis(H-2)+`</svg>`};
   if(!SH){const tot=r.largest_run.reduce((a,x)=>a+x[1],0)||1;const rows=r.largest_run.map(([k,n])=>[k,n/tot,n]);
     const ymax=sc.ymax;
-    c.innerHTML+=panel(rows,ymax,190,"var(--muted)",(k,v,n)=>`largest G run ${k}: ${fmt(n)} reads (${pct(v)})`)+`<div class="note" style="text-align:center">largest G run</div>`;return c}
+    c.innerHTML+=`<div class="sec" style="margin-top:4px"><h3>all reads · ${fmt(tot)} reads${molText(r,null)}</h3></div>`+panel(rows,ymax,190,"var(--muted)",(k,v,n)=>`largest G run ${k}: ${fmt(n)} reads (${pct(v)})`)+`<div class="note" style="text-align:center">largest G run</div>`;return c}
   const lab=["hap_major","hap_minor","unk"];
   const counts=Object.fromEntries(r.largest_run_labels);
   const totals=lab.map((_,i)=>r.largest_run_labels.reduce((a,[,v])=>a+v[i],0));
   const ymax=sc.ymax;
   lab.forEach((l,i)=>{const rows=SH[l].map(([k,v])=>[k,v,(counts[k]||[0,0,0])[i]]);
-    c.innerHTML+=`<div class="sec" style="margin-top:4px"><h3${l==="unk"?' style="color:var(--muted)"':""}>${labelSwatch(l)}${LABEL_NAME[l].toLowerCase()} · ${fmt(totals[i])} reads</h3>`+
+    c.innerHTML+=`<div class="sec" style="margin-top:4px"><h3${l==="unk"?' style="color:var(--muted)"':""}>${labelSwatch(l)}${LABEL_NAME[l].toLowerCase()} · ${fmt(totals[i])} reads${molText(r,l)}</h3>`+
       panel(rows,ymax,78,l==="unk"?"outline":`var(${LABEL_COLOR[l]})`,(k,v,n)=>`${LABEL_NAME[l].toLowerCase()}, largest G run ${k}: ${fmt(n)} reads (${pct(v)} of ${LABEL_NAME[l].toLowerCase()})`)+`</div>`});
   c.innerHTML+=`<div class="note" style="text-align:center">largest G run</div>`;
   return c;
