@@ -103,12 +103,12 @@ assert len(REFERENCE_PLAIN) == len(REFERENCE_INTERRUPTED) == 200
 _INTERRUPTER_REFPOS = BED_START + 7
 
 # Flanking-SNV offsets used by Locus2, in the same "canonical distance from
-# the anchor" convention prolyg_phasing.io.bam._alignment_flanking uses:
-# up_dist=0 is the reference base immediately outside the upstream anchor
-# (position 49, one before the anchor's own 50-59); dn_dist=0 is the same
-# on the downstream side (position 84, one past the anchor's own 74-83).
-# Both fall inside the flat "A" padding on either side of the anchors, so
-# mutating them cannot perturb anchor placement or the polyG tract itself.
+# the flank" convention prolyg_phasing.io.bam._alignment_flanking uses:
+# up_dist=0 is the reference base immediately outside the upstream flank
+# (position 49, one before the flank's own 50-59); dn_dist=0 is the same
+# on the downstream side (position 84, one past the flank's own 74-83).
+# Both fall inside the flat "A" padding on either side of the flanks, so
+# mutating them cannot perturb flank placement or the polyG tract itself.
 _UP_SNV_REFPOS = 49
 _DN_SNV_REFPOS = 84
 
@@ -249,10 +249,15 @@ _HEADER = {
 }
 
 
-def _write_bam(bam_path: Path, add_reads) -> None:
-    """Write, coordinate-sort, and index a BAM; ``add_reads(bam)`` populates it."""
+def _write_bam(bam_path: Path, add_reads, sample: str) -> None:
+    """Write, coordinate-sort, and index a BAM; ``add_reads(bam)`` populates it.
+
+    The header carries one read group whose SM names `sample`, the name
+    ``build-flanks`` writes into its outputs.
+    """
     unsorted_path = bam_path.with_name(bam_path.stem + ".unsorted.bam")
-    with pysam.AlignmentFile(str(unsorted_path), "wb", header=_HEADER) as bam:
+    header = {**_HEADER, "RG": [{"ID": "1", "SM": sample}]}
+    with pysam.AlignmentFile(str(unsorted_path), "wb", header=header) as bam:
         add_reads(bam)
     pysam.sort("-o", str(bam_path), str(unsorted_path))
     pysam.index(str(bam_path))
@@ -343,10 +348,10 @@ def _add_target_reads(bam: pysam.AlignmentFile) -> None:
 
 def main() -> None:
     bam_path = EXAMPLE_DIR / "example.bam"
-    _write_bam(bam_path, _add_reference_reads)
+    _write_bam(bam_path, _add_reference_reads, "EXAMPLE")
 
     target_bam_path = EXAMPLE_DIR / "example_target.bam"
-    _write_bam(target_bam_path, _add_target_reads)
+    _write_bam(target_bam_path, _add_target_reads, "EXAMPLE_TARGET")
 
     bed_path = EXAMPLE_DIR / "panel.bed"
     bed_path.write_text(

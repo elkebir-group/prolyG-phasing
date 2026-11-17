@@ -1,4 +1,5 @@
-samples: config/samples.tsv           # sample_id, bam (path relative to the repo root, or absolute).
+samples: config/samples.tsv           # sample_id, bam (path relative to the repo root, or absolute),
+                                       # normal (the sample_id of the donor's matched normal).
                                        # Points at the committed example by default (workflow/example/)
                                        # so the workflow runs out of the box; edit in place, or override
                                        # with --config samples=<your samples.tsv>, to use your own data.
@@ -14,8 +15,6 @@ extraction:
   min_mapq: 40
   drop_chimeric: true
   max_tlen: 1000
-  anchor_hamming_max: 1
-  pair_disagreement_policy: drop
   n_alleles_margin: 1
   min_flanking_base_q: 20
 

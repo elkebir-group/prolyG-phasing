@@ -3,18 +3,21 @@
 Walks a BAM against a BED panel and produces an in-memory
 `ExtractedPanel` of faithful per-(MI, strand, seq) read counts.
 
-Two passes:
+Every locus needs its two flanks from the matched normal's flank table
+(`prolyg-phasing build-flanks`). Two steps per locus:
 
-1. **Anchorability pass** — per BED interval, reconstruct a `±pad` bp
-   reference window from MD tags and try to construct upstream +
-   downstream anchors (`_anchors.build_anchors`).
-2. **Extraction pass** — per anchorable locus, fetch overlapping
-   alignments, apply parser-side QC filters (MAPQ, SA, TLEN, anchor
-   placement), group by `query_name` for pair-collapse, drop pair
-   disagreements, and emit per-(MI, strand, seq) read counts.
+1. **Reference window** — reconstruct the reference on BED ± `pad` bp
+   from MD tags. It gives the strand, the reference tract between the two
+   flanks' run-side bases, and the G walk past each BED end.
+2. **Extraction** — fetch overlapping alignments, apply the read filters
+   (MAPQ, SA, TLEN, MI), cut each read's tract between its best placement
+   of the two flanks (`_flank_placement.place_flanks`; the tract must hold
+   a read base aligned inside the BED interval), group by
+   `query_name` for pair collapse, merge or drop pair disagreements
+   (`_merge_pair_tract`), and emit per-(MI, strand, seq) read counts.
 
 Per-locus ``n_runs`` is set from the **data** (max parsed tuple length
-across accepted reads), not from the reference inter-anchor sequence.
+across accepted reads), not from the reference tract.
 This handles interrupter-pattern polymorphisms where the reference
 predicts one ``S`` but the sample carries reads at multiple ``S``
 values (e.g. PolyG3298: ~49% of reads parse to 2-tuples, ~46% to
@@ -29,10 +32,14 @@ parsed read across the panel.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
+import hashlib
 from collections import Counter, defaultdict
+from collections.abc import Iterator, Sequence
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
+from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
@@ -40,23 +47,44 @@ import pysam
 from tqdm.auto import tqdm
 
 from prolyg_phasing.io._anchors import (
-    AnchorResult,
-    build_anchors,
     get_reference_window,
-    hamming_search,
+    reference_walk,
     revcomp,
 )
+from prolyg_phasing.io._flank_placement import (
+    NO_FLANK_PAIR,
+    WINDOW_RECOVERED,
+    WINDOW_UNRECOVERABLE,
+    FlankPlacement,
+    FlankRecord,
+    FlankTable,
+    flank_outer_bases,
+    place_flanks,
+    place_polyg_reads,
+    polyg_reads,
+    read_flank_table,
+    window_index,
+)
 from prolyg_phasing.io.panel import (
+    EXTRACTION_SCHEMA_VERSION,
     ExtractedLocus,
     ExtractedPanel,
     ExtractionProvenance,
+    PanelWriter,
+    encode_locus_row,
     parse_run_lengths,
 )
 
-FLANKING_SEQ_LEN = 10
 REF_WINDOW_PAD = 50
 
-EXTRACTION_SCHEMA_VERSION = "2"
+# A reference coordinate past the end of every chromosome: the bound of the
+# flanked interval on a side whose flank has no reference position.
+_NO_FLANKING_BOUND = 1 << 62
+
+# The flanking start of a side with no position: never a coordinate.
+_NO_FLANKING_START = -1
+
+PAIR_DISAGREEMENT_POLICY = "merge_by_quality"
 DEFAULT_MIN_FLANKING_BASE_Q = 20
 
 _COMP_TABLE = str.maketrans("ACGTNacgtn", "TGCANtgcan")
@@ -85,35 +113,148 @@ def _load_bed(bed_path: Path) -> list[tuple[str, str, int, int]]:
 
 
 # ---------------------------------------------------------------------------
-# Per-locus anchorability + extraction
+# Per-locus geometry + extraction
 # ---------------------------------------------------------------------------
 
 
-def _build_anchors_for_locus(
+@dataclasses.dataclass(frozen=True)
+class LocusGeometry:
+    """The reference geometry of one locus in one BAM, with its two flanks.
+
+    Attributes
+    ----------
+    ref_orientation : str
+        "+" if the repeat reads as Gs on the reference, "-" otherwise.
+    reference_window : str
+        The reference on BED ± `REF_WINDOW_PAD`, in reference orientation.
+    reference_window_start : int
+        Reference coordinate of ``reference_window[0]``.
+    upstream, downstream : FlankRecord
+        The two flanks from the matched normal's flank table. A flank with
+        no reference position still sets the tract; that side gives no
+        flanking bases.
+    g_walk_up, g_walk_dn : int
+        The G bases between each BED end and that side's edge base.
+    """
+
+    ref_orientation: str
+    reference_window: str
+    reference_window_start: int
+    upstream: FlankRecord
+    downstream: FlankRecord
+    g_walk_up: int
+    g_walk_dn: int
+
+    def polyg_index(self, position: int) -> int:
+        """Index of reference coordinate `position` in the polyG-orientation window."""
+        return window_index(position, ref_orientation=self.ref_orientation,
+                            window_start=self.reference_window_start,
+                            window_len=len(self.reference_window))
+
+    @property
+    def flanked_interval(self) -> tuple[int, int]:
+        """Reference interval ``[lo, hi)`` from one flank's outer base to the other's.
+
+        The flanking window for phasing lies outside it. A side whose flank
+        has no reference position extends the interval to that end of the
+        reference (0, or `_NO_FLANKING_BOUND`), so the side gives no
+        flanking bases.
+        """
+        low, high = ((self.upstream, self.downstream) if self.ref_orientation == "+"
+                     else (self.downstream, self.upstream))
+        lo = low.outer_position if low.has_position else 0
+        hi = high.outer_position + 1 if high.has_position else _NO_FLANKING_BOUND
+        return lo, hi
+
+    @property
+    def reference_tract(self) -> str:
+        """The reference strictly between the two run-side bases, in polyG orientation.
+
+        Empty when a flank has no reference position: the tract has no
+        reference end on that side.
+        """
+        if not (self.upstream.has_position and self.downstream.has_position):
+            return ""
+        window = self.reference_window
+        if self.ref_orientation == "-":
+            window = revcomp(window)
+        lo = self.polyg_index(self.upstream.run_side_position) + 1
+        hi = self.polyg_index(self.downstream.run_side_position)
+        return window[lo:hi]
+
+
+def locus_geometry(
     bam: pysam.AlignmentFile,
+    name: str,
     chrom: str,
     bed_start: int,
     bed_end: int,
+    flanks: tuple[FlankRecord, FlankRecord],
     *,
-    pad: int,
-    k: int,
     min_mapq: int,
-) -> AnchorResult:
-    """Anchor extraction for one BED interval: MD-tag reference + anchor walk."""
-    win_start = bed_start - pad
-    win_end = bed_end + pad
-    ref = get_reference_window(bam, chrom, win_start, win_end, min_mapq=min_mapq)
-    return build_anchors(
-        ref_window=ref,
-        bed_offset=pad,
-        bed_len=bed_end - bed_start,
-        k=k,
+) -> LocusGeometry | None:
+    """The reference window of one locus from MD tags, with its two flanks.
+
+    Returns None when no read rebuilds the reference window. build-flanks
+    writes a reference position only inside BED ± `REF_WINDOW_PAD`, and
+    only with the upstream run-side base upstream of the downstream one.
+    Raises RuntimeError, naming the locus, when the flank table breaks
+    this.
+    """
+    window_start = bed_start - REF_WINDOW_PAD
+    window = get_reference_window(bam, chrom, window_start, bed_end + REF_WINDOW_PAD,
+                                  min_mapq=min_mapq)
+    if window is None:
+        return None
+    walk = reference_walk(window, REF_WINDOW_PAD, bed_end - bed_start)
+    geometry = LocusGeometry(
+        ref_orientation=walk.ref_orientation,
+        reference_window=window,
+        reference_window_start=window_start,
+        upstream=flanks[0],
+        downstream=flanks[1],
+        g_walk_up=walk.g_walk_up,
+        g_walk_dn=walk.g_walk_dn,
+    )
+    for side, flank in zip(("upstream", "downstream"), flanks, strict=True):
+        if flank.has_position and \
+                not 0 <= geometry.polyg_index(flank.run_side_position) < len(window):
+            raise RuntimeError(
+                f"{name}: the {side} flank's run-side base at reference position "
+                f"{flank.run_side_position} is outside the reference window "
+                f"[{window_start}, {window_start + len(window)}); the flank table "
+                "breaks an invariant of build-flanks")
+    if flanks[0].has_position and flanks[1].has_position and \
+            geometry.polyg_index(flanks[0].run_side_position) \
+            >= geometry.polyg_index(flanks[1].run_side_position):
+        raise RuntimeError(f"{name}: the upstream flank is not upstream of the downstream "
+                           "flank; the flank table breaks an invariant of build-flanks")
+    return geometry
+
+
+def place_locus_flanks(alignments: Sequence[pysam.AlignedSegment],
+                       geometry: LocusGeometry, bed_start: int, bed_end: int
+                       ) -> FlankPlacement:
+    """Each alignment's tract under the locus's two flanks; one entry per alignment.
+
+    This is the per-read decision of the extraction: the tract and the
+    drop reasons (see :func:`place_flanks`). The tract edges come from the
+    read sequence; the alignment marks the read bases inside the BED
+    interval ``[bed_start, bed_end)``, and the tract must hold one.
+    """
+    return place_flanks(
+        alignments,
+        upstream=geometry.upstream,
+        downstream=geometry.downstream,
+        ref_orientation=geometry.ref_orientation,
+        bed_start=bed_start,
+        bed_end=bed_end,
     )
 
 
 # One side (upstream or downstream) of one read's flanking bases, as
 # ``(start_distance, bases)``: ``bases[i]`` is the canonical-orientation
-# base at distance ``start_distance + i`` from that side's anchor, going
+# base at distance ``start_distance + i`` from that side's flank, going
 # outward. ``"."`` marks a distance the read says nothing about — an
 # alignment gap, or a base below ``min_base_q``. Reads are A/C/G/T/N
 # after upper-casing, so ``"."`` is never a real base, and it is already
@@ -212,19 +353,18 @@ def _strip_side(start: int, text: str) -> FlankingSide:
 def _alignment_flanking(
     r: pysam.AlignedSegment,
     *,
-    bed_start: int,
-    bed_end: int,
-    g_walk_up: int,
-    g_walk_dn: int,
-    anchor_k: int,
+    lo: int,
+    hi: int,
     ref_orientation: str,
     min_base_q: int,
 ) -> tuple[FlankingSide, FlankingSide]:
-    """Flanking bases for one alignment, by canonical distance from the anchor.
+    """Flanking bases for one alignment, by canonical distance from the flank.
 
+    `lo` and `hi` bound the reference interval ``[lo, hi)`` that the two
+    flanks and the repeat cover (`LocusGeometry.flanked_interval`).
     Returns ``(upstream_side, downstream_side)`` as `FlankingSide` pairs.
     Distance 0 on each side is the base immediately adjacent to that
-    side's anchor going outward (away from the polyG). Bases are in
+    side's flank going outward (away from the polyG). Bases are in
     canonical orientation (complemented for ``"-"`` orientation loci).
     Positions the alignment skips (insertions, soft clips, deletions)
     and bases below `min_base_q` are left as ``"."``.
@@ -243,16 +383,12 @@ def _alignment_flanking(
         return _EMPTY_SIDE, _EMPTY_SIDE
 
     # Both orientations see the same geometry: one reference region left
-    # of the anchors (`refpos < lo`) and one right of them (`refpos >=
+    # of the flanks (`refpos < lo`) and one right of them (`refpos >=
     # hi`). Orientation decides which region is the upstream side, which
     # way distances run, and whether bases are complemented.
     if ref_orientation == "+":
-        lo = bed_start - g_walk_up - anchor_k
-        hi = bed_end + g_walk_dn + anchor_k
         bases = seq.upper()
     else:
-        lo = bed_start - g_walk_dn - anchor_k
-        hi = bed_end + g_walk_up + anchor_k
         bases = seq.upper().translate(_COMP_TABLE)
 
     # Mask sub-threshold bases once, so the per-block fills below are
@@ -338,6 +474,138 @@ def _consensus(a: FlankingSide, b: FlankingSide) -> FlankingSide:
     return _strip_side(start_a, text_a[:head_len] + overlap + tail)
 
 
+def _merge_by_quality(
+    seq_a: str,
+    seq_b: str,
+    quality_a: Sequence[int] | None,
+    quality_b: Sequence[int] | None,
+    tracts: Sequence[tuple[int, int]],
+) -> str | None:
+    """Merge two mates' equal-length stretches of read by base quality.
+
+    At each position where the mates differ, the base with the higher
+    Phred quality wins. At a position where the mates differ with equal
+    qualities, we write N if the position lies outside both mates' tracts,
+    and we return ``None`` if the position lies inside either tract. We
+    also return ``None`` when the stretches differ in length or when
+    either mate has no stored qualities. The caller then drops the pair.
+
+    Parameters
+    ----------
+    seq_a, seq_b : str
+        Stretches of the two mates in polyG orientation.
+    quality_a, quality_b : sequence of int or None
+        Per-base Phred qualities of the two stretches, in the same
+        orientation and over the same slice as ``seq_a`` and ``seq_b``.
+    tracts : sequence of (int, int)
+        Each mate's own tract as a half-open interval of stretch positions.
+
+    Returns
+    -------
+    str or None
+        The merged stretch, or ``None`` when no merge is possible.
+    """
+    if len(seq_a) != len(seq_b) or quality_a is None or quality_b is None:
+        return None
+    merged = list(seq_a)
+    for i, (base_a, base_b) in enumerate(zip(seq_a, seq_b, strict=True)):
+        if base_a == base_b:
+            continue
+        if quality_a[i] == quality_b[i]:
+            if any(start <= i < end for start, end in tracts):
+                return None
+            merged[i] = "N"
+        elif quality_b[i] > quality_a[i]:
+            merged[i] = base_b
+    return "".join(merged)
+
+
+def _polyg_qualities(
+    alignment: pysam.AlignedSegment,
+    start: int,
+    end: int,
+    ref_orientation: str,
+) -> Sequence[int] | None:
+    """Base qualities of an alignment on ``[start, end)``, in polyG orientation.
+
+    `start` and `end` index the polyG-orientation read. Only a pair whose
+    tracts differ reads them, so the qualities of the other reads are
+    never decoded.
+    """
+    qualities = alignment.query_qualities
+    if qualities is None:
+        return None
+    if ref_orientation == "-":
+        qualities = qualities[::-1]
+    return qualities[start:end]
+
+
+def _merge_pair_tracts(
+    pairs: Sequence[tuple[int, int]],
+    alignments: Sequence[pysam.AlignedSegment],
+    placement: FlankPlacement,
+    upstream: str,
+    downstream: str,
+    ref_orientation: str,
+) -> list[str | None]:
+    """The tract of each pair whose two mates have different tracts, or ``None``.
+
+    In each mate we take the stretch of the polyG-orientation read from the
+    outer base of the upstream flank match to the outer base of the
+    downstream flank match, at the mate's best placement. We merge the two
+    stretches by base quality (`_merge_by_quality`) and return the tract of
+    the best placement of the two flanks in the merged stretch. A misread
+    first or last G of the tract can end a mate's flank match one base
+    later and shorten its tract by one base, while its stretch keeps the
+    length of the other mate's stretch. We mark every base of a merged
+    stretch as aligned inside the BED interval, because each mate's tract
+    lies inside its stretch and holds such a base. The caller drops a
+    pair with ``None``: the two stretches cannot be merged, or the merged
+    stretch has no tract with a value of at least 0. An N that the merge
+    writes at a tied flank base counts as a substitution in the flank match.
+
+    Parameters
+    ----------
+    pairs : sequence of (int, int)
+        The two mates of each pair, as indices into `alignments` and
+        `placement`. Both mates are kept.
+    alignments : sequence of pysam.AlignedSegment
+        The reads that `placement` placed.
+    placement : FlankPlacement
+        The placement of `alignments` under the two flanks.
+    upstream, downstream : str
+        The locus's two flanks.
+    ref_orientation : str
+        "+" if the repeat reads as Gs on the reference, "-" otherwise.
+    """
+    if not pairs:
+        return []
+    index = np.asarray([i for pair in pairs for i in pair], dtype=np.int64)
+    reads = polyg_reads([alignments[i].query_sequence for i in index], ref_orientation)
+    up_outer, dn_outer = flank_outer_bases(reads, placement.take(index), upstream, downstream)
+    merged: list[str | None] = []
+    for k in range(len(pairs)):
+        stretches, qualities, tracts = [], [], []
+        for j in (2 * k, 2 * k + 1):
+            start, end = int(up_outer[j]), int(dn_outer[j]) + 1
+            stretches.append(reads[j][start:end])
+            qualities.append(_polyg_qualities(alignments[index[j]], start, end, ref_orientation))
+            i = index[j]
+            tracts.append((int(placement.upstream_run_side[i]) + 1 - start,
+                           int(placement.downstream_run_side[i]) - start))
+        merged.append(_merge_by_quality(*stretches, *qualities, tracts))
+    rows = [k for k, m in enumerate(merged) if m is not None]
+    out: list[str | None] = [None] * len(pairs)
+    if rows:
+        stretches = [merged[k] for k in rows]
+        placed = place_polyg_reads(stretches, upstream, downstream,
+                                   [((0, len(m)),) for m in stretches])
+        for row, k in enumerate(rows):
+            if placed.kept[row]:
+                out[k] = placed.tracts[row]
+    return out
+
+
 def _merge_pair_flanking(
     mates: list[tuple[FlankingSide, FlankingSide]],
 ) -> tuple[FlankingSide, FlankingSide]:
@@ -355,63 +623,32 @@ def _merge_pair_flanking(
     return _consensus(up_a, up_b), _consensus(dn_a, dn_b)
 
 
-def _extract_locus(
+def filtered_alignments(
     bam: pysam.AlignmentFile,
     chrom: str,
+    fetch_start: int,
+    fetch_end: int,
     bed_start: int,
     bed_end: int,
     *,
-    ref_orientation: str,
-    anchor_up: str,
-    anchor_dn: str,
-    anchor_k: int,
-    g_walk_up: int,
-    g_walk_dn: int,
     min_mapq: int,
     drop_chimeric: bool,
     max_tlen: int,
-    anchor_hamming_max: int,
-    min_base_q: int,
-) -> tuple[Counter, list[str], int, int, dict]:
-    """Extract reads at one locus.
+    qc: dict,
+) -> Iterator[tuple[pysam.AlignedSegment, bool]]:
+    """Alignments in the fetch window that pass the extraction's read filters.
 
-    Returns ``(read_counts, flanking_seqs, flanking_up_width,
-    flanking_dn_width, qc)``. ``read_counts`` is a
-    ``Counter[(mi, strand, seq, flanking_id)]`` of accepted reads
-    (post-pair-collapse); ``flanking_seqs`` is the per-locus deduped
-    flanking string list (indexed by ``flanking_id``), each of the form
-    ``up_seq + "|" + dn_seq`` with ``.`` for uncovered/low-Q positions.
-    ``flanking_up_width`` / ``flanking_dn_width`` are the per-locus
-    extents observed.
+    Yields ``(alignment, bed_overlap)`` in fetch order. The filters drop
+    unmapped, secondary and supplementary alignments, mapping quality
+    below `min_mapq`, an SA tag (when `drop_chimeric`), ``|TLEN| >
+    max_tlen`` and an empty stored sequence. An alignment that overlaps
+    the BED interval must also carry an MI tag. For alignments that
+    overlap the BED interval, the filters add to the
+    ``n_alignments_overlap_locus`` and
+    ``n_alignments_drop_{mapq,sa,tlen,no_mi}`` counters in `qc`. The
+    overlapping alignments it yields are the overlap count less these four
+    drops.
     """
-    qc = {
-        "n_alignments_overlap_locus": 0,
-        "n_alignments_drop_mapq": 0,
-        "n_alignments_drop_sa": 0,
-        "n_alignments_drop_tlen": 0,
-        "n_alignments_drop_anchor": 0,
-        "n_read_pairs": 0,
-        "n_read_pairs_drop_disagree": 0,
-    }
-
-    # Wide fetch: ``bed ± max_tlen`` so the mate of a bed-spanning read is
-    # visible even if its alignment lies fully outside the polyG bed. With
-    # paired-end Illumina at insert sizes up to ``max_tlen``, a fragment's
-    # far mate sits at most ``max_tlen`` bp from any base of its pair, so
-    # this window captures every relevant mate. Bed-spanning vs
-    # flanking-only is decided per-alignment by reference-interval
-    # overlap; the anchor check runs only on bed-spanning mates, since a
-    # flanking-only mate cannot contain both anchors by construction.
-    fetch_start = max(0, bed_start - max_tlen)
-    fetch_end = bed_end + max_tlen
-
-    # First pass: keep every alignment that clears the alignment-level
-    # filters, in fetch order, tagged bed-spanning or flanking-only. The
-    # anchor placement is deferred to one batched Hamming search over all
-    # bed-spanning reads of this locus, so it is not decided here.
-    candidates: list[tuple[pysam.AlignedSegment, str | None]] = []
-    bed_seqs: list[str] = []
-
     for r in bam.fetch(chrom, fetch_start, fetch_end):
         if r.flag & _DROP_FLAGS:
             continue
@@ -448,60 +685,145 @@ def _extract_locus(
         if bed_overlap:
             qc["n_alignments_overlap_locus"] += 1
             if not r.has_tag("MI"):
+                qc["n_alignments_drop_no_mi"] += 1
                 continue
-            seq = r.query_sequence.upper()
-            if ref_orientation == "-":
-                seq = revcomp(seq)
-            candidates.append((r, seq))
-            bed_seqs.append(seq)
-        else:
-            candidates.append((r, None))
+        yield r, bed_overlap
 
-    # Anchor placement for every bed-spanning read of this locus at once.
+
+
+
+def new_locus_qc() -> dict[str, int]:
+    """Zeroed per-locus QC counters of one extraction."""
+    return {
+        "n_alignments_overlap_locus": 0,
+        "n_alignments_drop_mapq": 0,
+        "n_alignments_drop_sa": 0,
+        "n_alignments_drop_tlen": 0,
+        "n_alignments_drop_no_mi": 0,
+        "n_alignments_placed": 0,
+        "n_alignments_drop_flank": 0,
+        "n_alignments_drop_upstream_flank_not_placed": 0,
+        "n_alignments_drop_downstream_flank_not_placed": 0,
+        "n_alignments_drop_no_placement": 0,
+        "n_alignments_drop_no_bed_base": 0,
+        "n_alignments_drop_negative_value": 0,
+        "n_read_pairs": 0,
+        "n_read_pairs_drop_disagree": 0,
+        "n_read_pairs_merged": 0,
+    }
+
+
+def _count_flank_drops(placement: FlankPlacement, qc: dict) -> None:
+    """Add the placed reads and the flank drops of one locus to `qc`.
+
+    ``n_alignments_placed`` counts the reads with at least one placement,
+    of any value. A read with no match of a flank adds to that side's
+    ``flank_not_placed`` counter; a read with no match on both sides adds
+    to both. A read with both matches adds to exactly one of these, or is
+    kept: ``no_placement`` when no upstream match ends before a downstream
+    match starts; ``no_bed_base`` when such pairs exist but none holds a
+    base aligned inside the BED interval; ``negative_value`` when its best
+    value is negative. ``n_alignments_drop_flank`` counts each dropped read
+    once.
+    """
+    qc["n_alignments_placed"] += int(placement.placed.sum())
+    qc["n_alignments_drop_flank"] += int((~placement.kept).sum())
+    qc["n_alignments_drop_upstream_flank_not_placed"] += int(
+        (~placement.upstream_matched).sum())
+    qc["n_alignments_drop_downstream_flank_not_placed"] += int(
+        (~placement.downstream_matched).sum())
+    qc["n_alignments_drop_no_placement"] += int(placement.no_placement.sum())
+    qc["n_alignments_drop_no_bed_base"] += int(placement.no_bed_base.sum())
+    qc["n_alignments_drop_negative_value"] += int(placement.negative_value.sum())
+
+
+def _extract_locus(
+    bam: pysam.AlignmentFile,
+    chrom: str,
+    bed_start: int,
+    bed_end: int,
+    *,
+    geometry: LocusGeometry,
+    min_mapq: int,
+    drop_chimeric: bool,
+    max_tlen: int,
+    min_base_q: int,
+) -> tuple[Counter, list[str], int, int, dict]:
+    """Extract reads at one locus.
+
+    Returns ``(read_counts, flanking_seqs, flanking_up_width,
+    flanking_dn_width, qc)``. ``read_counts`` is a
+    ``Counter[(mi, strand, seq, flanking_id)]`` of accepted reads
+    (post-pair-collapse); ``flanking_seqs`` is the per-locus deduped
+    flanking string list (indexed by ``flanking_id``), each of the form
+    ``up_seq + "|" + dn_seq`` with ``.`` for uncovered/low-Q positions.
+    ``flanking_up_width`` / ``flanking_dn_width`` are the per-locus
+    extents observed.
+    """
+    qc = new_locus_qc()
+    ref_orientation = geometry.ref_orientation
+    lo, hi = geometry.flanked_interval
+
+    # Wide fetch: ``bed ± max_tlen`` so the mate of a bed-spanning read is
+    # visible even if its alignment lies fully outside the polyG bed. With
+    # paired-end Illumina at insert sizes up to ``max_tlen``, a fragment's
+    # far mate sits at most ``max_tlen`` bp from any base of its pair, so
+    # this window captures every relevant mate. Bed-spanning vs
+    # flanking-only is decided per-alignment by reference-interval
+    # overlap; the flank placement runs only on bed-spanning mates, since
+    # a flanking-only mate does not cover the repeat.
+    fetch_start = max(0, bed_start - max_tlen)
+    fetch_end = bed_end + max_tlen
+
+    # First pass: keep every alignment that clears the alignment-level
+    # filters, in fetch order, tagged bed-spanning or flanking-only. The
+    # flank placement runs once over all bed-spanning reads of this locus.
+    candidates: list[tuple[pysam.AlignedSegment, bool]] = []
+    bed_alignments: list[pysam.AlignedSegment] = []
+
+    for r, bed_overlap in filtered_alignments(
+        bam, chrom, fetch_start, fetch_end, bed_start, bed_end,
+        min_mapq=min_mapq, drop_chimeric=drop_chimeric, max_tlen=max_tlen, qc=qc,
+    ):
+        candidates.append((r, bed_overlap))
+        if bed_overlap:
+            bed_alignments.append(r)
+
+    placement = place_locus_flanks(bed_alignments, geometry, bed_start, bed_end)
+    _count_flank_drops(placement, qc)
     # Read back as Python lists: the pass below indexes them one read at
     # a time, and unboxing a numpy scalar per read costs more than the
     # whole conversion.
-    up_distances, up_offsets = hamming_search(bed_seqs, anchor_up)
-    dn_distances, dn_offsets = hamming_search(bed_seqs, anchor_dn)
-    up_distances = up_distances.tolist()
-    up_offsets = up_offsets.tolist()
-    dn_distances = dn_distances.tolist()
-    dn_offsets = dn_offsets.tolist()
+    kept = placement.kept.tolist()
+    tracts = placement.tracts.tolist()
 
-    # Second pass, still in fetch order: apply the anchor and MI decisions
+    # Second pass, still in fetch order: apply the flank and MI decisions
     # and group by query_name for pair-collapse. Each entry is
     #   (bed_mate, flanking_only_alignment)
-    # with exactly one of the two set. `bed_mate` is a 5-tuple
-    # ``(mi_prefix, strand, ia_seq, up_side, dn_side)``. A flanking-only
-    # alignment is carried as-is and its flanking is computed later, and
-    # only if the fragment turns out to have a bed-spanning mate to
-    # attach it to: most flanking-only alignments in the ``± max_tlen``
-    # window belong to fragments that never reach the polyG, and
-    # computing their flanking here is the single largest source of
-    # wasted work at a locus.
+    # with exactly one of the two set. `bed_mate` is a 6-tuple
+    # ``(mi_prefix, strand, tract, up_side, dn_side, index)``, where `index`
+    # is the read's entry in `bed_alignments` and `placement`. A
+    # flanking-only alignment is carried as-is and its flanking is
+    # computed later, and only if the fragment turns out to have a
+    # bed-spanning mate to attach it to: most flanking-only alignments in
+    # the ``± max_tlen`` window belong to fragments that never reach the
+    # polyG, and computing their flanking here is the single largest
+    # source of wasted work at a locus.
     by_qn: dict[
         str,
         list[tuple[tuple | None, pysam.AlignedSegment | None]],
     ] = defaultdict(list)
 
     bed_index = 0
-    for r, seq in candidates:
-        if seq is None:
+    for r, bed_overlap in candidates:
+        if not bed_overlap:
             by_qn[r.query_name].append((None, r))
             continue
 
         i = bed_index
         bed_index += 1
-        if up_distances[i] > anchor_hamming_max or dn_distances[i] > anchor_hamming_max:
-            qc["n_alignments_drop_anchor"] += 1
+        if not kept[i]:
             continue
-
-        ia_start = up_offsets[i] + anchor_k
-        ia_end = dn_offsets[i]
-        if ia_end < ia_start:
-            qc["n_alignments_drop_anchor"] += 1
-            continue
-        ia_seq = seq[ia_start:ia_end]
 
         try:
             mi_tag = r.get_tag("MI")
@@ -512,26 +834,30 @@ def _extract_locus(
             continue
 
         up_flank, dn_flank = _alignment_flanking(
-            r,
-            bed_start=bed_start, bed_end=bed_end,
-            g_walk_up=g_walk_up, g_walk_dn=g_walk_dn,
-            anchor_k=anchor_k,
-            ref_orientation=ref_orientation,
-            min_base_q=min_base_q,
+            r, lo=lo, hi=hi, ref_orientation=ref_orientation, min_base_q=min_base_q,
         )
-        by_qn[r.query_name].append(((mi_prefix, strand, ia_seq, up_flank, dn_flank), None))
+        by_qn[r.query_name].append(
+            ((mi_prefix, strand, tracts[i], up_flank, dn_flank, i), None)
+        )
 
     # Pair-collapse: group by query_name. Drop qns with no bed-spanning
     # mate (the fragment never reached the polyG and can't be assigned an
     # MI/strand/length), then drop >2-mate groups. A flanking-only mate
-    # that covers nothing outside the anchors is not a mate at all, so it
-    # is dropped before the group-size test. Pair-disagreement checks
-    # only apply when both mates are bed-spanning. Flanking sides are
+    # that covers nothing outside the flanks is not a mate at all, so it
+    # is dropped before the group-size test. Tract disagreement checks
+    # only apply when both mates are bed-spanning: two different tracts
+    # are merged by base quality over the mates' flank-to-flank stretches
+    # (`_merge_pair_tracts`, once for all such pairs of the locus), and a
+    # failed merge drops the pair. Flanking
+    # sides are
     # pair-merged with per-position consensus (drop on disagreement); a
     # bed-spanning + flanking-only pair has no disagreement possible at
     # any single position the flanking-only mate covers — both feed into
     # the merge as today.
-    accepted: list[tuple[str, str, str, FlankingSide, FlankingSide]] = []
+    accepted: list[tuple[str, str, str | None, FlankingSide, FlankingSide]] = []
+    # Pairs with two different tracts: their entry in `accepted` and their
+    # two mates' indices. Their tract is set after the loop.
+    to_merge: list[tuple[int, tuple[int, int]]] = []
     for _qn, mates in by_qn.items():
         bed_mates = [bed for bed, _ in mates if bed is not None]
         if not bed_mates:
@@ -541,11 +867,7 @@ def _extract_locus(
             if alignment is None:
                 continue
             up_flank, dn_flank = _alignment_flanking(
-                alignment,
-                bed_start=bed_start, bed_end=bed_end,
-                g_walk_up=g_walk_up, g_walk_dn=g_walk_dn,
-                anchor_k=anchor_k,
-                ref_orientation=ref_orientation,
+                alignment, lo=lo, hi=hi, ref_orientation=ref_orientation,
                 min_base_q=min_base_q,
             )
             if up_flank[1] or dn_flank[1]:
@@ -557,19 +879,32 @@ def _extract_locus(
         if len(prefs) != 1 or len(strands) != 1:
             continue
         qc["n_read_pairs"] += 1
-        if len(bed_mates) == 2 and bed_mates[0][2] != bed_mates[1][2]:
-            qc["n_read_pairs_drop_disagree"] += 1
-            continue
+        tract = bed_mates[0][2]
+        if len(bed_mates) == 2 and tract != bed_mates[1][2]:
+            to_merge.append((len(accepted), (bed_mates[0][5], bed_mates[1][5])))
+            tract = None
         up_merged, dn_merged = _merge_pair_flanking(
             [(m[3], m[4]) for m in bed_mates] + flank_sides
         )
-        accepted.append((bed_mates[0][0], bed_mates[0][1], bed_mates[0][2], up_merged, dn_merged))
+        accepted.append((bed_mates[0][0], bed_mates[0][1], tract, up_merged, dn_merged))
+    merged_tracts = _merge_pair_tracts(
+        [pair for _, pair in to_merge], bed_alignments, placement,
+        geometry.upstream.bases, geometry.downstream.bases, ref_orientation,
+    )
+    for (entry, _), merged_tract in zip(to_merge, merged_tracts, strict=True):
+        if merged_tract is None:
+            qc["n_read_pairs_drop_disagree"] += 1
+        else:
+            qc["n_read_pairs_merged"] += 1
+            accepted[entry] = (accepted[entry][0], accepted[entry][1], merged_tract,
+                               *accepted[entry][3:])
+    accepted = [a for a in accepted if a[2] is not None]
 
     # Determine per-locus flanking widths: max distance seen across all
     # accepted reads, on each side.
     flanking_up_width = 0
     flanking_dn_width = 0
-    for _mi, _strand, _ia, (up_start, up_text), (dn_start, dn_text) in accepted:
+    for _mi, _strand, _tract, (up_start, up_text), (dn_start, dn_text) in accepted:
         up_extent = up_start + len(up_text)
         if up_extent > flanking_up_width:
             flanking_up_width = up_extent
@@ -592,7 +927,7 @@ def _extract_locus(
     flanking_seqs: list[str] = []
     flanking_sides_to_id: dict[tuple[FlankingSide, FlankingSide], int] = {}
     read_counts: Counter = Counter()
-    for mi_, strand_, ia_, up, dn in accepted:
+    for mi_, strand_, tract_, up, dn in accepted:
         fid = flanking_sides_to_id.get((up, dn))
         if fid is None:
             up_start, up_text = up
@@ -610,7 +945,7 @@ def _extract_locus(
                 dn_dots[:flanking_dn_width - dn_start - len(dn_text)],
             )))
             flanking_sides_to_id[(up, dn)] = fid
-        read_counts[(mi_, strand_, ia_, fid)] += 1
+        read_counts[(mi_, strand_, tract_, fid)] += 1
 
     return read_counts, flanking_seqs, flanking_up_width, flanking_dn_width, qc
 
@@ -627,29 +962,38 @@ def _prolyg_version() -> str:
         return "unknown"
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def extract_panel(
     bam_path: str | Path,
     bed_path: str | Path,
+    flanks_path: str | Path,
     *,
     min_mapq: int = 40,
     drop_chimeric: bool = True,
     max_tlen: int = 1000,
-    anchor_hamming_max: int = 1,
-    pair_disagreement_policy: str = "drop",
     n_alleles_margin: int = 1,
     min_base_q: int = DEFAULT_MIN_FLANKING_BASE_Q,
     verbose: bool = False,
 ) -> ExtractedPanel:
     """Walk a BAM against a BED and produce an in-memory `ExtractedPanel`.
 
-    Two passes per locus:
+    Per locus:
 
-    1. Reconstruct the reference window from MD tags, determine
-       polyG-canonical orientation, and try to build upstream +
-       downstream anchors.
-    2. If anchorable, fetch alignments overlapping the BED interval,
-       apply parser-side QC filters, pair-collapse R1+R2 by
-       `query_name`, and emit per-(MI, strand, seq) read counts.
+    1. Reconstruct the reference window from MD tags and determine the
+       polyG-canonical orientation. A locus with no flank in the flank
+       table (no reference window or no flank pair in the matched normal)
+       gets that status and no reads.
+    2. If the window is recovered, fetch alignments overlapping the BED
+       interval, apply parser-side QC filters, place both flanks in each
+       read, pair-collapse R1+R2 by `query_name`, and emit per-(MI,
+       strand, seq) read counts.
 
     `n_alleles` is set to `max_observed_run_length + n_alleles_margin`,
     where the max is taken across all parsed reads in all loci. Reads
@@ -663,19 +1007,16 @@ def extract_panel(
         Sorted, indexed BAM. Must carry MD tags and MI tags.
     bed_path : path
         4-column BED: `chrom\\tstart\\tend\\tname`.
+    flanks_path : path
+        The per-side flank table that ``prolyg-phasing build-flanks``
+        writes for this donor's matched normal. It must hold exactly the
+        loci of the BED.
     min_mapq : int, default 40
         Drop alignments with `mapping_quality < min_mapq`.
     drop_chimeric : bool, default True
         Drop alignments with an SA tag.
     max_tlen : int, default 1000
         Drop alignments with `|TLEN| > max_tlen`.
-    anchor_hamming_max : int, default 1
-        Cap on per-anchor Hamming distance for accepted placement.
-    pair_disagreement_policy : str, default "drop"
-        Currently only ``"drop"`` is supported. R1+R2 pairs with
-        different inter-anchor `seq` are dropped and counted in
-        `n_read_pairs_drop_disagree`. Future policies may add
-        ``"r1"`` / ``"keep_both"`` on demand.
     n_alleles_margin : int, default 1
         Headroom over `max_observed_run_length` when setting panel-
         wide `n_alleles`. `1` matches the current SD14 convention.
@@ -687,100 +1028,188 @@ def extract_panel(
     Returns
     -------
     ExtractedPanel
+
+    Raises
+    ------
+    ValueError
+        When the flank table and the BED do not hold the same loci.
+    RuntimeError
+        When a flank position breaks an invariant of build-flanks (see
+        :func:`locus_geometry`).
     """
-    if pair_disagreement_policy != "drop":
-        raise NotImplementedError(
-            f"pair_disagreement_policy={pair_disagreement_policy!r} not supported; "
-            "only 'drop' is implemented."
-        )
-
-    bam_path = Path(bam_path)
-    bed_path = Path(bed_path)
-
+    bam_path, bed_path, flanks_path = Path(bam_path), Path(bed_path), Path(flanks_path)
     bed_rows = _load_bed(bed_path)
+    flank_table = _flank_table_for(flanks_path, bed_rows)
+    settings = _ExtractionSettings(min_mapq, drop_chimeric, max_tlen, min_base_q)
 
-    bam = pysam.AlignmentFile(str(bam_path), "rb")
-
-    # One pass: extract a locus and immediately turn it into its
-    # `ExtractedLocus`, so the locus's `Counter` — one 4-tuple key per
-    # deduped row, and a full panel has millions of them — is released
-    # before the next locus starts. Holding every locus's Counter across
-    # a second pass kept those tuples alive to the end of the run, which
-    # both raised peak memory and made every cyclic-collection pass walk
-    # them again.
     loci: dict[str, ExtractedLocus] = {}
     max_observed_run_length = 0
+    bed_iter = tqdm(bed_rows, desc="extract_panel", unit="locus") if verbose else bed_rows
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        for row in bed_iter:
+            locus = _extract_bed_locus(bam, row, flank_table, settings)
+            loci[row[0]] = locus
+            max_observed_run_length = max(max_observed_run_length,
+                                          locus.max_observed_run_length)
+    return ExtractedPanel(
+        loci=loci, n_alleles=max_observed_run_length + n_alleles_margin,
+        provenance=_provenance(bam_path, bed_path, flanks_path, flank_table, settings,
+                               n_alleles_margin))
 
-    bed_iter = (
-        tqdm(bed_rows, desc="extract_panel", unit="locus") if verbose else bed_rows
-    )
 
-    try:
-        for name, chrom, bed_start, bed_end in bed_iter:
-            anchor = _build_anchors_for_locus(
-                bam, chrom, bed_start, bed_end,
-                pad=REF_WINDOW_PAD, k=FLANKING_SEQ_LEN, min_mapq=min_mapq,
-            )
+def extract_panel_to_db(
+    bam_path: str | Path,
+    bed_path: str | Path,
+    flanks_path: str | Path,
+    out_db: str | Path,
+    *,
+    n_workers: int,
+    min_mapq: int = 40,
+    drop_chimeric: bool = True,
+    max_tlen: int = 1000,
+    n_alleles_margin: int = 1,
+    min_base_q: int = DEFAULT_MIN_FLANKING_BASE_Q,
+    verbose: bool = False,
+) -> int:
+    """Extract every BED locus in `n_workers` processes and write ``panel.db``.
 
-            if anchor.status != "anchorable":
-                counts: Counter = Counter()
-                flanking_seqs: list[str] = []
-                up_width = 0
-                dn_width = 0
-                qc = {
-                    "n_alignments_overlap_locus": 0,
-                    "n_alignments_drop_mapq": 0,
-                    "n_alignments_drop_sa": 0,
-                    "n_alignments_drop_tlen": 0,
-                    "n_alignments_drop_anchor": 0,
-                    "n_read_pairs": 0,
-                    "n_read_pairs_drop_disagree": 0,
-                }
-            else:
-                counts, flanking_seqs, up_width, dn_width, qc = _extract_locus(
-                    bam, chrom, bed_start, bed_end,
-                    ref_orientation=anchor.ref_orientation,
-                    anchor_up=anchor.upstream_anchor,
-                    anchor_dn=anchor.downstream_anchor,
-                    anchor_k=FLANKING_SEQ_LEN,
-                    g_walk_up=anchor.g_walk_up,
-                    g_walk_dn=anchor.g_walk_dn,
-                    min_mapq=min_mapq,
-                    drop_chimeric=drop_chimeric,
-                    max_tlen=max_tlen,
-                    anchor_hamming_max=anchor_hamming_max,
-                    min_base_q=min_base_q,
-                )
+    The panel equals ``extract_panel(...).save_db(out_db)`` with the same
+    arguments. Each worker opens the BAM once and extracts one locus at a
+    time; it sends back the locus's encoded table row. This process writes
+    each row as it arrives, in BED order, and keeps only the largest
+    observed run length, which sets ``n_alleles``. No process holds the
+    whole panel. Returns the number of loci.
+    """
+    bam_path, bed_path, flanks_path = Path(bam_path), Path(bed_path), Path(flanks_path)
+    bed_rows = _load_bed(bed_path)
+    flank_table = _flank_table_for(flanks_path, bed_rows)
+    settings = _ExtractionSettings(min_mapq, drop_chimeric, max_tlen, min_base_q)
+    # Open the BAM here first: a worker whose start-up fails is restarted by
+    # the pool without end, so an unreadable BAM must fail before the pool.
+    pysam.AlignmentFile(str(bam_path), "rb").close()
+    max_observed_run_length = 0
+    n_workers = max(1, min(n_workers, len(bed_rows)))
+    with PanelWriter(out_db) as writer, Pool(
+            n_workers, initializer=_open_extract_worker,
+            initargs=(str(bam_path), str(flanks_path), settings)) as pool:
+        results = pool.imap(_extract_worker_row, bed_rows, chunksize=1)
+        if verbose:
+            results = tqdm(results, total=len(bed_rows), desc="extract_panel", unit="locus")
+        for name, row, max_run in results:
+            writer.add_row(name, row)
+            max_observed_run_length = max(max_observed_run_length, max_run)
+        writer.finish(max_observed_run_length + n_alleles_margin,
+                      _provenance(bam_path, bed_path, flanks_path, flank_table, settings,
+                                  n_alleles_margin))
+    return len(bed_rows)
 
-            locus = _build_locus(
-                name, chrom, bed_start, bed_end,
-                anchor=anchor, counts=counts, qc=qc,
-                flanking_seqs=flanking_seqs, up_width=up_width, dn_width=dn_width,
-            )
-            loci[name] = locus
-            if locus.max_observed_run_length > max_observed_run_length:
-                max_observed_run_length = locus.max_observed_run_length
-    finally:
-        bam.close()
 
-    n_alleles = max_observed_run_length + n_alleles_margin
+@dataclasses.dataclass(frozen=True)
+class _ExtractionSettings:
+    """The read filters of one extraction."""
 
-    provenance = ExtractionProvenance(
+    min_mapq: int
+    drop_chimeric: bool
+    max_tlen: int
+    min_base_q: int
+
+
+def _flank_table_for(flanks_path: Path, bed_rows: Sequence[tuple[str, str, int, int]]
+                     ) -> FlankTable:
+    """The flank table, checked to hold exactly the BED loci."""
+    flank_table = read_flank_table(flanks_path)
+    bed_names = [name for name, *_ in bed_rows]
+    missing = [name for name in bed_names if name not in flank_table.loci]
+    if missing:
+        raise ValueError(f"{flanks_path}: no flanks for {len(missing)} BED loci: "
+                         f"{missing[:10]}")
+    extra = sorted(flank_table.loci - set(bed_names))
+    if extra:
+        raise ValueError(f"{flanks_path}: flanks for {len(extra)} loci not in the BED: "
+                         f"{extra[:10]}")
+    return flank_table
+
+
+def _provenance(bam_path: Path, bed_path: Path, flanks_path: Path, flank_table: FlankTable,
+                settings: _ExtractionSettings, n_alleles_margin: int) -> ExtractionProvenance:
+    return ExtractionProvenance(
         bam_path=str(bam_path),
         bed_path=str(bed_path),
+        flank_table_path=str(flanks_path),
+        flank_table_sha256=_file_sha256(flanks_path),
+        flank_table_sample=flank_table.sample,
         extraction_version=_prolyg_version(),
         extraction_date=datetime.date.today().isoformat(),
-        min_mapq=min_mapq,
-        drop_chimeric=drop_chimeric,
-        max_tlen=max_tlen,
-        anchor_hamming_max=anchor_hamming_max,
-        pair_disagreement_policy=pair_disagreement_policy,
+        min_mapq=settings.min_mapq,
+        drop_chimeric=settings.drop_chimeric,
+        max_tlen=settings.max_tlen,
+        pair_disagreement_policy=PAIR_DISAGREEMENT_POLICY,
         n_alleles_margin=n_alleles_margin,
-        min_base_q=min_base_q,
+        min_base_q=settings.min_base_q,
         extraction_schema_version=EXTRACTION_SCHEMA_VERSION,
     )
 
-    return ExtractedPanel(loci=loci, n_alleles=n_alleles, provenance=provenance)
+
+def _extract_bed_locus(bam: pysam.AlignmentFile, row: tuple[str, str, int, int],
+                       flank_table: FlankTable, settings: _ExtractionSettings
+                       ) -> ExtractedLocus:
+    """One BED locus of one BAM as its `ExtractedLocus`.
+
+    The locus's read `Counter` is released when this returns, before the
+    next locus starts.
+    """
+    name, chrom, bed_start, bed_end = row
+    # A locus has no geometry when the matched normal had no reference
+    # window or no flank pair, so it has no flanks, or when this BAM has no
+    # reference window.
+    if name in flank_table.no_flank_pair:
+        flanks = geometry = None
+        no_geometry_status = NO_FLANK_PAIR
+    elif name in flank_table.no_reference_window:
+        flanks = geometry = None
+        no_geometry_status = WINDOW_UNRECOVERABLE
+    else:
+        no_geometry_status = WINDOW_UNRECOVERABLE
+        flanks = flank_table.records[name]
+        geometry = locus_geometry(bam, name, chrom, bed_start, bed_end, flanks,
+                                  min_mapq=settings.min_mapq)
+    if geometry is None:
+        counts: Counter = Counter()
+        flanking_seqs: list[str] = []
+        up_width = dn_width = 0
+        qc = new_locus_qc()
+    else:
+        counts, flanking_seqs, up_width, dn_width, qc = _extract_locus(
+            bam, chrom, bed_start, bed_end,
+            geometry=geometry,
+            min_mapq=settings.min_mapq,
+            drop_chimeric=settings.drop_chimeric,
+            max_tlen=settings.max_tlen,
+            min_base_q=settings.min_base_q,
+        )
+    return _build_locus(
+        name, chrom, bed_start, bed_end,
+        flanks=flanks, geometry=geometry, no_geometry_status=no_geometry_status,
+        counts=counts, qc=qc,
+        flanking_seqs=flanking_seqs, up_width=up_width, dn_width=dn_width,
+    )
+
+
+_EXTRACT_WORKER: dict = {}
+
+
+def _open_extract_worker(bam_path: str, flanks_path: str,
+                         settings: _ExtractionSettings) -> None:
+    _EXTRACT_WORKER["bam"] = pysam.AlignmentFile(bam_path, "rb")
+    _EXTRACT_WORKER["flank_table"] = read_flank_table(flanks_path)
+    _EXTRACT_WORKER["settings"] = settings
+
+
+def _extract_worker_row(row: tuple[str, str, int, int]) -> tuple[str, list, int]:
+    """One locus in a worker: its id, its encoded table row, its largest run."""
+    locus = _extract_bed_locus(_EXTRACT_WORKER["bam"], row, _EXTRACT_WORKER["flank_table"],
+                               _EXTRACT_WORKER["settings"])
+    return row[0], encode_locus_row(locus), locus.max_observed_run_length
 
 
 def _build_locus(
@@ -789,7 +1218,9 @@ def _build_locus(
     bed_start: int,
     bed_end: int,
     *,
-    anchor: AnchorResult,
+    flanks: tuple[FlankRecord, FlankRecord] | None,
+    geometry: LocusGeometry | None,
+    no_geometry_status: str,
     counts: Counter,
     qc: dict,
     flanking_seqs: list[str],
@@ -804,13 +1235,16 @@ def _build_locus(
     is kept as diagnostic context but is not authoritative for $S_i$ —
     the inference adapter (prolyG's ``to_loci``) recomputes the
     locus-level run count from the observed patterns, and extraction
-    stays faithful with no pattern filter here.
-    """
-    if anchor.ref_inter_anchor_seq:
-        ref_run_lengths = parse_run_lengths(anchor.ref_inter_anchor_seq)
-    else:
-        ref_run_lengths = ()
+    stays faithful with no pattern filter here. `flanks` is None when the
+    matched normal had no reference window or no flank pair. `geometry` is
+    None then, or when the BAM does not rebuild the reference window of
+    the locus; the locus then has the status `no_geometry_status` and no
+    reads.
 
+    A side with no flanking bases for want of a position (no reference
+    window, no flank pair, or a flank with no reference position) has
+    width 0 and a start of -1, so it never reads as a coordinate.
+    """
     if counts:
         mi_arr = np.asarray([k[0] for k in counts], dtype=object)
         strand_arr = np.asarray([k[1] for k in counts], dtype="U1")
@@ -826,24 +1260,37 @@ def _build_locus(
 
     flanking_seq_arr = np.asarray(flanking_seqs, dtype=object)
 
-    if anchor.status == "anchorable":
-        if anchor.ref_orientation == "+":
-            flanking_up_ref_pos_start = (
-                bed_start - anchor.g_walk_up - FLANKING_SEQ_LEN - up_width
-            )
-            flanking_dn_ref_pos_start = (
-                bed_end + anchor.g_walk_dn + FLANKING_SEQ_LEN
-            )
+    if geometry is not None:
+        # With a flank that has no reference position, the reference tract
+        # and its run lengths are empty.
+        reference_tract = geometry.reference_tract
+        ref_run_lengths = parse_run_lengths(reference_tract) if reference_tract else ()
+        ref_orientation = geometry.ref_orientation
+        g_walk_up, g_walk_dn = geometry.g_walk_up, geometry.g_walk_dn
+        status = WINDOW_RECOVERED
+        # The flanking window starts past each flank's outer base. The
+        # upstream field is written most-distant-first, so its start is
+        # its most distant base. A side whose flank has no reference
+        # position has width 0 and start -1.
+        lo, hi = geometry.flanked_interval
+        if ref_orientation == "+":
+            flanking_up_ref_pos_start = lo - up_width
+            flanking_dn_ref_pos_start = hi
         else:
-            flanking_up_ref_pos_start = (
-                bed_end + anchor.g_walk_up + FLANKING_SEQ_LEN + up_width - 1
-            )
-            flanking_dn_ref_pos_start = (
-                bed_start - anchor.g_walk_dn - FLANKING_SEQ_LEN - 1
-            )
+            flanking_up_ref_pos_start = hi + up_width - 1
+            flanking_dn_ref_pos_start = lo - 1
+        if not geometry.upstream.has_position:
+            flanking_up_ref_pos_start = _NO_FLANKING_START
+        if not geometry.downstream.has_position:
+            flanking_dn_ref_pos_start = _NO_FLANKING_START
     else:
-        flanking_up_ref_pos_start = 0
-        flanking_dn_ref_pos_start = 0
+        reference_tract = ""
+        ref_run_lengths = ()
+        ref_orientation = ""
+        g_walk_up = g_walk_dn = 0
+        status = no_geometry_status
+        flanking_up_ref_pos_start = _NO_FLANKING_START
+        flanking_dn_ref_pos_start = _NO_FLANKING_START
 
     per_locus_max_n_runs = 0
     per_locus_max = 0
@@ -865,29 +1312,23 @@ def _build_locus(
         flanking_id=flanking_id_arr,
         flanking_seq=flanking_seq_arr,
         n_runs=n_runs,
-        ref_inter_anchor_seq=anchor.ref_inter_anchor_seq,
+        reference_tract=reference_tract,
         reference_run_lengths=ref_run_lengths,
         chrom=chrom,
         bed_start=bed_start,
         bed_end=bed_end,
         bed_name=name,
-        ref_orientation=anchor.ref_orientation,
-        upstream_anchor=anchor.upstream_anchor,
-        downstream_anchor=anchor.downstream_anchor,
-        anchorability_status=anchor.status,
+        ref_orientation=ref_orientation,
+        upstream_flank=None if flanks is None else flanks[0],
+        downstream_flank=None if flanks is None else flanks[1],
+        reference_window_status=status,
         max_observed_run_length=per_locus_max,
-        n_alignments_overlap_locus=qc["n_alignments_overlap_locus"],
-        n_alignments_drop_mapq=qc["n_alignments_drop_mapq"],
-        n_alignments_drop_sa=qc["n_alignments_drop_sa"],
-        n_alignments_drop_tlen=qc["n_alignments_drop_tlen"],
-        n_alignments_drop_anchor=qc["n_alignments_drop_anchor"],
-        n_read_pairs=qc["n_read_pairs"],
-        n_read_pairs_drop_disagree=qc["n_read_pairs_drop_disagree"],
         n_reads=int(count_arr.sum()),
-        g_walk_up=anchor.g_walk_up,
-        g_walk_dn=anchor.g_walk_dn,
+        g_walk_up=g_walk_up,
+        g_walk_dn=g_walk_dn,
         flanking_up_width=up_width,
         flanking_dn_width=dn_width,
         flanking_up_ref_pos_start=flanking_up_ref_pos_start,
         flanking_dn_ref_pos_start=flanking_dn_ref_pos_start,
+        **qc,
     )

@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PolyG Locus Reads</title>
+<style>
+/* Layout: a bench instrument. Locus list on the left, one locus read-out on the right; sequences in mono, bases in fixed colors. */
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --fg:#1b2330; --muted:#5d6878; --line:#dde2e9; --accent:#0f6e8c;
+  --chip:#eef2f6; --warn:#a85c00; --warnbg:#fff1dc; --bad:#a52a2a; --badbg:#fbe6e6; --ok:#2f6f3a; --okbg:#e3f2e5;
+  --bG:#c9ced6; --bA:#1b7a3a; --bC:#2f6fd0; --bT:#f07e6e; --bN:#222;
+  --flank:#4b5563; --tract:#aeb4bd; --anchor:#4b5563; --ins:#b02cb0;
+  --hmajor:#CC79A7; --hminor:#E69F00; --snvband:var(--fg);
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#12161c; --panel:#1a2029; --fg:#e4e9f0; --muted:#97a3b3; --line:#2c3440; --accent:#4fb3d4;
+  --chip:#242c37; --warn:#f0b35a; --warnbg:#3a2c16; --bad:#f08a8a; --badbg:#3c1f22; --ok:#8fd49a; --okbg:#1d3323;
+  --bG:#4a525e; --bA:#2a8442; --bC:#6a9cf0; --bT:#ffb0a4; --bN:#ddd;
+  --flank:#a7b0bb; --tract:#5f6873; --anchor:#aab4c2; --ins:#e070e0;
+  --hmajor:#e07fb0; --hminor:#f0b030; --snvband:var(--fg); color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#12161c; --panel:#1a2029; --fg:#e4e9f0; --muted:#97a3b3; --line:#2c3440; --accent:#4fb3d4;
+  --chip:#242c37; --warn:#f0b35a; --warnbg:#3a2c16; --bad:#f08a8a; --badbg:#3c1f22; --ok:#8fd49a; --okbg:#1d3323;
+  --bG:#4a525e; --bA:#2a8442; --bC:#6a9cf0; --bT:#ffb0a4; --bN:#ddd;
+  --flank:#a7b0bb; --tract:#5f6873; --anchor:#aab4c2; --ins:#e070e0;
+  --hmajor:#e07fb0; --hminor:#f0b030; --snvband:var(--fg); color-scheme:dark}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.45;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:14px}
+header{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;margin-bottom:12px}
+h1{font-size:18px;font-weight:600;margin:0;letter-spacing:.01em}
+h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:8px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg button{font:inherit;border:0;background:var(--panel);color:var(--fg);padding:5px 12px;cursor:pointer}
+.seg button[aria-pressed="true"]{background:var(--accent);color:var(--panel)}
+button:focus-visible,input:focus-visible,tr:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+input[type=search]{font:inherit;padding:5px 10px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--fg);width:12em}
+.main{display:grid;grid-template-columns:minmax(0,1fr);gap:16px;align-items:start}
+.list{background:var(--panel);border:1px solid var(--line);border-radius:8px;min-width:0}
+.filters{display:flex;flex-wrap:wrap;gap:6px;padding:10px}
+.filters button{font:inherit;font-size:12px;border:1px solid var(--line);background:var(--chip);color:var(--fg);border-radius:999px;padding:2px 10px;cursor:pointer}
+.filters button[aria-pressed="true"]{border-color:var(--accent);color:var(--accent);font-weight:600}
+.tablewrap{height:220px;overflow:auto;border-top:1px solid var(--line)}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{padding:4px 8px;text-align:left;border-bottom:1px solid var(--line);white-space:nowrap}
+th{position:sticky;top:0;background:var(--panel);font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);cursor:pointer;z-index:1}
+#loci tbody tr{cursor:pointer}
+#loci tbody tr:hover{background:var(--chip)}
+#loci tbody tr[aria-selected="true"]{background:var(--chip);box-shadow:inset 3px 0 0 var(--accent)}
+.num{text-align:right}
+#loci.side th.grp{text-align:center;cursor:default}
+#loci.side .ga{border-left:1px solid var(--line)}
+#loci .sname{display:inline-block;max-width:8em;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom;text-transform:none;letter-spacing:0;font-weight:400}
+.mono{font-family:var(--mono);font-size:12px}
+.pill{display:inline-block;font-size:11px;border-radius:4px;padding:0 6px;line-height:18px}
+.p-warn{background:var(--warnbg);color:var(--warn)} .p-bad{background:var(--badbg);color:var(--bad)} .p-ok{background:var(--okbg);color:var(--ok)} .p-n{background:var(--chip);color:var(--muted)}
+.detail{display:grid;gap:14px;min-width:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;min-width:0}
+.card h2{font-size:13px;margin:0 0 8px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+.lhead{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline}
+.lhead .name{font-size:22px;font-weight:600;font-family:var(--mono)}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:6px 18px;margin-top:8px}
+.kv div{min-width:0;overflow-wrap:anywhere} .kv .mono{word-break:break-all} .kv b{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:500}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
+.scroll{overflow-x:auto}
+.refstrip{font-family:var(--mono);font-size:13px;line-height:1}
+.seqcell{display:inline-block;width:12px;text-align:center}
+.legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--muted);margin-top:6px}
+.legend span i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+canvas{display:block}
+.tip{position:fixed;pointer-events:none;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:12px;box-shadow:0 4px 14px rgba(0,0,0,.18);max-width:min(90vw,640px);z-index:20}
+.tip .mono{word-break:break-all}
+.note{color:var(--muted);font-size:12px;max-width:95ch}
+.help{display:inline-block;width:15px;height:15px;line-height:15px;border-radius:50%;text-align:center;font-size:10px;background:var(--chip);color:var(--muted);cursor:help;text-transform:none;letter-spacing:0;vertical-align:1px}
+.sec{margin-top:10px}
+.counters tbody tr{cursor:help}
+.counters tbody tr:hover,.counters tbody tr:focus-visible{outline:1.5px solid var(--muted);outline-offset:-2px}
+.rowband{position:absolute;left:0;box-sizing:border-box;pointer-events:none;border:2px solid var(--fg);background:none;border-radius:2px}
+.pair{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px;align-items:stretch}
+.pair>.card,.pair>.slot{min-width:0;margin:0} .pair>.slot{display:block}
+.colhead{font-size:13px;font-weight:600}
+.zoomreset{font:inherit;font-size:11px;padding:0 8px;border:1px solid var(--line);border-radius:4px;background:var(--panel);color:var(--fg);cursor:pointer}
+.zoomreset:disabled{opacity:.4;cursor:default} .sec h3{font-size:12px;margin:0 0 4px;font-weight:600;display:flex;gap:8px;align-items:center}
+.sec h3 i{display:inline-block;width:10px;height:10px;border-radius:2px}
+#loading{color:var(--muted)}
+</style>
+<header>
+  <h1>PolyG Locus Reads <small>from panel.db · G strand</small></h1>
+  <div class="seg" role="group" aria-label="Sample" id="samples"></div>
+  <span id="pickers" hidden><select id="pickA" aria-label="Left sample"></select> <select id="pickB" aria-label="Right sample"></select></span>
+  <label class="note"><input type="checkbox" id="side"> side by side</label>
+  <input type="search" id="q" placeholder="Find locus, e.g. PolyG4320" aria-label="Find locus">
+  <label class="note">bases next to each flank <input type="number" id="near" min="0" max="50" step="1" style="width:4em"></label>
+</header>
+<p id="loading">Loading the locus list…</p>
+<div class="main" id="app" hidden>
+  <section class="list" aria-label="Loci">
+    <div class="filters" id="filters"></div>
+    <div class="tablewrap"><table id="loci"><thead><tr>
+      <th data-k="locus">Locus</th><th data-k="n_reads" class="num">Reads</th><th data-k="molecules" class="num">Molecules</th><th data-k="largest_run" class="num">Largest run</th><th data-k="snvs" class="num" id="snvhead">Phasing SNVs</th><th data-k="status">Status</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+  <section class="detail" id="detail"></section>
+</div>
+<div class="tip" id="tip" hidden></div>
+<script>
+// The page reads the locus list from /loci and one locus from /locus, served by
+// prolyg-phasing view-loci on the local machine.
+let LIST,sample=0,sample2=1,side=false,current=null,sortKey="locus",sortDir=1,filter="all";
+// sortCol is the side-by-side sub-column the list sorts on: 0 for the left
+// sample, 1 for the right one. One sample shown sorts on that sample.
+let sortCol=0,HEAD1;
+const $=s=>document.querySelector(s);
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const fmt=n=>n==null?"–":Number(n).toLocaleString();
+const pct=x=>x==null||!isFinite(x)?"–":(100*x).toFixed(1)+"%";
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const natural=new Intl.Collator(undefined,{numeric:true});
+function baseColor(b){return css({G:"--bG",A:"--bA",C:"--bC",T:"--bT"}[b]||"--bN")}
+function coord(orient,start,i){return orient==="-"?start-i:start+i}
+
+async function load(){
+  LIST=await (await fetch("loci")).json();
+  $("#loading").hidden=true; $("#app").hidden=false;
+  $("#near").value=LIST.near;
+  $("#near").addEventListener("change",renderDetail);
+  LIST.samples.forEach((s,k)=>{const b=document.createElement("button");b.textContent=s.sample;
+    b.onclick=()=>{sample=k;route()};$("#samples").appendChild(b);
+    for(const id of ["#pickA","#pickB"]){const o=document.createElement("option");o.value=k;o.textContent=s.sample;$(id).appendChild(o)}});
+  $("#pickA").onchange=()=>{sample=+$("#pickA").value;route()};
+  $("#pickB").onchange=()=>{sample2=+$("#pickB").value;route()};
+  $("#side").onchange=()=>{side=$("#side").checked;route()};
+  const F=[["all","All"],["noflank","No flank"],["noposition","Side with no position"],["noreads","No reads"]];
+  for(const [k,l] of F){const b=document.createElement("button");b.textContent=l;b.dataset.k=k;b.dataset.help=LIST.samples[0].help.filters[k]||"";b.onclick=()=>{filter=k;renderList()};$("#filters").appendChild(b)}
+  $('#loci thead th[data-k="molecules"]').dataset.help=MOLECULES_HELP;
+  HEAD1=$("#loci thead").innerHTML;
+  $("#loci thead").onclick=ev=>{const th=ev.target.closest("th[data-k]");if(!th)return;
+    const k=th.dataset.k,c=th.dataset.s===undefined?0:+th.dataset.s;
+    if(sortKey===k&&(!side||k==="locus"||sortCol===c))sortDir*=-1;else{sortKey=k;sortDir=k==="locus"||k==="status"?1:-1}
+    sortCol=c;renderList()};
+  $("#q").addEventListener("input",renderList);
+  $("#q").addEventListener("keydown",e=>{if(e.key==="Enter"){const r=visible()[0];if(r)select(r)}});
+  window.addEventListener("hashchange",fromHash);
+  fromHash();
+}
+// The route: "#<sample>/<locus>" for one sample, "#<sample>+<sample>/<locus>"
+// for two side by side.
+function fromHash(){
+  const m=decodeURIComponent(location.hash.slice(1)).match(/^(\d+)(?:\+(\d+))?\/(.*)$/);
+  const last=LIST.samples.length-1;sample=0;current=null;side=false;
+  if(m){sample=Math.min(+m[1],last);side=m[2]!==undefined;if(side)sample2=Math.min(+m[2],last);
+    current=LIST.loci.find(e=>e.locus===m[3])||null}
+  renderAll();
+}
+function route(){location.hash=sample+(side?"+"+sample2:"")+"/"+encodeURIComponent(current?current.locus:"")}
+function select(e){current=e;route()}
+function renderAll(){
+  document.querySelectorAll("#samples button").forEach((b,k)=>b.setAttribute("aria-pressed",k===sample));
+  $("#side").checked=side;$("#samples").hidden=side;$("#pickers").hidden=!side;
+  $("#pickA").value=sample;$("#pickB").value=sample2;
+  renderList();renderDetail();
+}
+function info(e){return e.samples[sample]}
+// The samples the list shows: one, or the left and right sample side by side.
+function shown(){return side?[sample,sample2]:[sample]}
+// A filter chip keeps a locus when any shown sample matches it.
+const FILTERS={noflank:s=>s.status!=="recovered",noposition:s=>s.no_position,noreads:s=>s.n_reads===0};
+function visible(){
+  const q=$("#q").value.trim().toLowerCase();
+  let rows=LIST.loci.filter(e=>!q||e.locus.toLowerCase().includes(q));
+  const match=FILTERS[filter];
+  if(match)rows=rows.filter(e=>shown().some(k=>e.samples[k]&&match(e.samples[k])));
+  const key=e=>{if(sortKey==="locus")return e.locus;const s=e.samples[shown()[side?sortCol:0]];if(!s)return null;
+    if(sortKey==="snvs")return s.snvs?s.snvs.phased+s.snvs.dropped/1000:null;return s[sortKey]};
+  return rows.slice().sort((a,b)=>{const x=key(a),y=key(b);
+    if(sortKey==="locus")return natural.compare(x,y)*sortDir;
+    if(x==null)return 1; if(y==null)return -1;
+    return (x>y?1:x<y?-1:0)*sortDir});
+}
+function snvText(s){if(!s||!s.snvs)return "–";const v=s.snvs;
+  if(!v.phased&&!v.dropped)return `<span class="note">no SNV</span>`;
+  return fmt(v.phased)+(v.dropped?` <span class="note">(${fmt(v.dropped)})</span>`:"")}
+// The status label of sample k, with its text from the sample's help table.
+function statusPill(s,k){const H=LIST.samples[k].help.status,pill=(cls,key,label)=>`<span class="pill ${cls}" data-help="${esc(H[key]||"")}">${esc(label)}</span>`;
+  return !s?pill("p-n","not_in_panel","not in panel"):s.status!=="recovered"?pill("p-bad",s.status,s.status.replaceAll("_"," ")):s.no_position?pill("p-warn","no_reference_position","side with no position"):pill("p-ok","recovered","recovered")}
+function snvTitle(k){return LIST.samples[k].phasing?"SNVs of this sample's phasing result (snv_calls.tsv): phased, and dropped for low linkage in brackets":"no phasing result given for this sample"}
+// Short names for the two sub-column heads: the names without the start they
+// share, cut at a "_", "-" or "." so that a name part stays whole.
+function shortNames(a,b){if(a===b)return [a,b];let n=0;while(n<a.length&&a[n]===b[n])n++;
+  const cut=Math.max(a.lastIndexOf("_",n-1),a.lastIndexOf("-",n-1),a.lastIndexOf(".",n-1))+1;
+  return [a.slice(cut),b.slice(cut)]}
+const MOLECULES_HELP="Molecules: the number of distinct MI tags. We count the A and B strands of one MI as one molecule.";
+const LIST_COLS=[["n_reads","Reads",true],["molecules","Molecules",true],["largest_run","Largest run",true],["snvs","Phasing SNVs",true],["status","Status",false]];
+function listHead(){
+  if(!side){$("#loci").removeAttribute("class");$("#loci thead").innerHTML=HEAD1;$("#snvhead").title=snvTitle(sample);return}
+  $("#loci").setAttribute("class","side");
+  const names=shown().map(k=>LIST.samples[k].sample),short=shortNames(...names);
+  $("#loci thead").innerHTML=`<tr><th data-k="locus" rowspan="2">Locus</th>${LIST_COLS.map(([k,l,num])=>
+    `<th colspan="2" class="grp ga"${k==="molecules"?` data-help="${esc(MOLECULES_HELP)}"`:""}${k==="snvs"?` title="${esc(shown().map(s=>LIST.samples[s].sample+": "+snvTitle(s)).join("\n"))}"`:""}>${l}</th>`).join("")}</tr>
+    <tr>${LIST_COLS.map(([k,,num])=>[0,1].map(c=>`<th data-k="${k}" data-s="${c}" class="${num?"num":""}${c?"":" ga"}" title="${esc(names[c])}"><span class="sname">${esc(short[c])}</span></th>`).join("")).join("")}</tr>`;
+  // The sub-column heads stick just below the first head row.
+  const top=$("#loci thead tr").offsetHeight+"px";
+  for(const th of $("#loci thead tr:nth-child(2)").cells)th.style.top=top}
+function renderList(){
+  listHead();
+  document.querySelectorAll("#filters button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.k===filter));
+  const tb=$("#loci tbody");tb.textContent="";
+  for(const e of visible()){const s=info(e);
+    const tr=document.createElement("tr");tr.tabIndex=0;tr.setAttribute("aria-selected",current===e);
+    if(!side)tr.innerHTML=`<td class="mono">${esc(e.locus)}</td><td class="num">${s?fmt(s.n_reads):"–"}</td><td class="num">${s?fmt(s.molecules):"–"}</td><td class="num">${s?fmt(s.largest_run):"–"}</td><td class="num">${snvText(s)}</td><td>${statusPill(s,sample)}</td>`;
+    else{const ss=shown().map(k=>e.samples[k]),sub=(f,num)=>ss.map((x,c)=>`<td class="${num?"num":""}${c?"":" ga"}">${f(x,shown()[c])}</td>`).join("");
+      tr.innerHTML=`<td class="mono">${esc(e.locus)}</td>`+sub(x=>x?fmt(x.n_reads):"–",true)+sub(x=>x?fmt(x.molecules):"–",true)+sub(x=>x?fmt(x.largest_run):"–",true)+sub(snvText,true)+sub(statusPill,false)}
+    tr.onclick=()=>select(e);tr.onkeydown=ev=>{if(ev.key==="Enter")select(e)};
+    tb.appendChild(tr)}
+  // Keep the open locus in view inside the list panel, without moving the page.
+  const sel=tb.querySelector('tr[aria-selected="true"]'),wrap=$(".tablewrap");
+  // The list head is one row tall for one sample and two rows side by side.
+  const h=$("#loci thead").offsetHeight;
+  if(sel&&(sel.offsetTop<wrap.scrollTop+h+6||sel.offsetTop>wrap.scrollTop+wrap.clientHeight-20))wrap.scrollTop=sel.offsetTop-h-36;
+}
+async function fetchLocus(s){
+  const q=new URLSearchParams({sample:s,locus:current.locus,near:$("#near").value});
+  const resp=await fetch("locus?"+q);
+  return resp.ok?{data:await resp.json()}:{error:await resp.text()}}
+// One card per kind; a missing card is null. "col" names the column, so the
+// element ids of the two columns differ.
+function cardsOf(r,col,k){r._col=col;r._k=k;
+  return {head:headCard(r),ref:r.flanks?refCard(r):null,tract:tractCard(r),hist:histCard(r),
+    pile:r.flanks&&r.pileup.sections.some(S=>S.rows.length)?pileCard(r):null,
+    flanking:r.flanks&&r.pileup.sections.some(S=>S.rows.length)?flankingCard(r):null,
+    counters:counterCard(r)}}
+async function renderDetail(){
+  const el=$("#detail");el.textContent="";
+  if(!current){el.innerHTML=`<div class="card"><p class="note">Pick a locus in the list. All sequence is on the G strand.</p></div>`;return}
+  const want=current,key=route_key();
+  if(!side){
+    if(!info(current)){el.innerHTML=`<div class="card"><p class="note">${esc(current.locus)} is not in the panel of ${esc(LIST.samples[sample].sample)}.</p></div>`;return}
+    const got=await fetchLocus(sample);
+    if(want!==current||key!==route_key())return;
+    if(got.error){el.innerHTML=`<div class="card"><p class="note">${esc(got.error)}</p></div>`;return}
+    const r=got.data;r._shared=null;const C=cardsOf(r,"",sample);el.textContent="";
+    el.appendChild(C.head);if(C.ref)el.appendChild(C.ref);
+    const two=document.createElement("div");two.className="two";two.appendChild(C.tract);two.appendChild(C.hist);el.appendChild(two);
+    if(C.pile){el.appendChild(C.pile);el.appendChild(C.flanking)}
+    el.appendChild(C.counters);return}
+  const got=await Promise.all([sample,sample2].map(s=>current.samples[s]?fetchLocus(s):Promise.resolve({error:`${current.locus} is not in the panel of ${LIST.samples[s].sample}.`})));
+  if(want!==current||key!==route_key())return;
+  el.textContent="";
+  const rs=got.map(g=>g.data||null);
+  const shared={hist:mergeHistScale(...rs.filter(Boolean).map(histScale)),
+    tract:sharedTractWidth(...rs.filter(Boolean)),link:{}};
+  const cols=rs.map((r,i)=>r?(r._shared=shared,cardsOf(r,"ab"[i],[sample,sample2][i])):null);
+  const top=document.createElement("div");top.className="pair";
+  [sample,sample2].forEach(s=>{const d=document.createElement("div");d.className="colhead";d.textContent=LIST.samples[s].sample;top.appendChild(d)});
+  el.appendChild(top);
+  for(const kind of ["head","ref","tract","hist","pile","flanking","counters"]){
+    const row=document.createElement("div");row.className="pair";
+    cols.forEach((C,i)=>{let card=C?C[kind]:null;
+      if(!card&&!C&&kind==="head"){card=document.createElement("div");card.className="card";card.innerHTML=`<p class="note">${esc(got[i].error)}</p>`}
+      if(!card){card=document.createElement("div");card.className="slot"}
+      row.appendChild(card)});
+    if([...row.children].some(c=>c.className!=="slot"))el.appendChild(row)}
+}
+function route_key(){return sample+"/"+sample2+"/"+side}
+// Shared scales of the side-by-side view.
+function histScale(r){
+  const ks=r.largest_run.map(x=>x[0]);if(!ks.length)return null;
+  const SH=r.largest_run_shares;let ymax;
+  if(SH)ymax=Math.max(0.01,...Object.values(SH).flatMap(v=>v.map(x=>x[1])));
+  else{const tot=r.largest_run.reduce((a,x)=>a+x[1],0)||1;ymax=Math.max(0.01,...r.largest_run.map(x=>x[1]/tot))}
+  return {lo:Math.min(...ks,0),hi:Math.max(...ks,1),ymax}}
+function mergeHistScale(...scales){const v=scales.filter(Boolean);if(!v.length)return null;
+  return {lo:Math.min(...v.map(x=>x.lo)),hi:Math.max(...v.map(x=>x.hi)),ymax:Math.max(...v.map(x=>x.ymax))}}
+function tractWidth(r){return Math.max(1,...r.pileup.sections.flatMap(S=>S.rows.map(x=>x.tract.length)))}
+function sharedTractWidth(...rs){return rs.length?Math.max(...rs.map(tractWidth)):1}
+function flankText(f){
+  if(f.status!=="recovered")return `<span class="mono">${esc(f.bases)}</span> <span class="pill p-warn">no reference position</span>`;
+  return `<span class="mono">${esc(f.bases)}</span> <span class="note">${fmt(Math.min(f.outer_position,f.run_side_position))}–${fmt(Math.max(f.outer_position,f.run_side_position))}</span>`}
+function headCard(r){
+  const c=document.createElement("div");c.className="card";const k=r.counters,o=k.n_alignments_overlap_locus;
+  const share=n=>`${fmt(n)} (${pct(o?n/o:NaN)})`;
+  const drops=[["MAPQ","n_alignments_drop_mapq"],["SA","n_alignments_drop_sa"],["TLEN","n_alignments_drop_tlen"],["no MI","n_alignments_drop_no_mi"],
+    ["upstream flank not placed","n_alignments_drop_upstream_flank_not_placed"],["downstream flank not placed","n_alignments_drop_downstream_flank_not_placed"],
+    ["no placement","n_alignments_drop_no_placement"],["no base in the BED interval","n_alignments_drop_no_bed_base"],["negative value","n_alignments_drop_negative_value"]];
+  c.innerHTML=`<div class="lhead"><span class="name">${esc(r.locus)}</span>
+   <span class="mono">${esc(r.chrom)}:${fmt(r.bed_start)}–${fmt(r.bed_end)} (${esc(r.ref_orientation||"?")} strand)</span>
+   <span class="pill ${r.reference_window_status==="recovered"?"p-ok":"p-bad"}">${esc(r.reference_window_status.replaceAll("_"," "))}</span>
+   <span class="note">${esc(r.sample)} · flanks from ${esc(LIST.samples[r._k].flank_table_sample)}</span></div>
+   <div class="kv">
+    <div><b>Upstream flank</b>${r.flanks?flankText(r.flanks.upstream):"–"}</div>
+    <div><b>Downstream flank</b>${r.flanks?flankText(r.flanks.downstream):"–"}</div>
+    <div><b>Reference tract</b><span class="mono">${esc(r.reference_tract||"–")}</span> <span class="note">${r.reference_run_lengths.join(",")}</span></div>
+    <div><b>Reads in the panel</b>${fmt(k.n_reads)} · ${fmt(k.n_read_pairs)} read pairs (${fmt(k.n_read_pairs_merged)} merged, ${fmt(k.n_read_pairs_drop_disagree)} dropped)</div>
+    <div><b>Alignments over the locus</b>${fmt(o)} · ${fmt(k.n_alignments_placed)} placed (${pct(o?k.n_alignments_placed/o:NaN)})</div>
+    <div><b>Dropped, share of the alignments over the locus</b>${drops.filter(([,f])=>k[f]).map(([l,f])=>`${l} ${share(k[f])}`).join(" · ")||"none"}</div>
+   </div>`;
+  const ph=r.phasing;
+  if(ph&&ph.summary){const m=ph.summary;c.innerHTML+=`<div class="kv">
+    <div><b>Haplotype profiles</b><span class="mono">major ${esc(m.hap_major_profile||"–")} · minor ${esc(m.hap_minor_profile||"–")}</span></div>
+    <div><b>SNVs</b>${fmt(+m.n_snvs_phased)} phased · ${fmt(+m.n_snvs_dropped_low_linkage)} dropped (low linkage)</div>
+    <div><b>Reads by phase label</b>major ${fmt(+m.reads_major)} · minor ${fmt(+m.reads_minor)} · unk ${fmt(+m.reads_unk)}</div></div>`}
+  if(!r.flanks)c.innerHTML+=`<p class="note">This locus has no flank in this sample, so it has no reads.</p>`;
+  return c;
+}
+function refCard(r){
+  const c=document.createElement("div");c.className="card";
+  const up=r.flanks.upstream.bases,dn=r.flanks.downstream.bases,t=r.reference_tract,w=up+t+dn,L=w.length;
+  const cell=(ch,style="")=>`<span class="seqcell" style="${style}">${ch}</span>`;
+  let bases="",band="",idx="";
+  for(let i=0;i<L;i++){const z=i<up.length?"var(--flank)":i<up.length+t.length?"var(--tract)":"var(--flank)";
+    bases+=cell(w[i],`color:${w[i]==="G"?"var(--fg)":baseColor(w[i])};font-weight:${w[i]==="G"?400:600}`);
+    band+=cell("",`background:${z};height:6px;opacity:.75`);
+    idx+=cell(i%5===0?`<span style="font-size:9px;color:var(--muted)">${i}</span>`:"")}
+  const line=x=>`<div style="white-space:nowrap;height:16px">${x}</div>`;
+  c.innerHTML=`<h2>Reference on the G strand${helpMark("The flanks are the matched normal's flank bases. The panel holds no reference bases outside the flanks.")}</h2><div class="scroll"><div class="refstrip">${line(band)+line(bases)+line(idx)}</div></div>
+   <div class="legend"><span><i style="background:var(--flank)"></i>flanks</span><span><i style="background:var(--tract)"></i>reference tract</span>
+   ${t?"":"<span>No reference tract: a flank has no reference position.</span>"}</div>`;
+  return c;
+}
+function tractSeq(s){return s.split("").map(b=>b==="G"?b:`<span style="color:${baseColor(b)};font-weight:600">${b}</span>`).join("")||"(empty)"}
+function tractCard(r){
+  const c=document.createElement("div");c.className="card";const total=r.counters.n_reads;const max=Math.max(1,...r.tracts.map(x=>x[1]));
+  const L=r.tract_labels,lab=["hap_major","hap_minor","unk"];
+  const head=L?lab.map(l=>`<th class="num" style="color:var(${LABEL_COLOR[l]})"><span class="legend" style="display:inline;margin:0">${labelSwatch(l)}</span>${LABEL_NAME[l]}</th>`).join(""):"";
+  c.innerHTML=`<h2>Tracts${helpMark(MOLECULES_HELP+(L?" Major, minor, unk: reads by phase label.":""))}</h2><div class="note">${fmt(total)} reads, ${fmt(r.n_molecules)} molecules, ${fmt(r.n_tracts)} tracts${r.tract_reads_not_shown?` (${fmt(r.n_tracts-r.tracts.length)} tracts, ${fmt(r.tract_reads_not_shown)} reads not listed)`:""}.</div>
+   <div class="scroll" style="max-height:420px;overflow:auto"><table><thead><tr><th class="num">Reads</th>${head}<th class="num">Molecules</th><th class="num">Share</th><th></th><th>Tract</th></tr></thead><tbody>${r.tracts.map(([s,n,m],i)=>`<tr><td class="num">${fmt(n)}</td>${L?L[i].map((v,k)=>`<td class="num" style="color:var(${LABEL_COLOR[lab[k]]})">${fmt(v)}</td>`).join(""):""}<td class="num">${fmt(m)}</td><td class="num">${pct(n/total)}</td>
+   <td><span style="display:inline-block;height:8px;width:${Math.round(60*n/max)}px;background:var(--muted);border-radius:2px"></span></td>
+   <td class="mono">${tractSeq(s)}</td></tr>`).join("")}</tbody></table></div>`;
+  return c;
+}
+// Molecules of one phase label: distinct MI among the label's reads.
+const MOLECULE_IN_EACH_LABEL="We count a molecule with reads under two labels once under each label.";
+function molText(r,label){const S=r.pileup.sections.find(x=>x.label===label);return S?` · ${fmt(S.molecules)} molecules`:""}
+function histCard(r){
+  const c=document.createElement("div");c.className="card";
+  const SH=r.largest_run_shares;
+  c.innerHTML=`<h2>Largest G run per read, share of reads${SH?helpMark("One histogram per phase label: each shows the share of that label's reads at each largest G run, on one x axis and one y scale. "+MOLECULE_IN_EACH_LABEL):""}</h2>`;
+  if(!r.largest_run.length){c.innerHTML+=`<p class="note">No reads.</p>`;return c}
+  // One sample: its own axis and scale; side by side: the shared ones.
+  const sc=r._shared&&r._shared.hist?r._shared.hist:histScale(r);const lo=sc.lo,hi=sc.hi;
+  const W=460,pl=36,bw=(W-pl-8)/(hi-lo+1);
+  const axis=(y)=>{let s="";for(let k=lo;k<=hi;k++){const x=pl+(k-lo)*bw;
+    if((k-lo)%Math.ceil((hi-lo+1)/14)===0)s+=`<text x="${x+bw/2}" y="${y}" font-size="9" text-anchor="middle" fill="var(--muted)">${k}</text>`}return s};
+  const panel=(rows,ymax,H,color,tipOf)=>{let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;display:block" role="img">`;
+    const pb=14,top=4;
+    for(const t of [0,0.5,1]){const v=t*ymax,y=H-pb-(H-pb-top)*t;s+=`<line x1="${pl}" x2="${W-4}" y1="${y}" y2="${y}" stroke="var(--line)"/><text x="${pl-4}" y="${y+3}" font-size="9" text-anchor="end" fill="var(--muted)">${(100*v).toFixed(0)}%</text>`}
+    for(const [k,v,n] of rows){if(!v)continue;const x=pl+(k-lo)*bw,hh=(H-pb-top)*v/ymax;
+      s+=color==="outline"?`<rect x="${x+1.75}" y="${H-pb-hh+0.75}" width="${Math.max(1,bw-3.5)}" height="${Math.max(0,hh-0.75)}" fill="none" stroke="var(--muted)" stroke-width="1.5"><title>${tipOf(k,v,n)}</title></rect>`
+        :`<rect x="${x+1}" y="${H-pb-hh}" width="${Math.max(1,bw-2)}" height="${hh}" fill="${color}"><title>${tipOf(k,v,n)}</title></rect>`}
+    return s+axis(H-2)+`</svg>`};
+  if(!SH){const tot=r.largest_run.reduce((a,x)=>a+x[1],0)||1;const rows=r.largest_run.map(([k,n])=>[k,n/tot,n]);
+    const ymax=sc.ymax;
+    c.innerHTML+=`<div class="sec" style="margin-top:4px"><h3>all reads · ${fmt(tot)} reads${molText(r,null)}</h3></div>`+panel(rows,ymax,190,"var(--muted)",(k,v,n)=>`largest G run ${k}: ${fmt(n)} reads (${pct(v)})`)+`<div class="note" style="text-align:center">largest G run</div>`;return c}
+  const lab=["hap_major","hap_minor","unk"];
+  const counts=Object.fromEntries(r.largest_run_labels);
+  const totals=lab.map((_,i)=>r.largest_run_labels.reduce((a,[,v])=>a+v[i],0));
+  const ymax=sc.ymax;
+  lab.forEach((l,i)=>{const rows=SH[l].map(([k,v])=>[k,v,(counts[k]||[0,0,0])[i]]);
+    c.innerHTML+=`<div class="sec" style="margin-top:4px"><h3${l==="unk"?' style="color:var(--muted)"':""}>${labelSwatch(l)}${LABEL_NAME[l].toLowerCase()} · ${fmt(totals[i])} reads${molText(r,l)}</h3>`+
+      panel(rows,ymax,78,l==="unk"?"outline":`var(${LABEL_COLOR[l]})`,(k,v,n)=>`${LABEL_NAME[l].toLowerCase()}, largest G run ${k}: ${fmt(n)} reads (${pct(v)} of ${LABEL_NAME[l].toLowerCase()})`)+`</div>`});
+  c.innerHTML+=`<div class="note" style="text-align:center">largest G run</div>`;
+  return c;
+}
+function cellsText(cnt){const B=LIST.flanking_bases;return cnt?B.split("").map((b,k)=>cnt[k]?`${b} ${fmt(cnt[k])}`:"").filter(Boolean).join(" · ")||"no read base":""}
+function snvStatus(v){return v.status==="phased"?(v.is_anchor?"phased, anchor":"phased"):v.status==="dropped_low_linkage"?"dropped, low linkage":v.status}
+// A small "?" next to a card title; its hover holds the explanation.
+function helpMark(text){return ` <span class="help" tabindex="0" role="button" aria-label="help" data-help="${esc(text)}">?</span>`}
+// The "?" help, and every other element with data-help, uses the page's #tip box: shown on hover, toggled (pinned) on
+// click or Enter. While it shows, the canvases leave #tip alone.
+// A click pins the "?" help and a counter row's text; the list's labels and
+// chips show theirs on hover only, as a click there changes the list.
+const HELP={open:null,pinned:false},PIN=".help,.counters tr";
+function helpShow(el){const tip=$("#tip"),rc=el.getBoundingClientRect();
+  tip.textContent=el.dataset.help;tip.hidden=false;HELP.open=el;
+  const w=Math.min(420,innerWidth-16);tip.style.maxWidth=w+"px";
+  // Right of a small mark; under the start of an element too wide for that.
+  const left=rc.right+8+w<=innerWidth-8?rc.right+8:Math.max(8,Math.min(rc.left,innerWidth-w-8));tip.style.left=left+"px";
+  const top=rc.bottom+6,h=tip.offsetHeight;tip.style.top=(top+h>innerHeight-8?Math.max(8,rc.top-h-6):top)+"px"}
+function helpHide(){if(!HELP.open)return;$("#tip").hidden=true;HELP.open=null;HELP.pinned=false}
+document.addEventListener("mouseover",e=>{if(HELP.pinned)return;const el=e.target.closest("[data-help]");
+  if(el)helpShow(el);else helpHide()});
+document.addEventListener("mouseout",e=>{const el=e.target.closest("[data-help]");if(el&&!HELP.pinned&&!el.contains(e.relatedTarget))helpHide()});
+document.addEventListener("click",e=>{const el=e.target.closest(PIN);
+  if(el){if(HELP.pinned&&HELP.open===el){helpHide()}else{helpShow(el);HELP.pinned=true}return}
+  if(HELP.pinned)helpHide()});
+document.addEventListener("keydown",e=>{const el=e.target.closest&&e.target.closest(PIN);
+  if(el&&(e.key==="Enter"||e.key===" ")){e.preventDefault();el.click()}if(e.key==="Escape")helpHide()});
+// Label styles: major and minor are filled; unk is a hollow outline in the
+// muted text color. Hue in the pile-up belongs to the bases.
+const LABEL_COLOR={hap_major:"--hmajor",hap_minor:"--hminor",unk:"--muted"};
+// Next to its word, unk has no swatch: the muted word is enough.
+function labelSwatch(l){return l==="unk"?"":`<i style="background:var(${LABEL_COLOR[l]})"></i>`}
+const LABEL_NAME={hap_major:"Major",hap_minor:"Minor",unk:"Unk"};
+function profileText(r,label){
+  const field=label==="hap_major"?"hap_major_base":"hap_minor_base";
+  const ph=r.phasing.snvs.filter(v=>v.status==="phased").sort((a,b)=>a.ref_pos-b.ref_pos);
+  return ph.map(v=>`${esc(v[field])} at ${fmt(v.ref_pos)}${v.is_anchor?" (anchor)":""}`).join(", ")||"no phased SNV"}
+function sectionHeading(r,S){
+  if(!S.label)return "";
+  const sw=labelSwatch(S.label);
+  if(S.label==="unk")return `<h3 style="color:var(--muted)">${sw}Unk: these reads have no label (no phased SNV covered, or a tied vote) · ${fmt(S.reads)} reads${molText(r,S.label)}</h3>`;
+  return `<h3>${sw}${LABEL_NAME[S.label]} haplotype: ${profileText(r,S.label)} · ${fmt(S.reads)} reads${molText(r,S.label)}</h3>`}
+function pileCard(r){
+  const c=document.createElement("div");c.className="card";const P=r.pileup;
+  const snvCols=[...P.up,...P.dn].filter(x=>x.snv);
+  const dropped=r.phasing?r.phasing.snvs.filter(v=>v.status!=="phased").sort((a,b)=>a.ref_pos-b.ref_pos):[];
+  const help=(r.phasing?"Columns: the bases next to each flank, and one column per SNV of the phasing result. A phased SNV's header shows the major haplotype's base over the minor haplotype's base; a dropped SNV's header shows its two alleles. Major: the haplotype with the more common base at the anchor SNV. Framed cell: the base differs from its row's haplotype base at that phased SNV. "+MOLECULE_IN_EACH_LABEL+" ":"Columns: the bases next to each flank. ")+"The flank columns show the flank sequence we built from the donor's normal. The tract is left-justified and padded with a line. A short mark between columns stands for skipped positions. Hover a column for its position and base counts.";
+  const secs=P.sections.map((S,k)=>`<div class="sec">${sectionHeading(r,S)}<div class="note">${fmt(S.n_rows)} rows, ${fmt(S.rows.length)} drawn${S.reads_not_drawn?` (${fmt(S.reads_not_drawn)} reads not drawn)`:""}.</div><div class="scroll" id="pilehost${r._col}${k}"></div></div>`).join("");
+  c.innerHTML=`<h2>Pile-up${helpMark(help)}</h2>
+   <div class="note">Each row: reads with the same tract${r.phasing?", phase label":""} and bases at the shown columns. Empty cell: the read has no base there.</div>
+   ${dropped.length?`<div class="note">Dropped SNVs: ${dropped.map(v=>`${fmt(v.ref_pos)} ${esc(v.allele_major)}/${esc(v.allele_minor)}`).join(", ")}.</div>`:""}
+   ${secs}
+   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--flank)"></i>flank band</span><span><i style="background:var(--tract)"></i>tract band</span>${r.phasing?`<span><i style="background:var(--snvband)"></i>phased SNV</span><span><i style="background:transparent;border:1.5px dashed var(--muted)"></i>dropped SNV</span><span><i style="background:transparent;outline:2px solid var(--fg)"></i>differs from its haplotype</span>`:""}<span>faded bases: flank sequence</span><span>— tract padding</span><span>▮ skipped positions</span></div>`;
+  queueMicrotask(()=>{const T=r._shared?r._shared.tract:tractWidth(r);
+    P.sections.forEach((S,k)=>drawPile(r,S,$("#pilehost"+r._col+k),T))});
+  return c;
+}
+function layoutSide(cols,upstream){
+  // Column slots with a gap slot where flanking indices are not adjacent.
+  const out=[];cols.forEach((c,k)=>{if(k>0&&Math.abs(c.index-cols[k-1].index)>1)out.push({gap:true});out.push({col:c,k})});return out}
+function drawPile(r,S,host,T){
+  if(!host||!S.rows.length)return;
+  const P=r.pileup,up=r.flanks.upstream.bases,dn=r.flanks.downstream.bases;
+  const U=layoutSide(P.up,true),D=layoutSide(P.dn,false);
+  const slots=[...U.map(x=>({side:"up",...x})),...[...up].map((b,i)=>({flank:"up",b,i})),
+    ...Array.from({length:T},(_,i)=>({tract:i})),...[...dn].map((b,i)=>({flank:"dn",b,i})),...D.map(x=>({side:"dn",...x}))];
+  // Header lines, top to bottom: with phasing, the major and the minor
+  // haplotype base of each SNV, then the band; then the sequence line (flank
+  // bases and reference tract only).
+  const PH=!!r.phasing,LEFT=PH?40:0;
+  const width=slots.length,LABW=90,avail=Math.max(300,host.clientWidth-LABW-LEFT-4);
+  const CW=Math.max(5,Math.min(12,Math.floor(avail/width))),RH=Math.max(8,Math.min(11,CW));
+  const Y_MAJ=11,Y_MIN=23,BAND=PH?27:4,Y_SEQ=BAND+20,HEAD=Y_SEQ+6;
+  const H=HEAD+S.rows.length*RH+6,W=width*CW+LABW+LEFT;
+  const dpr=window.devicePixelRatio||1;const cv=document.createElement("canvas");cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+"px";cv.style.height=H+"px";
+  const g=cv.getContext("2d");g.scale(dpr,dpr);const font=`${Math.min(10,CW)}px ${css("--mono")}`;g.font=font;
+  const X=j=>LEFT+j*CW;
+  if(PH){g.textAlign="left";g.font=`9px ${css("--sans")}`;
+    g.fillStyle=css("--muted");g.fillText("major",1,Y_MAJ);g.fillText("minor",1,Y_MIN);g.font=font}
+  slots.forEach((sl,j)=>{g.textAlign="center";const x=X(j)+CW/2;
+    if(sl.gap){g.fillStyle=css("--muted");g.fillRect(x-1,Y_SEQ-8,2,8);return}
+    if(sl.flank||sl.tract!=null){g.fillStyle=sl.tract!=null?css("--tract"):css("--flank");g.globalAlpha=.75;g.fillRect(X(j),BAND,CW-1,5);g.globalAlpha=1;
+      g.fillStyle=css("--fg");g.fillText(sl.flank?sl.b:(r.reference_tract[sl.tract]||""),x,Y_SEQ);return}
+    const v=sl.col.snv;
+    if(v){const phased=v.status==="phased";
+      if(phased){g.fillStyle=css("--snvband");g.fillRect(X(j),BAND,CW-1,5)}
+      else{g.strokeStyle=css("--muted");g.lineWidth=1;g.setLineDash([2,2]);g.strokeRect(X(j)+0.5,BAND+0.5,CW-2,4);g.setLineDash([])}
+      g.fillStyle=phased?css("--fg"):css("--muted");g.fillText(phased?v.hap_major_base:v.allele_major,x,Y_MAJ);
+      g.fillText(phased?v.hap_minor_base:v.allele_minor,x,Y_MIN)}
+    else{g.fillStyle=css("--muted");g.fillRect(x-1,Y_SEQ-4,2,4)}});
+  let y=HEAD;
+  for(const row of S.rows){
+    const differs={up:new Set(row.differs?row.differs.up:[]),dn:new Set(row.differs?row.differs.dn:[])};
+    slots.forEach((sl,j)=>{let ch="",faded=false;
+      if(sl.gap)return;
+      if(sl.flank){ch=sl.b;faded=true}
+      else if(sl.tract!=null){ch=row.tract[sl.tract]||" "}
+      else ch=row[sl.side][sl.k];
+      if(ch===""||ch===".")return;
+      if(ch===" "){g.fillStyle=css("--fg");g.fillRect(X(j),y+RH/2-1,CW,2);return}
+      g.globalAlpha=faded?.45:1;g.fillStyle=baseColor(ch);g.fillRect(X(j),y,CW-1,RH-1);g.globalAlpha=1;
+      if(sl.side&&differs[sl.side].has(sl.k)){g.strokeStyle=css("--fg");g.lineWidth=1.5;g.strokeRect(X(j)+0.75,y+0.75,CW-2.5,RH-2.5)}});
+    g.fillStyle=css("--muted");g.textAlign="left";g.font=font;
+    g.fillText(fmt(row.reads),X(width)+6,y+RH-2);y+=RH}
+  // The row under the mouse gets an outline across the whole row, over the
+  // canvas, in its section's label color (the text color without a label).
+  const wrap=document.createElement("div");wrap.style.cssText=`position:relative;width:${W}px`;
+  const band=document.createElement("div");band.className="rowband";band.hidden=true;
+  band.style.borderColor=S.label?`var(${LABEL_COLOR[S.label]})`:"var(--fg)";
+  wrap.appendChild(cv);wrap.appendChild(band);host.textContent="";host.appendChild(wrap);
+  const tip=$("#tip");
+  cv.onmousemove=e=>{if(HELP.open)return;const rc=cv.getBoundingClientRect(),xx=e.clientX-rc.left-LEFT,yy=e.clientY-rc.top,j=Math.floor(xx/CW);
+    const kk=Math.floor((yy-HEAD)/RH),onRow=yy>=HEAD&&kk>=0&&kk<S.rows.length;
+    // The outline sits inside the canvas (its border is inside its box), has
+    // no fill, and ends just past the row's read count.
+    band.hidden=!onRow;if(onRow){g.font=font;const end=X(width)+6+g.measureText(fmt(S.rows[kk].reads)).width+4;
+      band.style.top=(HEAD+kk*RH-2)+"px";band.style.height=(RH+3)+"px";band.style.width=Math.min(W,end)+"px"}
+    if(onRow&&(j<0||j>=width)){const row=S.rows[kk];tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";
+      tip.innerHTML=`<div class="mono">${fmt(row.reads)} ${row.reads===1?"read":"reads"} · ${fmt(row.molecules)} ${row.molecules===1?"molecule":"molecules"}${row.label?` · ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;return}
+    if(j<0||j>=width){tip.hidden=true;return}
+    const sl=slots[j];let html="";
+    if(sl.gap)html="<b>skipped flanking positions</b>";
+    else if(sl.flank)html=`<b>${sl.flank==="up"?"upstream":"downstream"} flank, base ${sl.i+1}</b> (the flank sequence we built from the donor's normal)`;
+    else if(sl.tract!=null)html=`<b>tract, position ${sl.tract+1}</b>`;
+    else{const c=sl.col,v=c.snv;html=`<b>reference ${fmt(c.position)}</b> · ${sl.side==="up"?"upstream":"downstream"}, ${sl.side==="up"?r.flanking.up.width-c.index:c.index+1} from the flank`;
+      if(v)html+=v.status==="phased"?`<div>phased SNV${v.is_anchor?", anchor":""}: major haplotype ${esc(v.hap_major_base)}, minor haplotype ${esc(v.hap_minor_base)}; alleles ${esc(v.allele_major)}/${esc(v.allele_minor)}, minor allele ${pct(v.vaf_minor)} of ${fmt(v.coverage)} families</div>`
+        :`<div>dropped SNV (low linkage): no haplotype bases; the header shows its alleles ${esc(v.allele_major)}/${esc(v.allele_minor)}, minor allele ${pct(v.vaf_minor)} of ${fmt(v.coverage)} families</div>`;
+      html+=`<div>all reads: ${cellsText(c.counts)}</div>`}
+    const k=Math.floor((yy-HEAD)/RH);
+    if(yy>=HEAD&&k<S.rows.length){const row=S.rows[k];
+      html+=`<div class="mono">${fmt(row.reads)} ${row.reads===1?"read":"reads"} · ${fmt(row.molecules)} ${row.molecules===1?"molecule":"molecules"}${row.label?` · ${esc(row.label)}`:""} · tract ${esc(row.tract)||"(empty)"} (${row.tract.length} bases)</div>`;
+      if(sl.side){const ch=row[sl.side][sl.k];html+=`<div>this row's reads: ${ch==="."?"no base here":esc(ch)}${row.differs&&row.differs[sl.side].includes(sl.k)?" (differs from the row's haplotype base)":""}</div>`}}
+    tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-460))+"px";tip.style.top=(e.clientY+12)+"px";tip.innerHTML=html};
+  cv.onmouseleave=()=>{band.hidden=true;if(!HELP.open)tip.hidden=true};
+}
+function flankingCard(r){
+  const c=document.createElement("div");c.className="card";
+  c.innerHTML=`<h2>Flanking base counts${helpMark("Every flanking position of each side, in reference columns. Each side zooms on its own: drag over a range or turn the mouse wheel to zoom; when zoomed in, drag to pan and shift-drag to zoom further. Reset returns to the full width. At high zoom the ticks show reference coordinates and wide columns show each base count. Marks: the SNVs of the phasing result. Hover for the position and the counts.")}</h2>
+   <div class="note">Coverage (top) and base shares (bottom) of the kept reads.</div>
+   <div id="flankhost${r._col}"></div><div class="note" id="flanklist${r._col}"></div>
+   <div class="legend"><span><i style="background:var(--bG)"></i>G</span><span><i style="background:var(--bA)"></i>A</span><span><i style="background:var(--bC)"></i>C</span><span><i style="background:var(--bT)"></i>T</span><span><i style="background:var(--bN)"></i>N</span>${r.phasing?`<span><i style="background:var(--snvband)"></i>SNV of the phasing result</span>`:""}</div>`;
+  queueMicrotask(()=>drawFlanking(r));return c;
+}
+function drawFlanking(r){
+  const host=$("#flankhost"+r._col);if(!host)return;const F=r.flanking,B=LIST.flanking_bases;
+  host.textContent="";const marked=[];
+  let maxCov=1;for(const S of [F.up,F.dn])for(const cnt of S.counts)maxCov=Math.max(maxCov,cnt.reduce((a,b)=>a+b,0));
+  for(const [name,S] of [["upstream",F.up],["downstream",F.dn]]){
+    const box=document.createElement("div");box.className="sec";
+    const head=document.createElement("h3");
+    head.innerHTML=`${name} · ${fmt(S.width)} positions${S.width?`, ${fmt(S.start)}–${fmt(coord(r.ref_orientation,S.start,S.width-1))}`:", no flanking bases"} `;
+    box.appendChild(head);host.appendChild(box);
+    S.counts.forEach((cnt,i)=>{if(S.snv.includes(i)){const cov=cnt.reduce((a,b)=>a+b,0);marked.push({name,at:coord(r.ref_orientation,S.start,i),cnt,cov})}});
+    if(!S.width)continue;
+    const reset=document.createElement("button");reset.textContent="reset";reset.className="zoomreset";head.appendChild(reset);
+    const cv=document.createElement("canvas");cv.style.cursor="crosshair";box.appendChild(cv);
+    zoomSide(r,name,S,cv,reset,maxCov,B);
+  }
+  $("#flanklist"+r._col).innerHTML=marked.length?"Marked positions: "+marked.map(m=>`${m.name} ${fmt(m.at)}: `+B.split("").map((b,k)=>m.cnt[k]?`${b} ${pct(m.cnt[k]/m.cov)}`:"").filter(Boolean).join(" ")).join(" · "):(r.phasing?"The phasing result has no SNV at this locus.":"");
+}
+function zoomSide(r,name,S,cv,reset,maxCov,B){
+  // The view is the index range [lo, hi) of this side's positions. Zoom and
+  // pan change only the view; the counts come from the locus data.
+  const n=S.width,orient=r.ref_orientation,tip=$("#tip");
+  const W=Math.max(300,cv.parentElement.clientWidth-4),CH=40,SH=40,MH=8,AX=16,TXT=5*10+4;
+  let lo=0,hi=n,drag=null;
+  const dpr=window.devicePixelRatio||1;
+  function draw(){
+    const cw=W/(hi-lo),showText=cw>=30,H=CH+SH+MH+AX+(showText?TXT:0)+4;
+    cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+"px";cv.style.height=H+"px";
+    const g=cv.getContext("2d");g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);
+    const first=Math.floor(lo),last=Math.min(n,Math.ceil(hi));
+    for(let i=first;i<last;i++){const cnt=S.counts[i],cov=cnt.reduce((a,b)=>a+b,0),x=(i-lo)*cw,w=Math.max(cw-(cw>4?1:0),0.5);
+      if(cov){const h=(CH-4)*cov/maxCov;g.fillStyle=css("--muted");g.fillRect(x,CH-h,w,h);
+        let y=CH+2;cnt.map((v,k)=>[v,k]).sort((a,b)=>b[0]-a[0]).forEach(([v,k])=>{if(!v)return;const hh=SH*v/cov;g.fillStyle=baseColor(B[k]);g.fillRect(x,y,w,hh);y+=hh})}
+      if(S.snv.includes(i)){g.fillStyle=css("--snvband");g.fillRect(x,CH+SH+3,Math.max(w,2),MH-2)}
+      if(showText&&cov){g.fillStyle=css("--fg");g.font=`10px ${css("--mono")}`;g.textAlign="center";
+        let k2=0;cnt.forEach((v,k)=>{if(v){g.fillText(`${B[k]}${v}`,x+cw/2,CH+SH+MH+AX+12+10*k2);k2++}})}}
+    // Reference coordinate ticks.
+    const span=hi-lo,steps=[1,2,5,10,20,50,100,200,500,1000];const step=steps.find(t=>span/t<=10)||1000;
+    g.fillStyle=css("--muted");g.font=`9px ${css("--mono")}`;g.textAlign="center";
+    for(let i=Math.ceil(lo/step)*step;i<hi;i+=step){const x=(i-lo+0.5)*cw;g.fillRect(x,CH+SH+MH,1,4);g.fillText(fmt(coord(orient,S.start,i)),x,CH+SH+MH+13)}
+    if(drag&&drag.select){g.fillStyle="rgba(15,110,140,.18)";const a=Math.min(drag.x0,drag.x1),b=Math.max(drag.x0,drag.x1);g.fillRect(a,0,b-a,CH+SH+MH)}
+    reset.disabled=lo===0&&hi===n;
+  }
+  const at=x=>lo+x/W*(hi-lo);
+  // Side by side: the same side of the other column follows this view by
+  // reference coordinate (null: back to the full width).
+  const link=r._shared?r._shared.link:null,toIndex=c=>orient==="-"?S.start-c:c-S.start;
+  const me={apply(range){if(range===null){lo=0;hi=n}else{const a=toIndex(range[0]),b=toIndex(range[1]);lo=Math.min(a,b);hi=Math.max(a,b);clamp()}draw()}};
+  if(link)(link[name]=link[name]||[]).push(me);
+  const share=full=>{if(!link)return;const range=full?null:[coord(orient,S.start,lo),coord(orient,S.start,hi)];
+    for(const o of link[name])if(o!==me)o.apply(range)};
+  const clamp=()=>{const span=Math.max(3,Math.min(n,hi-lo));if(lo<0){lo=0}if(lo+span>n){lo=n-span}hi=lo+span;lo=Math.max(0,lo)};
+  cv.onwheel=e=>{e.preventDefault();const rc=cv.getBoundingClientRect(),x=e.clientX-rc.left,c=at(x),f=e.deltaY<0?0.8:1.25;
+    lo=c-(c-lo)*f;hi=c+(hi-c)*f;clamp();draw();share(false)};
+  cv.onmousedown=e=>{const rc=cv.getBoundingClientRect(),x=e.clientX-rc.left;
+    const zoomed=lo>0||hi<n;drag={x0:x,x1:x,select:!zoomed||e.shiftKey,lo0:lo,hi0:hi}};
+  window.addEventListener("mousemove",e=>{if(!drag)return;const rc=cv.getBoundingClientRect();drag.x1=e.clientX-rc.left;
+    if(!drag.select){const d=(drag.x1-drag.x0)/W*(drag.hi0-drag.lo0);lo=drag.lo0-d;hi=drag.hi0-d;clamp();share(false)}draw()});
+  window.addEventListener("mouseup",()=>{if(!drag)return;
+    if(drag.select&&Math.abs(drag.x1-drag.x0)>4){const a=at(Math.min(drag.x0,drag.x1)),b=at(Math.max(drag.x0,drag.x1));lo=a;hi=b;clamp();share(false)}
+    drag=null;draw()});
+  reset.onclick=()=>{lo=0;hi=n;draw();share(true)};
+  cv.onmousemove=e=>{if(drag||HELP.open)return;const rc=cv.getBoundingClientRect(),i=Math.floor(at(e.clientX-rc.left));
+    if(i<0||i>=n){tip.hidden=true;return}
+    const cnt=S.counts[i],cov=cnt.reduce((a,b)=>a+b,0);
+    tip.hidden=false;tip.style.left=Math.max(8,Math.min(e.clientX+12,innerWidth-320))+"px";tip.style.top=(e.clientY+12)+"px";
+    tip.innerHTML=`<b>reference ${fmt(coord(orient,S.start,i))}</b> · ${name}, ${name==="upstream"?n-i:i+1} from the flank${S.snv.includes(i)?" · SNV of the phasing result":""}<div>${fmt(cov)} reads: `+B.split("").map((b,k)=>cnt[k]?`${b} ${fmt(cnt[k])} (${pct(cnt[k]/cov)})`:"").filter(Boolean).join(" · ")+`</div>`};
+  cv.onmouseleave=()=>{if(!HELP.open)tip.hidden=true};
+  draw();
+  // Exposed for a headless check: zoom to a reference range.
+  cv.zoomTo=(a,b)=>{lo=a;hi=b;clamp();draw();share(false)};
+}
+// Each counter row carries its explanation (the sample's help.counters, from
+// the panel's provenance) for the page's #tip box.
+function counterCard(r){
+  const c=document.createElement("div");c.className="card";const H=LIST.samples[r._k].help.counters;
+  c.innerHTML=`<h2>Extraction counters${helpMark("Hover over a row to see what the counter counts.")}</h2><div class="scroll"><table class="counters"><tbody>${Object.entries(r.counters).map(([k,v])=>`<tr tabindex="0" data-help="${esc(H[k]||"")}"><td class="mono">${esc(k)}</td><td class="num">${fmt(v)}</td></tr>`).join("")}</tbody></table></div>`;
+  return c;
+}
+load().catch(e=>{$("#loading").hidden=false;$("#loading").textContent="The locus list could not be read: "+e.message});
+</script>
+
+</html>

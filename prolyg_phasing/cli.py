@@ -1,4 +1,5 @@
-"""Command-line entry point: ``prolyg-phasing extract`` / ``phase`` / ``ref-phase``.
+"""Command-line entry point: ``prolyg-phasing extract`` / ``build-flanks`` / ``phase`` /
+``ref-phase`` / ``view-loci``.
 
 Thin argparse wrappers, one per stage. Run directly against one BAM (or one
 already-extracted ``panel.db``), or drive ``extract``/``phase`` over many
@@ -14,7 +15,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from prolyg_phasing.io.bam import extract_panel
+from prolyg_phasing.io._flank_construction import build_flanks, write_flank_table
+from prolyg_phasing.io._workers import worker_count
+from prolyg_phasing.io.bam import extract_panel_to_db
 from prolyg_phasing.io.panel import ExtractedPanel
 from prolyg_phasing.io.phasing_tables import (
     build_haplotype_calls,
@@ -23,18 +26,21 @@ from prolyg_phasing.io.phasing_tables import (
     build_snv_calls,
     haplotypes_from_snv_calls_table,
 )
+from prolyg_phasing.locus_view import make_server
 from prolyg_phasing.phasing import PhasingPanel
-from prolyg_phasing.ref_phasing import assign_flanking_haplotypes_ref
+from prolyg_phasing.ref_phasing import assign_flanking_haplotypes_ref, target_phasing_panel
 
 _EXTRACT_DESCRIPTION = """\
 Walk a sorted, indexed BAM against a BED panel and write the extracted
 panel to a panel.db (SQLite) file.
 
-Two passes per locus: (1) reconstruct the reference window from MD tags,
-determine polyG-canonical orientation, and try to build upstream +
-downstream anchors; (2) if anchorable, fetch alignments overlapping the
-BED interval, apply the QC filters below, pair-collapse R1+R2 by read
-name, and emit per-(molecule, strand, sequence) read counts.
+Every sample of a donor, the tumor included, is read with the flanks of
+the donor's matched normal (--flanks, written by build-flanks). Two steps
+per locus: (1) reconstruct the reference window from MD tags, determine
+polyG-canonical orientation, and check both flanks against it; (2) fetch
+alignments overlapping the BED interval, apply the QC filters below,
+place both flanks in each read, pair-collapse R1+R2 by read name, and
+emit per-(molecule, strand, sequence) read counts.
 
 The BAM must carry MD tags (reference reconstruction) and MI tags (one
 per molecule/UMI family — required for every family-level count and
@@ -47,6 +53,10 @@ def _add_extract_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--bed", required=True, type=Path,
                     help="4-column BED panel: chrom, start, end, name — "
                          "one row per polyG locus to extract.")
+    p.add_argument("--flanks", required=True, type=Path,
+                    help="The {out_prefix}_flank_sides.tsv that build-flanks "
+                         "wrote for this donor's matched normal. It must hold "
+                         "exactly the loci of the BED.")
     p.add_argument("--out-db", required=True, type=Path,
                     help="Path to write the panel.db (SQLite) runtime "
                          "artifact. Parent directory is not created.")
@@ -58,16 +68,6 @@ def _add_extract_args(p: argparse.ArgumentParser) -> None:
                          "dropping them.")
     p.add_argument("--max-tlen", type=int, default=1000,
                     help="Drop alignments with |TLEN| greater than this.")
-    p.add_argument("--anchor-hamming-max", type=int, default=1,
-                    help="Maximum Hamming distance allowed when placing "
-                         "the upstream/downstream anchor sequence in a "
-                         "read; a placement past this is rejected.")
-    p.add_argument("--pair-disagreement-policy", default="drop",
-                    choices=["drop"],
-                    help="What to do when a read pair's R1 and R2 report "
-                         "different inter-anchor sequence. Only 'drop' "
-                         "(discard the pair, count it in "
-                         "n_read_pairs_drop_disagree) is implemented.")
     p.add_argument("--n-alleles-margin", type=int, default=1,
                     help="Headroom added over the panel-wide max observed "
                          "run length when sizing the allele-count axis "
@@ -79,23 +79,140 @@ def _add_extract_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--verbose", action="store_true",
                     help="Show a progress bar over the BED (one tick per "
                          "locus). Silent by default.")
+    p.add_argument("--workers", type=_positive_int, default=None,
+                    help="Worker processes; each extracts one locus at a time, and "
+                         "this process writes each locus to the panel as it "
+                         "finishes. Without it, the count comes from the free "
+                         "cores and memory of this machine.")
 
 
 def _run_extract(args: argparse.Namespace) -> None:
-    panel = extract_panel(
-        bam_path=args.bam,
-        bed_path=args.bed,
+    n_workers = worker_count() if args.workers is None else args.workers
+    n_loci = extract_panel_to_db(
+        args.bam, args.bed, args.flanks, args.out_db,
+        n_workers=n_workers,
         min_mapq=args.min_mapq,
         drop_chimeric=args.drop_chimeric,
         max_tlen=args.max_tlen,
-        anchor_hamming_max=args.anchor_hamming_max,
-        pair_disagreement_policy=args.pair_disagreement_policy,
         n_alleles_margin=args.n_alleles_margin,
         min_base_q=args.min_flanking_base_q,
         verbose=args.verbose,
     )
-    panel.save_db(args.out_db)
-    print(f"wrote {args.out_db} ({len(panel.loci)} loci)")
+    print(f"wrote {args.out_db} ({n_loci} loci; {n_workers} workers)")
+
+
+_BUILD_FLANKS_DESCRIPTION = """\
+Choose the two flanks of every locus from a matched normal BAM, and write
+{out_prefix}_flank_sides.tsv: one row per locus side, with the flank
+records that extraction reads.
+
+At each locus, the flanks are the pair of 10-base strings that maximizes
+one objective over the normal's reads: the sum over reads of the value of
+each read's best tract, where a G scores 1, any other base -2, and a
+flank match costs 1 for a substitution and 2 or 2.5 for a gap of 1 or 2
+bases. A tract holds a read base aligned inside the BED interval. A read
+with no tract, or a negative value, adds 0. Each flank
+occurs exactly at a tract edge in at least one read. The table adds, per
+locus, the objective, the reads, the reads placed, and the number of
+tied optimal pairs. The read filters are the extraction's defaults. Loci
+run in parallel; the worker count comes from the free cores and memory
+of this machine, or from --workers.
+
+Each BED locus side gets a row. A locus whose reference window no read
+rebuilds has the status ref_window_unrecoverable on both sides and no
+flank; a locus with no flank pair of positive objective has the status
+no_flank_pair. Extraction records either with that status and no reads.
+A side whose flank no read aligns at both end bases, or whose position
+falls outside BED +- 50 bases or out of order, has the status
+no_reference_position: it keeps its flank bases and gives no flanking
+bases in extraction.
+
+The table names the sample. The name is the BAM's read-group SM; give
+--sample only for a BAM with no SM."""
+
+
+def _add_build_flanks_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--bam", required=True, type=Path,
+                    help="Matched normal BAM, sorted and indexed, with MD and MI tags.")
+    p.add_argument("--bed", required=True, type=Path,
+                    help="4-column BED panel: chrom, start, end, name.")
+    p.add_argument("--out-prefix", required=True, type=Path,
+                    help="Path prefix of the output file. The parent "
+                         "directory is not created.")
+    p.add_argument("--sample", default=None,
+                    help="Sample name to write into the outputs. Required when "
+                         "the BAM has no read-group SM; when it has one, it "
+                         "must equal it.")
+    p.add_argument("--workers", type=_positive_int, default=None,
+                    help="Worker processes. Without it, the count comes from the "
+                         "free cores and memory of this machine.")
+
+
+def _positive_int(text: str) -> int:
+    """An integer of at least 1, for an argparse type."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, not {value}")
+    return value
+
+
+_VIEW_LOCI_DESCRIPTION = """\
+Start a local locus viewer for one or more panel.db files of a donor (its
+normal and its tumors). It is an HTTP server bound to 127.0.0.1; it reads
+the panels on request and writes no files. Each panel is a
+sample tab, named by the file stem of the BAM its provenance names.
+
+Each --panel may name, after the panel, the --out-dir of "prolyg-phasing
+phase" for that panel. The viewer then reads snv_calls.tsv,
+haplotype_calls.tsv and locus_summary.tsv: the pile-up
+shows a column per SNV and splits its rows by the read family's phase
+label. At start it checks that the phasing result belongs to the panel
+(the same read families at every locus) and stops if it does not.
+
+Per locus and sample the page shows the flanks and the reference tract on
+the G strand, the tracts with their read and molecule counts, the largest G
+run per read, the pile-up, the base counts over the full flanking width of
+each side, and every per-locus counter.
+
+On a remote machine, reach the page through an ssh tunnel from your own
+computer: ssh -N -L <port>:localhost:<port> <host>, then open
+http://localhost:<port>/. Stop the server with Ctrl-C."""
+
+
+def _add_view_loci_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--panel", required=True, type=Path, action="append", nargs="+",
+                   metavar=("PANEL_DB", "PHASING_DIR"),
+                   help="A panel.db of the donor, and optionally the phasing output "
+                        "directory for it. Repeat for each sample.")
+    p.add_argument("--port", type=int, default=8765,
+                   help="The port on 127.0.0.1 to serve the page on.")
+
+
+def _run_view_loci(args: argparse.Namespace) -> None:
+    pairs = []
+    for values in args.panel:
+        if len(values) > 2:
+            raise SystemExit(f"--panel takes a panel.db and at most one phasing directory, "
+                             f"not {len(values)} paths")
+        pairs.append((values[0], values[1] if len(values) == 2 else None))
+    server = make_server(pairs, args.port)
+    port = server.server_address[1]
+    print(f"Serving {len(pairs)} panels at http://localhost:{port}/ "
+          f"(remote: ssh -N -L {port}:localhost:{port} <host>). Ctrl-C stops.", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+def _run_build_flanks(args: argparse.Namespace) -> None:
+    n_workers = worker_count() if args.workers is None else args.workers
+    result = build_flanks(args.bam, args.bed, n_workers=n_workers, sample=args.sample)
+    path = write_flank_table(result, args.out_prefix)
+    print(f"{result.sample}: {len(result.records)} loci with flanks; {n_workers} workers; "
+          f"wrote {path}")
 
 
 _PHASE_DESCRIPTION = """\
@@ -154,6 +271,20 @@ def _add_phase_args(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _write_phasing_tables(panel: ExtractedPanel, phasing: PhasingPanel, out_dir: Path,
+                          min_pattern_freq: float) -> None:
+    """haplotype_calls.tsv, locus_summary.tsv and snv_calls.tsv of one phasing result."""
+    build_haplotype_calls(panel, phasing).to_csv(
+        out_dir / "haplotype_calls.tsv", sep="\t", index=False,
+    )
+    build_locus_summary(panel, phasing, min_pattern_freq=min_pattern_freq).to_csv(
+        out_dir / "locus_summary.tsv", sep="\t", index=False,
+    )
+    build_snv_calls(phasing).to_csv(
+        out_dir / "snv_calls.tsv", sep="\t", index=False,
+    )
+
+
 def _run_phase(args: argparse.Namespace) -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -167,16 +298,7 @@ def _run_phase(args: argparse.Namespace) -> None:
         vote_margin=args.vote_margin,
     )
     phasing.save_pickle(args.out_dir / "phasing.pkl")
-
-    build_haplotype_calls(panel, phasing).to_csv(
-        args.out_dir / "haplotype_calls.tsv", sep="\t", index=False,
-    )
-    build_locus_summary(panel, phasing, min_pattern_freq=args.min_pattern_freq).to_csv(
-        args.out_dir / "locus_summary.tsv", sep="\t", index=False,
-    )
-    build_snv_calls(phasing).to_csv(
-        args.out_dir / "snv_calls.tsv", sep="\t", index=False,
-    )
+    _write_phasing_tables(panel, phasing, args.out_dir, args.min_pattern_freq)
 
     n_loci = len(phasing.assignments)
     n_with_snvs = sum(1 for h in phasing.haplotypes.values() if len(h.snvs) > 0)
@@ -228,8 +350,10 @@ def _add_ref_phase_args(p: argparse.ArgumentParser) -> None:
                     help="Identifier recorded on the output, not used to "
                          "look up anything.")
     p.add_argument("--out-dir", required=True, type=Path,
-                    help="Directory for ref_phasing.pkl + "
-                         "ref_phasing_summary.tsv. Created if missing.")
+                    help="Directory for ref_phasing.pkl, ref_phasing_summary.tsv, "
+                         "and the haplotype_calls.tsv, snv_calls.tsv and "
+                         "locus_summary.tsv tables in the formats of `phase`. "
+                         "Created if missing.")
     p.add_argument("--min-informative-positions", type=int, default=1,
                     help="Minimum number of usable reference SNVs a target "
                          "read must have votes at (n_major + n_minor) to "
@@ -238,6 +362,11 @@ def _add_ref_phase_args(p: argparse.ArgumentParser) -> None:
                     help="Minimum |n_major - n_minor| vote margin a target "
                          "read needs to get a non-'unk' label; a tie or "
                          "near-tie within this margin labels 'unk'.")
+    p.add_argument(
+        "--min-pattern-freq", type=float, default=0.1,
+        help="Display threshold for locus_summary.tsv's admitted_patterns "
+             "column, as for `phase`.",
+    )
 
 
 def _run_ref_phase(args: argparse.Namespace) -> None:
@@ -262,6 +391,9 @@ def _run_ref_phase(args: argparse.Namespace) -> None:
     build_ref_phasing_summary(target_panel, anchored).to_csv(
         args.out_dir / "ref_phasing_summary.tsv", sep="\t", index=False,
     )
+    _write_phasing_tables(
+        target_panel, target_phasing_panel(target_panel, anchored, reference_haplotypes),
+        args.out_dir, args.min_pattern_freq)
 
     n_loci = len(anchored.assignments)
     n_phasable = sum(1 for v in anchored.usable_snvs.values() if len(v) > 0)
@@ -277,7 +409,8 @@ def _run_ref_phase(args: argparse.Namespace) -> None:
     )
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The `prolyg-phasing` argument parser, with every subcommand."""
     p = argparse.ArgumentParser(
         prog="prolyg-phasing",
         description="Read/family interrupter-pattern and flanking-SNV "
@@ -295,6 +428,15 @@ def main(argv: list[str] | None = None) -> None:
     )
     _add_extract_args(extract_p)
     extract_p.set_defaults(func=_run_extract)
+
+    build_flanks_p = sub.add_parser(
+        "build-flanks",
+        help="Build per-side flank records from a matched normal BAM.",
+        description=_BUILD_FLANKS_DESCRIPTION,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    _add_build_flanks_args(build_flanks_p)
+    build_flanks_p.set_defaults(func=_run_build_flanks)
 
     phase_p = sub.add_parser(
         "phase",
@@ -316,7 +458,20 @@ def main(argv: list[str] | None = None) -> None:
     _add_ref_phase_args(ref_phase_p)
     ref_phase_p.set_defaults(func=_run_ref_phase)
 
-    args = p.parse_args(argv)
+    view_loci_p = sub.add_parser(
+        "view-loci",
+        help="Start a local locus viewer (an HTTP server) for panel.db files.",
+        description=_VIEW_LOCI_DESCRIPTION,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    _add_view_loci_args(view_loci_p)
+    view_loci_p.set_defaults(func=_run_view_loci)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
     args.func(args)
 
 

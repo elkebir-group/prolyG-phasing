@@ -44,7 +44,12 @@ from pathlib import Path
 
 import numpy as np
 
+from prolyg_phasing.io._flank_placement import FlankRecord
 from prolyg_phasing.io.format import format_pattern
+
+# Version of the saved-panel layout and extraction rules. `load_db` rejects
+# a panel written under any other version.
+EXTRACTION_SCHEMA_VERSION = "3"
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -57,18 +62,18 @@ class ExtractionProvenance:
 
     bam_path: str
     bed_path: str
+    flank_table_path: str
+    flank_table_sha256: str
+    flank_table_sample: str
     extraction_version: str
     extraction_date: str
     min_mapq: int
     drop_chimeric: bool
     max_tlen: int
-    anchor_hamming_max: int
     pair_disagreement_policy: str
     n_alleles_margin: int
-    # Schema-v2 additions (flanking extraction). Defaults preserve
-    # backward-compat for old provenance JSONs that lack these keys.
+    extraction_schema_version: str
     min_base_q: int = 0
-    extraction_schema_version: str = "1"
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -106,12 +111,14 @@ class ExtractedLocus:
     # Per-row data (deduped).
     mi: np.ndarray              # (n_rows,) — read-family ID strings ("10004", etc.)
     strand: np.ndarray          # (n_rows,) 'U1' — 'A' / 'B'
-    seq: np.ndarray             # (n_rows,) object — inter-anchor strings
+    seq: np.ndarray             # (n_rows,) object — tracts, between the two flanks
     count: np.ndarray           # (n_rows,) int64 — aggregated read count
 
     # Structural meta (per-locus, constant across rows).
     n_runs: int
-    ref_inter_anchor_seq: str
+    # The reference strictly between the two flanks, polyG orientation; empty,
+    # with empty run lengths, when a flank has no reference position.
+    reference_tract: str
     reference_run_lengths: tuple[int, ...]
 
     # Locus geometry.
@@ -120,20 +127,45 @@ class ExtractedLocus:
     bed_end: int
     bed_name: str
     ref_orientation: str        # '+' (G-dominant) / '-' (C-dominant; revcomp'd)
-    upstream_anchor: str
-    downstream_anchor: str
+    # None when the matched normal had no reference window at this locus. A
+    # flank with empty `ref_positions` has no reference position: it sets
+    # the tract, and its side has no flanking bases (width 0, start -1).
+    upstream_flank: FlankRecord | None
+    downstream_flank: FlankRecord | None
 
-    # QC counters.
+    # QC counters. Of the alignments that overlap the BED interval
+    # (`n_alignments_overlap_locus`), the MAPQ, SA, TLEN and missing-MI drops
+    # leave the reads that reach the flank step. `n_alignments_placed` counts
+    # the reads with at least one placement, of any value. A read dropped by
+    # the flank placement counts once in `n_alignments_drop_flank`. It also
+    # counts once per side with no match of that side's flank, or, with both
+    # matches, once in
+    # `n_alignments_drop_no_placement` (no upstream match before a
+    # downstream match), `n_alignments_drop_no_bed_base` (no such pair holds
+    # a base aligned inside the BED interval) or
+    # `n_alignments_drop_negative_value`.
     n_alignments_overlap_locus: int
     n_alignments_drop_mapq: int
     n_alignments_drop_sa: int
     n_alignments_drop_tlen: int
-    n_alignments_drop_anchor: int
+    n_alignments_drop_no_mi: int
+    n_alignments_placed: int
+    n_alignments_drop_flank: int
+    n_alignments_drop_upstream_flank_not_placed: int
+    n_alignments_drop_downstream_flank_not_placed: int
+    n_alignments_drop_no_placement: int
+    n_alignments_drop_no_bed_base: int
+    n_alignments_drop_negative_value: int
     n_read_pairs: int
     n_read_pairs_drop_disagree: int
+    n_read_pairs_merged: int
     n_reads: int                 # = count.sum()
     max_observed_run_length: int
-    anchorability_status: str
+    # WINDOW_RECOVERED; WINDOW_UNRECOVERABLE when no read of the matched
+    # normal or of this sample rebuilds the reference window; NO_FLANK_PAIR
+    # when the matched normal has no flank pair with a positive objective.
+    # The last two have no reads.
+    reference_window_status: str
 
     # Schema-v2 additions (flanking extraction). All have defaults so
     # old pickles deserialize into a panel with empty flanking; a fresh
@@ -146,10 +178,14 @@ class ExtractedLocus:
     )
     g_walk_up: int = 0
     g_walk_dn: int = 0
+    # Each side's flanking field: its width, and the reference coordinate of
+    # its string index 0. A side with no flanking bases for want of a
+    # position (no reference window, no flank pair, or a flank with no
+    # reference position) has width 0 and start -1, never a coordinate.
     flanking_up_width: int = 0
     flanking_dn_width: int = 0
-    flanking_up_ref_pos_start: int = 0
-    flanking_dn_ref_pos_start: int = 0
+    flanking_up_ref_pos_start: int = -1
+    flanking_dn_ref_pos_start: int = -1
 
     def to_dataframe(self):
         """Materialize a pandas view of the (mi, strand, seq, count) rows."""
@@ -230,46 +266,14 @@ class ExtractedPanel:
         is possible, not because this write path itself saves memory (the
         panel is already fully built in memory by extraction time).
 
-        Writes to a temporary path in the same directory and renames into
-        place, so a crash mid-write cannot leave a partial file at ``path``.
+        Writes through :class:`PanelWriter`: to a temporary path in the
+        same directory, renamed into place, so a crash mid-write cannot
+        leave a partial file at ``path``.
         """
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.unlink(missing_ok=True)
-        conn = sqlite3.connect(str(tmp))
-        try:
-            col_defs = ", ".join(
-                f'"{c}" {"INTEGER" if c in _DB_INT_COLUMNS else "TEXT"}'
-                for c in _DB_LOCI_COLUMNS[1:]
-            )
-            conn.execute(
-                f'CREATE TABLE loci (locus_id TEXT PRIMARY KEY, {col_defs}, '
-                f'row_blob BLOB)'
-            )
-            conn.execute("CREATE TABLE provenance (json TEXT)")
-            conn.execute("CREATE TABLE panel_info (n_alleles INTEGER)")
-            conn.execute(
-                "INSERT INTO provenance (json) VALUES (?)",
-                (json.dumps(self.provenance.to_dict()),),
-            )
-            conn.execute(
-                "INSERT INTO panel_info (n_alleles) VALUES (?)", (self.n_alleles,)
-            )
-            placeholders = ", ".join("?" for _ in _DB_LOCI_COLUMNS)
-            insert_sql = (
-                f"INSERT INTO loci ({', '.join(_DB_LOCI_COLUMNS)}, row_blob) "
-                f"VALUES ({placeholders}, ?)"
-            )
+        with PanelWriter(path) as writer:
             for locus_id, locus in self.loci.items():
-                meta = _locus_meta_row(locus)
-                values = [locus_id] + [meta[c] for c in _DB_LOCI_COLUMNS[1:]]
-                values.append(_encode_row_blob(locus))
-                conn.execute(insert_sql, values)
-            conn.commit()
-        finally:
-            conn.close()
-        tmp.replace(p)
+                writer.add(locus_id, locus)
+            writer.finish(self.n_alleles, self.provenance)
 
     @classmethod
     def load_db(cls, path: str | Path) -> ExtractedPanel:
@@ -285,6 +289,15 @@ class ExtractedPanel:
         p = Path(path)
         conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
         provenance_json = conn.execute("SELECT json FROM provenance").fetchone()[0]
+        stored_version = json.loads(provenance_json).get("extraction_schema_version")
+        if stored_version != EXTRACTION_SCHEMA_VERSION:
+            conn.close()
+            shown = "missing" if stored_version is None else repr(stored_version)
+            raise ValueError(
+                f"Panel {p} has extraction schema version {shown}; this "
+                f"code reads version {EXTRACTION_SCHEMA_VERSION!r}. "
+                "Re-extract the panel from its BAM."
+            )
         provenance = ExtractionProvenance.from_dict(json.loads(provenance_json))
         n_alleles = conn.execute("SELECT n_alleles FROM panel_info").fetchone()[0]
         return cls(loci=_LazyLociMap(conn), n_alleles=n_alleles, provenance=provenance)
@@ -326,7 +339,7 @@ def parse_run_lengths(seq: str) -> tuple[int, ...]:
 
     - All-G `seq` (single-run loci, no interrupters): returns
       `(len(seq),)`.
-    - Empty `seq` (anchors adjacent in the read): returns `(0,)` —
+    - Empty `seq` (flanks adjacent in the read): returns `(0,)` —
       callers compare against the locus's `n_runs` to decide whether
       to accept.
     - `seq` starting or ending with a non-G base (zero-length boundary
@@ -341,9 +354,9 @@ def parse_run_lengths(seq: str) -> tuple[int, ...]:
     return tuple(len(r) for r in runs)
 
 
-def reference_run_lengths_from_seq(ref_inter_anchor_seq: str) -> tuple[int, ...]:
+def reference_run_lengths_from_seq(reference_tract: str) -> tuple[int, ...]:
     """Reference's run-length tuple, by the same parse used on reads."""
-    return parse_run_lengths(ref_inter_anchor_seq)
+    return parse_run_lengths(reference_tract)
 
 
 def interrupter_pattern(seq: str) -> tuple[str, ...]:
@@ -497,23 +510,37 @@ def majority_pattern_by_family(
 # ---------------------------------------------------------------------------
 
 
+# The flank-placement counters: the placed reads, the dropped total, one
+# drop per side with no flank match, and the three per-read drops.
+_FLANK_DROP_COLUMNS = (
+    "n_alignments_placed",
+    "n_alignments_drop_flank",
+    "n_alignments_drop_upstream_flank_not_placed",
+    "n_alignments_drop_downstream_flank_not_placed",
+    "n_alignments_drop_no_placement",
+    "n_alignments_drop_no_bed_base",
+    "n_alignments_drop_negative_value",
+)
+
 _PANEL_META_COLUMNS = [
     "locus_id",
     "n_runs",
-    "ref_inter_anchor_seq",
+    "reference_tract",
     "reference_run_lengths",
     "chrom", "bed_start", "bed_end", "bed_name",
     "ref_orientation",
-    "upstream_anchor", "downstream_anchor",
-    "anchorability_status",
+    "upstream_flank", "downstream_flank",
+    "reference_window_status",
     "max_observed_run_length",
     "n_alignments_overlap_locus",
     "n_alignments_drop_mapq",
     "n_alignments_drop_sa",
     "n_alignments_drop_tlen",
-    "n_alignments_drop_anchor",
+    "n_alignments_drop_no_mi",
+    *_FLANK_DROP_COLUMNS,
     "n_read_pairs",
     "n_read_pairs_drop_disagree",
+    "n_read_pairs_merged",
     "n_reads",
     "n_alleles",
     # Schema-v2 flanking geometry.
@@ -537,9 +564,9 @@ _DB_LOCI_COLUMNS = [c for c in _PANEL_META_COLUMNS if c != "n_alleles"]
 _DB_INT_COLUMNS = {
     "n_runs", "bed_start", "bed_end", "max_observed_run_length",
     "n_alignments_overlap_locus", "n_alignments_drop_mapq",
-    "n_alignments_drop_sa", "n_alignments_drop_tlen",
-    "n_alignments_drop_anchor", "n_read_pairs",
-    "n_read_pairs_drop_disagree", "n_reads",
+    "n_alignments_drop_sa", "n_alignments_drop_tlen", "n_alignments_drop_no_mi",
+    *_FLANK_DROP_COLUMNS, "n_read_pairs",
+    "n_read_pairs_drop_disagree", "n_read_pairs_merged", "n_reads",
     "g_walk_up", "g_walk_dn", "flanking_up_width", "flanking_dn_width",
     "flanking_up_ref_pos_start", "flanking_dn_ref_pos_start",
 }
@@ -548,6 +575,29 @@ _DB_INT_COLUMNS = {
 # columns — the per-row arrays, keyed on the same locus as the scalar
 # metadata columns.
 _ROW_ARRAY_FIELDS = ("mi", "strand", "seq", "count", "flanking_id", "flanking_seq")
+
+
+def flank_to_text(flank: FlankRecord | None) -> str | None:
+    """A flank record as the JSON text of its panel column; None stays None (NULL)."""
+    if flank is None:
+        return None
+    return json.dumps({
+        "bases": flank.bases,
+        "ref_positions": list(flank.ref_positions),
+        "run_side_offset": flank.run_side_offset,
+    })
+
+
+def flank_from_text(text: str | None) -> FlankRecord | None:
+    """The flank record of a panel column; the inverse of :func:`flank_to_text`."""
+    if text is None:
+        return None
+    d = json.loads(text)
+    return FlankRecord(
+        bases=d["bases"],
+        ref_positions=tuple(d["ref_positions"]),
+        run_side_offset=d["run_side_offset"],
+    )
 
 
 def _encode_row_blob(locus: ExtractedLocus) -> bytes:
@@ -573,6 +623,8 @@ def _row_to_locus(locus_id: str, row: tuple) -> ExtractedLocus:
         tuple(int(x) for x in meta["reference_run_lengths"].split(","))
         if meta["reference_run_lengths"] else tuple()
     )
+    meta["upstream_flank"] = flank_from_text(meta["upstream_flank"])
+    meta["downstream_flank"] = flank_from_text(meta["downstream_flank"])
     arrays = _decode_row_blob(row[-1])
     return ExtractedLocus(
         mi=arrays["mi"], strand=arrays["strand"], seq=arrays["seq"],
@@ -697,7 +749,7 @@ def _locus_meta_row(locus: ExtractedLocus) -> dict:
     """
     return {
         "n_runs": locus.n_runs,
-        "ref_inter_anchor_seq": locus.ref_inter_anchor_seq,
+        "reference_tract": locus.reference_tract,
         "reference_run_lengths": ",".join(
             str(r) for r in locus.reference_run_lengths
         ),
@@ -706,17 +758,19 @@ def _locus_meta_row(locus: ExtractedLocus) -> dict:
         "bed_end": locus.bed_end,
         "bed_name": locus.bed_name,
         "ref_orientation": locus.ref_orientation,
-        "upstream_anchor": locus.upstream_anchor,
-        "downstream_anchor": locus.downstream_anchor,
-        "anchorability_status": locus.anchorability_status,
+        "upstream_flank": flank_to_text(locus.upstream_flank),
+        "downstream_flank": flank_to_text(locus.downstream_flank),
+        "reference_window_status": locus.reference_window_status,
         "max_observed_run_length": locus.max_observed_run_length,
         "n_alignments_overlap_locus": locus.n_alignments_overlap_locus,
         "n_alignments_drop_mapq": locus.n_alignments_drop_mapq,
         "n_alignments_drop_sa": locus.n_alignments_drop_sa,
         "n_alignments_drop_tlen": locus.n_alignments_drop_tlen,
-        "n_alignments_drop_anchor": locus.n_alignments_drop_anchor,
+        "n_alignments_drop_no_mi": locus.n_alignments_drop_no_mi,
+        **{c: getattr(locus, c) for c in _FLANK_DROP_COLUMNS},
         "n_read_pairs": locus.n_read_pairs,
         "n_read_pairs_drop_disagree": locus.n_read_pairs_drop_disagree,
+        "n_read_pairs_merged": locus.n_read_pairs_merged,
         "n_reads": locus.n_reads,
         "g_walk_up": locus.g_walk_up,
         "g_walk_dn": locus.g_walk_dn,
@@ -725,5 +779,73 @@ def _locus_meta_row(locus: ExtractedLocus) -> dict:
         "flanking_up_ref_pos_start": locus.flanking_up_ref_pos_start,
         "flanking_dn_ref_pos_start": locus.flanking_dn_ref_pos_start,
     }
+
+
+def encode_locus_row(locus: ExtractedLocus) -> list:
+    """One ``loci`` table row of a locus, without its id.
+
+    The scalar metadata in ``_DB_LOCI_COLUMNS[1:]`` order, then the
+    gzip-pickled row arrays. A worker process can encode a locus and send
+    only this row to the process that writes the panel.
+    """
+    meta = _locus_meta_row(locus)
+    return [meta[c] for c in _DB_LOCI_COLUMNS[1:]] + [_encode_row_blob(locus)]
+
+
+class PanelWriter:
+    """Write a panel.db one locus at a time.
+
+    Rows go to a temporary file beside `path`. :meth:`finish` writes the
+    panel-wide fields and renames the file into place; leaving the
+    ``with`` block without :meth:`finish` removes the temporary file, so a
+    failed write never leaves a partial panel at `path`. The reader orders
+    loci by id, so the order of :meth:`add` calls does not matter.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._tmp = self.path.with_name(self.path.name + ".tmp")
+        self._tmp.unlink(missing_ok=True)
+        self._conn = sqlite3.connect(str(self._tmp))
+        col_defs = ", ".join(
+            f'"{c}" {"INTEGER" if c in _DB_INT_COLUMNS else "TEXT"}'
+            for c in _DB_LOCI_COLUMNS[1:]
+        )
+        self._conn.execute(
+            f"CREATE TABLE loci (locus_id TEXT PRIMARY KEY, {col_defs}, row_blob BLOB)"
+        )
+        self._conn.execute("CREATE TABLE provenance (json TEXT)")
+        self._conn.execute("CREATE TABLE panel_info (n_alleles INTEGER)")
+        placeholders = ", ".join("?" for _ in _DB_LOCI_COLUMNS)
+        self._insert = (f"INSERT INTO loci ({', '.join(_DB_LOCI_COLUMNS)}, row_blob) "
+                        f"VALUES ({placeholders}, ?)")
+        self._finished = False
+
+    def add(self, locus_id: str, locus: ExtractedLocus) -> None:
+        """Write one locus."""
+        self.add_row(locus_id, encode_locus_row(locus))
+
+    def add_row(self, locus_id: str, row: list) -> None:
+        """Write one locus from :func:`encode_locus_row`."""
+        self._conn.execute(self._insert, [locus_id, *row])
+
+    def finish(self, n_alleles: int, provenance: ExtractionProvenance) -> None:
+        """Write the panel-wide fields, and move the file into place."""
+        self._conn.execute("INSERT INTO provenance (json) VALUES (?)",
+                           (json.dumps(provenance.to_dict()),))
+        self._conn.execute("INSERT INTO panel_info (n_alleles) VALUES (?)", (n_alleles,))
+        self._conn.commit()
+        self._conn.close()
+        self._tmp.replace(self.path)
+        self._finished = True
+
+    def __enter__(self) -> PanelWriter:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if not self._finished:
+            self._conn.close()
+            self._tmp.unlink(missing_ok=True)
 
 
