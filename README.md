@@ -6,16 +6,24 @@ where a flanking single-nucleotide variant (SNV) resolves it, the haplotype
 it produces per-locus, per-family, and per-SNV tables. Every label is a
 direct readout of a read's own sequence.
 
-Three stages:
+Five commands:
 
-1. **Extract** — walk a BAM against a BED panel, collapse read pairs into a
-   deduplicated, per-locus panel (`panel.db`).
-2. **Phase** — find flanking positions that are informative (heterozygous)
-   in the panel, phase them into two haplotype profiles per locus, and label
-   every read family that carries phase evidence.
-3. **Ref-phase** — vote a *different* panel's reads against an already-phased
-   reference panel's haplotype profiles, instead of phasing its own — e.g. a
-   tumor bulk sample voted against its matched normal.
+1. **Build flanks** (`build-flanks`) — from a donor's matched normal, choose
+   two 10-base flanks for each locus. Every sample of the donor is read with
+   these flanks.
+2. **Extract** (`extract`) — walk a BAM against a BED panel and write a
+   deduplicated, per-locus panel (`panel.db`). In each read, we place the
+   two flanks at the highest-value position, and the tract is the read
+   between them. We merge the two mates of a pair base by base by quality
+   before we take the tract. `--workers N` extracts N loci at a time.
+3. **Phase** (`phase`) — find flanking positions that are informative
+   (heterozygous) in the panel, phase them into two haplotype profiles per
+   locus, and label every read family that carries phase evidence.
+4. **Ref-phase** (`ref-phase`) — vote a second panel's reads against the
+   haplotype profiles of an already-phased reference panel, for example a
+   tumor sample against its matched normal.
+5. **View** (`view-loci`) — serve a local web page that shows each locus of
+   one or more panels: the flanks, the tracts, the pile-up and the counters.
 
 ## Install
 
@@ -123,6 +131,25 @@ key in place, or override without editing anything:
 snakemake -s workflow/Snakefile --cores N \
     --config samples=/path/to/your/samples.tsv panel='{"bed": "/path/to/your.bed"}'
 ```
+
+## Locus viewer
+
+`view-loci` starts an HTTP server on 127.0.0.1 that reads the panels on
+request and writes no files. Give each panel of a donor with `--panel`, and
+after each panel the output directory of its `phase` or `ref-phase` run:
+
+```bash
+prolyg-phasing view-loci \
+    --panel panel.db phasing/ \
+    --panel target_panel.db ref_phasing/ \
+    --port 8765
+```
+
+Each panel is one sample tab. With a phasing directory, the pile-up splits
+its rows by phase label and shows one column per SNV. The viewer stops at
+start if a phasing directory belongs to another panel. On a remote machine,
+open an ssh tunnel (`ssh -N -L 8765:localhost:8765 <host>`) and then
+`http://localhost:8765/`.
 
 ## Output tables
 
